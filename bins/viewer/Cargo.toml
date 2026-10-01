@@ -1,6 +1,14 @@
 [package]
 name = "rat-viewer"
-description = "Rat Next: вьюер оператора (UI: egui/iced — спайк в P0-Б)"
+description = "Rat Next: вьюер оператора (P2-пилот: TCP + egui)"
 version.workspace = true
 edition.workspace = true
 publish = false
+
+[features]
+default = []
+ffmpeg = ["rat-session/ffmpeg", "dep:eframe"]
+
+[dependencies]
+rat-session = { path = "../../crates/session" }
+eframe = { version = "0.36", optional = true }

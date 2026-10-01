@@ -1,6 +1,14 @@
 [package]
 name = "rat-agent"
-description = "Rat Next: служба агента (Session 0)"
+description = "Rat Next: агент (P2-пилот: видеосессия поверх TCP; далее — служба Windows)"
 version.workspace = true
 edition.workspace = true
 publish = false
+
+[features]
+default = []
+# Пилотный кодек-путь (локальная сборка FFmpeg; см. README).
+ffmpeg = ["rat-session/ffmpeg"]
+
+[dependencies]
+rat-session = { path = "../../crates/session" }

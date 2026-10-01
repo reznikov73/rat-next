@@ -6,6 +6,7 @@ members = [
     "crates/transport",
     "crates/crypto",
     "crates/mux",
+    "crates/session",
     "bins/agent",
     "bins/agent-helper",
     "bins/relay",
