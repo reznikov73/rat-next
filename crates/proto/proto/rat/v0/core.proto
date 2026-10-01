@@ -1,0 +1,97 @@
+syntax = "proto3";
+
+package rat.v0;
+
+// Управляющий канал Rat Next, версия схемы v0 (набросок).
+// Медиа (видео) и файловые данные передаются отдельными сырыми кадрами,
+// здесь — только управляющие сообщения и RPC.
+
+message Envelope {
+  uint32 ver = 1;        // версия схемы протокола
+  uint64 request_id = 2; // идентификатор RPC-запроса (0 = не RPC)
+  oneof body {
+    Hello hello = 10;
+    Ping ping = 11;
+    Pong pong = 12;
+    SessionOffer session_offer = 20;
+    SessionAnswer session_answer = 21;
+    IceCandidate ice_candidate = 22;
+    AuthProof auth_proof = 23;
+    InputEvent input = 30;
+    ClipboardEvent clipboard = 31;
+    FsRequest fs_request = 40;
+    FsResponse fs_response = 41;
+  }
+}
+
+// Приветствие/согласование возможностей при установке сессии.
+message Hello {
+  string agent_version = 1;
+  repeated string capabilities = 2; // напр. ["video.h264.hw", "fs.resume"]
+}
+
+message Ping { uint64 nonce = 1; }
+message Pong { uint64 nonce = 1; }
+
+// SDP-подобный обмен (набросок; окончательный формат — после ICE-спайка).
+message SessionOffer  { string session_id = 1; repeated string candidates = 2; }
+message SessionAnswer { string session_id = 1; string answer = 2; }
+
+message IceCandidate {
+  string foundation = 1;
+  string address = 2;
+  uint32 port = 3;
+  string protocol = 4;      // "udp" | "tcp"
+  string candidate_type = 5; // "host" | "srflx" | "relay"
+}
+
+// Доказательство аутентификации (Noise + SPAKE2/PIN). Набросок.
+message AuthProof { bytes noise_payload = 1; }
+
+// Событие ввода (мышь/клавиатура) — заготовка.
+message InputEvent {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    MOUSE_MOVE = 1;
+    MOUSE_BUTTON = 2;
+    KEY = 3;
+  }
+  Kind kind = 1;
+  int32 x = 2;
+  int32 y = 3;
+  uint32 key_code = 4;
+  bool pressed = 5;
+}
+
+// Буфер обмена — заготовка.
+message ClipboardEvent {
+  enum Format {
+    FORMAT_UNSPECIFIED = 0;
+    TEXT = 1;
+    FILES = 2;
+  }
+  Format format = 1;
+  bytes data = 2;
+}
+
+// Файловые операции — заготовка (окончательный дизайн — §3.7 проектного документа).
+message FsRequest {
+  enum Op {
+    OP_UNSPECIFIED = 0;
+    LIST = 1;
+    READ = 2;
+    WRITE = 3;
+    DELETE = 4;
+  }
+  Op op = 1;
+  string path = 2;
+  uint64 offset = 3;
+  bytes data = 4;
+}
+
+message FsResponse {
+  uint32 status = 1;
+  string error = 2;
+  bytes data = 3;
+  repeated string entries = 4;
+}

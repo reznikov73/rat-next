@@ -1,0 +1,15 @@
+# Спайк — standalone-пакет вне основного cargo workspace.
+[workspace]
+
+[package]
+name = "quic-echo"
+description = "Спайк P0: локальный QUIC echo (quinn + rustls/ring)"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rcgen = "0.13"

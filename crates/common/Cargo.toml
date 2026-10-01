@@ -1,0 +1,6 @@
+[package]
+name = "rat-common"
+description = "Rat Next: общие утилиты (конфиг, ошибки, логирование)"
+version.workspace = true
+edition.workspace = true
+publish = false

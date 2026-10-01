@@ -1,0 +1,19 @@
+# --- Rust ---
+/target
+**/*.rs.bk
+
+# --- IDE ---
+.idea/
+.vscode/
+*.iml
+
+# --- Служебные каталоги агентных инструментов (не версионируем) ---
+.agents/
+.autoclaw/
+.cluster/
+.opencode/
+projects/
+
+# --- Спайки: их собственные target/out ---
+spikes/**/target/
+spikes/**/out/

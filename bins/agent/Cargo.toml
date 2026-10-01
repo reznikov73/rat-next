@@ -1,0 +1,6 @@
+[package]
+name = "rat-agent"
+description = "Rat Next: служба агента (Session 0)"
+version.workspace = true
+edition.workspace = true
+publish = false

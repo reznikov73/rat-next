@@ -1,0 +1,6 @@
+[package]
+name = "rat-viewer"
+description = "Rat Next: вьюер оператора (UI: egui/iced — спайк в P0-Б)"
+version.workspace = true
+edition.workspace = true
+publish = false

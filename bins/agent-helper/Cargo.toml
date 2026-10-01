@@ -1,0 +1,6 @@
+[package]
+name = "rat-agent-helper"
+description = "Rat Next: session helper (пользовательская сессия / pre-login)"
+version.workspace = true
+edition.workspace = true
+publish = false

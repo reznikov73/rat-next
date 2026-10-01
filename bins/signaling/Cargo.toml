@@ -1,0 +1,6 @@
+[package]
+name = "rat-signaling"
+description = "Rat Next: signaling/registry API (устройства, ACL, presence)"
+version.workspace = true
+edition.workspace = true
+publish = false

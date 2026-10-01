@@ -1,0 +1,6 @@
+[package]
+name = "rat-transport"
+description = "Rat Next: транспорт (QUIC/ICE/relay)"
+version.workspace = true
+edition.workspace = true
+publish = false

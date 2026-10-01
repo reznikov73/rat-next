@@ -1,0 +1,19 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/proto",
+    "crates/common",
+    "crates/transport",
+    "crates/crypto",
+    "crates/mux",
+    "bins/agent",
+    "bins/agent-helper",
+    "bins/relay",
+    "bins/signaling",
+    "bins/viewer",
+]
+exclude = ["spikes/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"

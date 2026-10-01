@@ -1,0 +1,6 @@
+[package]
+name = "rat-mux"
+description = "Rat Next: мультиплексирование каналов (control/input/video/files)"
+version.workspace = true
+edition.workspace = true
+publish = false

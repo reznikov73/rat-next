@@ -1,0 +1,6 @@
+[package]
+name = "rat-crypto"
+description = "Rat Next: E2E-криптография (Noise, идентичности, PAKE)"
+version.workspace = true
+edition.workspace = true
+publish = false

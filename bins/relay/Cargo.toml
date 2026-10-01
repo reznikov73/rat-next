@@ -1,0 +1,6 @@
+[package]
+name = "rat-relay"
+description = "Rat Next: relay-сервер (pairing, форвард непрозрачных байтов)"
+version.workspace = true
+edition.workspace = true
+publish = false
