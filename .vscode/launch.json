@@ -62,6 +62,16 @@
       "console": "internalConsole"
     },
     {
+      "name": "Спайк: session_loopback — сессия агент↔вьюер",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}\\spikes\\video_loop\\target\\release\\session-loopback.exe",
+      "args": [],
+      "cwd": "${workspaceFolder}\\spikes\\session_loopback",
+      "preLaunchTask": "build: session_loopback (release)",
+      "console": "internalConsole"
+    },
+    {
       "name": "Продукт: rat-viewer (заглушка)",
       "type": "cppvsdbg",
       "request": "launch",

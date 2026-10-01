@@ -1,0 +1,3 @@
+# Общий target с video_loop — чтобы не пересобирать eframe-стек заново.
+[build]
+target-dir = "E:/Work/GIGA/github/Rat/spikes/video_loop/target"

@@ -106,6 +106,25 @@
       "type": "shell",
       "command": "powershell",
       "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\scripts\\vsc-task.ps1", "-Dir", "spikes/video_loop", "-Cmd", "run --release -- --smoke=20"]
+    },
+    {
+      "label": "build: session_loopback (release)",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\scripts\\vsc-task.ps1", "-Dir", "spikes/session_loopback", "-Cmd", "build --release"],
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "run: session_loopback",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\scripts\\vsc-task.ps1", "-Dir", "spikes/session_loopback", "-Cmd", "run --release"]
+    },
+    {
+      "label": "run: session_loopback (smoke 15s)",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\scripts\\vsc-task.ps1", "-Dir", "spikes/session_loopback", "-Cmd", "run --release -- --smoke=15"]
     }
   ]
 }
