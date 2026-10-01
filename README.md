@@ -35,6 +35,7 @@ CI: `.github/workflows/ci.yml` (заработает после публикац
 
 ## Статус
 
-Фаза P0 завершена: каркас репозитория, схема v0, спайки `quic_echo`, `dxgi_capture`, `ui_egui`,
-`ui_iced`, `ice_str0m`, `encode_qsv` — см. `spikes/README.md`; решение по UI-киту —
-`spikes/UI_KIT_DECISION.md`.
+- **P0 завершена**: каркас, схема v0, спайки (`quic_echo`, `dxgi_capture`, `ui_egui`, `ui_iced`,
+  `ice_str0m`, `encode_qsv`) — см. `spikes/README.md`; UI-кит: egui (`spikes/UI_KIT_DECISION.md`).
+- **P1 работает**: локальный видео-луп «экран → QSV H.264 → декод → показ» — 1080p, ~29 fps,
+  e2e ~70 мс; см. `spikes/video_loop/REPORT.md`.

@@ -52,6 +52,16 @@
       "console": "integratedTerminal"
     },
     {
+      "name": "Спайк: video_loop — локальный видео-луп",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}\\spikes\\video_loop\\target\\release\\video-loop.exe",
+      "args": [],
+      "cwd": "${workspaceFolder}\\spikes\\video_loop",
+      "preLaunchTask": "build: video_loop (release)",
+      "console": "internalConsole"
+    },
+    {
       "name": "Продукт: rat-viewer (заглушка)",
       "type": "cppvsdbg",
       "request": "launch",

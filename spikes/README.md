@@ -1,4 +1,4 @@
-# Спайки (P0)
+# Спайки (P0–P1)
 
 Исследовательские мини-проекты. Каждый — **standalone**-пакет (свой `[workspace]`,
 исключён из основного workspace через `exclude`), у каждого — свой `REPORT.md`
@@ -12,6 +12,7 @@
 | [ui_iced](ui_iced/) | iced 0.14: макет вьюера + smoke | ✅ ran |
 | [ice_str0m](ice_str0m/) | ICE (крейт `is` из str0m 0.24): соединение двух агентов | ✅ ran (connected за ~12 мс) |
 | [encode_qsv](encode_qsv/) | Аппаратный H.264 (Intel QSV) через FFmpeg | ✅ ran (~128 fps при 1080p) |
+| [video_loop](video_loop/) | **P1**: локальный луп «экран → QSV H.264 → декод → показ» (egui) | ✅ ~29 fps 1080p, e2e ~70 мс |
 
 **Решение по UI-киту:** [UI_KIT_DECISION.md](UI_KIT_DECISION.md) — рекомендован **egui**, iced — резерв.
 

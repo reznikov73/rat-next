@@ -87,6 +87,25 @@
       "type": "shell",
       "command": "powershell",
       "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\scripts\\vsc-task.ps1", "-Dir", "spikes/ice_str0m", "-Cmd", "run"]
+    },
+    {
+      "label": "build: video_loop (release)",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\scripts\\vsc-task.ps1", "-Dir", "spikes/video_loop", "-Cmd", "build --release"],
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "run: video_loop (луп)",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\scripts\\vsc-task.ps1", "-Dir", "spikes/video_loop", "-Cmd", "run --release"]
+    },
+    {
+      "label": "run: video_loop (smoke 20s)",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\scripts\\vsc-task.ps1", "-Dir", "spikes/video_loop", "-Cmd", "run --release -- --smoke=20"]
     }
   ]
 }

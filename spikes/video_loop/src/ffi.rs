@@ -185,6 +185,10 @@ impl Drop for Encoder {
     }
 }
 
+// SAFETY: доступ к энкодеру сериализован через Mutex в конвейере
+// (send — в потоке захвата, recv — в потоке декода; никогда одновременно).
+unsafe impl Send for Encoder {}
+
 // ============================== Decoder ==============================
 
 /// Прямые указатели на плоскости текущего декодированного кадра.
@@ -293,6 +297,10 @@ impl Drop for Decoder {
     }
 }
 
+// SAFETY: Decoder используется только в одном потоке; Send нужен для передачи
+// владения в рабочий поток.
+unsafe impl Send for Decoder {}
+
 // ============================== Sws (конверсии) ==============================
 
 extern "C" {
@@ -351,6 +359,10 @@ impl Drop for Sws {
         unsafe { rl_sws_free(self.ptr) }
     }
 }
+
+// SAFETY: каждый контекст Sws используется ровно в одном потоке за раз
+// (sws_in — в потоке захвата, sws_out — в потоке декода).
+unsafe impl Send for Sws {}
 
 pub unsafe fn sws_bgra_to_nv12(
     sws: *mut c_void,

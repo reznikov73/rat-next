@@ -1,6 +1,10 @@
 //! Конвейер спайка P1: захват (DXGI) → NV12 → H.264 (QSV) → декод → RGBA.
-//! Плюс замеры по стадиям (capture+convert / encode / decode+convert / e2e).
+//! Двухпоточная архитектура:
+//!   Поток A: пейсинг + захват + конверсия BGRA→NV12 (swscale) + отправка в энкодер.
+//!   Поток B: приём пакетов + декод + YUV→RGBA (swscale) + передача кадра в UI.
+//! Плюс замеры по стадиям (capture+conv / encode / decode+conv / e2e).
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
@@ -21,6 +25,12 @@ use windows::Win32::Graphics::Dxgi::{
 };
 
 use crate::ffi::{Decoder, Encoder, PlaneView, Sws};
+
+// Повышенная точность системного таймера (для точного 30 fps пейсинга).
+#[link(name = "winmm")]
+extern "system" {
+    fn timeBeginPeriod(uperiod: u32) -> u32;
+}
 
 /// Кадр, уходящий в UI.
 pub struct FrameOut {
@@ -135,6 +145,11 @@ pub struct Capture {
     pub height: usize,
 }
 
+// SAFETY: захват живёт и используется только в одном потоке (поток A);
+// Send нужен лишь чтобы передать владение в этот поток. COM-объекты D3D11
+// не используются одновременно из нескольких потоков.
+unsafe impl Send for Capture {}
+
 impl Capture {
     pub fn new() -> Result<Self, String> {
         unsafe {
@@ -171,23 +186,20 @@ impl Capture {
     /// Пересоздать duplication (после ACCESS_LOST / смены режима).
     pub fn try_recreate(&mut self) -> bool {
         unsafe {
-            match create_duplication(&self.device) {
-                Ok((dupl, w, h)) => {
-                    if let Ok(staging) = create_staging(&self.device, w, h) {
-                        self.dupl = dupl;
-                        self.staging = staging;
-                        self.width = w as usize;
-                        self.height = h as usize;
-                        return true;
-                    }
+            if let Ok((dupl, w, h)) = create_duplication(&self.device) {
+                if let Ok(staging) = create_staging(&self.device, w, h) {
+                    self.dupl = dupl;
+                    self.staging = staging;
+                    self.width = w as usize;
+                    self.height = h as usize;
+                    return true;
                 }
-                Err(_) => {}
             }
             false
         }
     }
 
-    /// Забрать кадр и сконвертировать в NV12 (в переданные буферы).
+    /// Забрать кадр и сконвертировать в NV12 (swscale, в переданные буферы).
     /// Ok(false) — не было нового кадра (таймаут).
     pub fn acquire_nv12(
         &mut self,
@@ -273,7 +285,7 @@ unsafe fn create_staging(
     texture.ok_or_else(|| "CreateTexture2D failed".to_string())
 }
 
-// ============================== Конверсии ==============================
+// ============================== Конверсии (fallback, не используются) ==============================
 
 /// BGRA → NV12 вручную (не используется; оставлено как fallback-референс).
 #[allow(dead_code)]
@@ -343,7 +355,7 @@ pub fn yuv420p_to_rgba(pv: &PlaneView, out: &mut [u8]) {
     }
 }
 
-// ============================== Поток конвейера ==============================
+// ============================== Потоки конвейера ==============================
 
 pub fn run_pipeline(
     stop: Arc<AtomicBool>,
@@ -351,112 +363,178 @@ pub fn run_pipeline(
     tx: SyncSender<FrameOut>,
     cfg: PipelineConfig,
 ) -> Result<(), String> {
+    // Без этого sleep гранулярен ~15.6 мс и пейсинг 30 fps страдает.
+    unsafe {
+        timeBeginPeriod(1);
+    }
+
     let mut cap = Capture::new()?;
     let (cw, ch) = (cap.width, cap.height);
 
-    let mut enc = match Encoder::new(
-        &cfg.codec,
-        cw as u32,
-        ch as u32,
-        cfg.fps,
-        cfg.bitrate,
-        cfg.gop,
-        &cfg.preset,
-        cfg.async_depth,
-        cfg.low_delay,
-    ) {
-        Ok(e) => {
-            stats.lock().unwrap().codec = cfg.codec.clone();
-            e
-        }
+    // Энкодер: h264_qsv с fallback на libx264.
+    let p_encoder = |codec: &str, preset: &str, async_depth: i32, low_delay: i32| {
+        Encoder::new(
+            codec,
+            cw as u32,
+            ch as u32,
+            cfg.fps,
+            cfg.bitrate,
+            cfg.gop,
+            preset,
+            async_depth,
+            low_delay,
+        )
+    };
+    let (enc, codec_used) = match p_encoder(&cfg.codec, &cfg.preset, cfg.async_depth, cfg.low_delay)
+    {
+        Ok(e) => (e, cfg.codec.clone()),
         Err(e1) => {
             println!("[pipeline] {e1} — fallback на libx264");
-            let e = Encoder::new(
-                "libx264",
-                cw as u32,
-                ch as u32,
-                cfg.fps,
-                cfg.bitrate,
-                cfg.gop,
-                "veryfast",
-                1,
-                0,
-            )?;
-            stats.lock().unwrap().codec = "libx264".into();
-            e
+            let e = p_encoder("libx264", "veryfast", 1, 0)?;
+            (e, "libx264".to_string())
         }
     };
-    let mut dec = Decoder::new()?;
+    stats.lock().unwrap().codec = codec_used;
 
-    // swscale-конверсии (SIMD внутри ffmpeg)
     let sws_in = Sws::new(cw as u32, ch as u32, crate::ffi::pix_fmt(0), crate::ffi::pix_fmt(1))?;
+    let dec = Decoder::new()?;
     let sws_out = Sws::new(cw as u32, ch as u32, crate::ffi::pix_fmt(2), crate::ffi::pix_fmt(3))?;
 
-    let mut y_buf = vec![0u8; cw * ch];
-    let mut uv_buf = vec![0u8; cw * ch / 2];
-    let mut pkt_buf = vec![0u8; 8 * 1024 * 1024];
-    let mut rgba = vec![0u8; cw * ch * 4];
+    let enc_shared = Arc::new(Mutex::new(enc));
+    // (frame_id, t_capture, t_sent, cap_ms)
+    let inflight: Arc<Mutex<VecDeque<(u64, Instant, Instant, f32)>>> =
+        Arc::new(Mutex::new(VecDeque::new()));
 
-    let frame_interval = Duration::from_micros(1_000_000 / cfg.fps.max(1) as u64);
-    let mut next_t = Instant::now();
-    let mut frame_id: u64 = 0;
-    // (frame_id, t_capture, t_sent)
-    let mut inflight: std::collections::VecDeque<(u64, Instant, Instant)> =
-        std::collections::VecDeque::new();
-    let mut fps_t = Instant::now();
-    let mut fps_count: u32 = 0;
-
-    while !stop.load(Ordering::Relaxed) {
-        // пейсинг
-        let now = Instant::now();
-        if next_t > now {
-            std::thread::sleep(next_t - now);
+    // --- Поток A: пейсинг + захват + отправка в энкодер ---
+    let stop_a = stop.clone();
+    let stats_a = stats.clone();
+    let enc_a = enc_shared.clone();
+    let inflight_a = inflight.clone();
+    let fps = cfg.fps.max(1);
+    let thread_a = std::thread::spawn(move || {
+        // Чуть выше обычного приоритета — меньше потерь на конкуренции с UI.
+        unsafe {
+            use windows::Win32::System::Threading::{
+                GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+            };
+            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
         }
-        if next_t < Instant::now() {
-            next_t = Instant::now() + frame_interval;
-        } else {
-            next_t += frame_interval;
-        }
+        let sws_in = sws_in;
+        let mut y_buf = vec![0u8; cw * ch];
+        let mut uv_buf = vec![0u8; cw * ch / 2];
+        let frame_interval = Duration::from_micros(1_000_000 / fps as u64);
+        let mut next_t = Instant::now();
+        let mut frame_id: u64 = 0;
+        let mut consec_err: u32 = 0;
 
-        // 1) захват + конверсия в NV12
-        let t0 = Instant::now();
-        let got = match cap.acquire_nv12(15, sws_in.ptr(), &mut y_buf, &mut uv_buf) {
-            Ok(v) => v,
-            Err(e) => {
-                if e.contains("ACCESS_LOST") {
-                    if cap.try_recreate() {
+        while !stop_a.load(Ordering::Relaxed) {
+            let now = Instant::now();
+            if next_t > now {
+                std::thread::sleep(next_t - now);
+            }
+            if next_t < Instant::now() {
+                next_t = Instant::now() + frame_interval;
+            } else {
+                next_t += frame_interval;
+            }
+
+            let t0 = Instant::now();
+            let got = match cap.acquire_nv12(15, sws_in.ptr(), &mut y_buf, &mut uv_buf) {
+                Ok(v) => v,
+                Err(e) => {
+                    if e.contains("ACCESS_LOST") && cap.try_recreate() {
                         continue;
                     }
-                }
-                let mut st = stats.lock().unwrap();
-                st.errors += 1;
-                st.last_error = e;
-                continue;
-            }
-        };
-        if !got {
-            continue;
-        }
-        let t_cap = Instant::now();
-
-        // 2) забрать готовые пакеты и декодировать их
-        loop {
-            let pkt = match enc.recv(&mut pkt_buf) {
-                Ok(Some(sz)) => sz,
-                Ok(None) => break,
-                Err(e) => {
-                    let mut st = stats.lock().unwrap();
+                    consec_err += 1;
+                    let mut st = stats_a.lock().unwrap();
                     st.errors += 1;
                     st.last_error = e;
-                    break;
+                    drop(st);
+                    if consec_err > 120 {
+                        break;
+                    }
+                    continue;
                 }
             };
-            let (pid, tcap0, t_sent) = inflight
-                .pop_front()
-                .unwrap_or((frame_id, t0, Instant::now()));
-            let t_enc = Instant::now();
+            if !got {
+                continue;
+            }
+            consec_err = 0;
+            let t_cap = Instant::now();
+            let cap_ms = (t_cap - t0).as_secs_f32() * 1000.0;
 
-            // декод
+            let t_sent = Instant::now();
+            let r = {
+                let mut e = enc_a.lock().unwrap();
+                e.send(&y_buf, cw, &uv_buf, cw, frame_id as i64)
+            };
+            match r {
+                Ok(0) => {
+                    inflight_a
+                        .lock()
+                        .unwrap()
+                        .push_back((frame_id, t0, t_sent, cap_ms));
+                    frame_id += 1;
+                }
+                Ok(_) => {
+                    stats_a.lock().unwrap().dropped += 1;
+                }
+                Err(e) => {
+                    let mut st = stats_a.lock().unwrap();
+                    st.errors += 1;
+                    st.last_error = e;
+                }
+            }
+        }
+        stop_a.store(true, Ordering::Relaxed);
+    });
+
+    // --- Поток B: приём пакетов + декод + конверсия + отправка в UI ---
+    let stop_b = stop.clone();
+    let stats_b = stats.clone();
+    let enc_b = enc_shared.clone();
+    let inflight_b = inflight.clone();
+    let thread_b = std::thread::spawn(move || {
+        // Чуть выше обычного приоритета — меньше потерь на конкуренции с UI.
+        unsafe {
+            use windows::Win32::System::Threading::{
+                GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+            };
+            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+        }
+        let mut dec = dec;
+        let sws_out = sws_out;
+        let mut pkt_buf = vec![0u8; 8 * 1024 * 1024];
+        let mut rgba = vec![0u8; cw * ch * 4];
+        let mut fps_t = Instant::now();
+        let mut fps_count: u32 = 0;
+
+        while !stop_b.load(Ordering::Relaxed) {
+            let recv_res = {
+                let mut e = enc_b.lock().unwrap();
+                e.recv(&mut pkt_buf)
+            };
+            let pkt = match recv_res {
+                Ok(Some(sz)) => sz,
+                Ok(None) => {
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+                Err(e) => {
+                    let mut st = stats_b.lock().unwrap();
+                    st.errors += 1;
+                    st.last_error = e;
+                    continue;
+                }
+            };
+            let t_enc = Instant::now();
+            let (pid, tcap0, t_sent, cap_ms) = inflight_b
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or((u64::MAX, t_enc, t_enc, 0.0));
+
+            // декод пакета
             let mut sent = false;
             for _ in 0..3 {
                 match dec.send(&pkt_buf[..pkt]) {
@@ -469,7 +547,7 @@ pub fn run_pipeline(
                     }
                     Ok(_) => {}
                     Err(e) => {
-                        let mut st = stats.lock().unwrap();
+                        let mut st = stats_b.lock().unwrap();
                         st.errors += 1;
                         st.last_error = e;
                         break;
@@ -479,11 +557,12 @@ pub fn run_pipeline(
             if !sent {
                 continue;
             }
+
             loop {
                 let gotf = match dec.recv() {
                     Ok(v) => v,
                     Err(e) => {
-                        let mut st = stats.lock().unwrap();
+                        let mut st = stats_b.lock().unwrap();
                         st.errors += 1;
                         st.last_error = e;
                         break;
@@ -493,7 +572,7 @@ pub fn run_pipeline(
                     break;
                 }
                 if dec.pix_fmt() != crate::ffi::pix_fmt(2) {
-                    let mut st = stats.lock().unwrap();
+                    let mut st = stats_b.lock().unwrap();
                     st.last_error = format!("unexpected pix_fmt {}", dec.pix_fmt());
                     st.errors += 1;
                     break;
@@ -516,9 +595,9 @@ pub fn run_pipeline(
                     let t_dec = Instant::now();
 
                     {
-                        let mut st = stats.lock().unwrap();
+                        let mut st = stats_b.lock().unwrap();
                         st.record(
-                            (t_cap - t0).as_secs_f32() * 1000.0,
+                            cap_ms,
                             (t_enc - t_sent).as_secs_f32() * 1000.0,
                             (t_dec - t_enc).as_secs_f32() * 1000.0,
                             (t_dec - tcap0).as_secs_f32() * 1000.0,
@@ -542,30 +621,15 @@ pub fn run_pipeline(
                         t_decoded: t_dec,
                     };
                     if tx.try_send(frame).is_err() {
-                        stats.lock().unwrap().dropped += 1;
+                        stats_b.lock().unwrap().dropped += 1;
                     }
                 }
             }
+            let _ = sws_out.ptr(); // (защита от unused в случае будущих правок)
         }
+    });
 
-        // 3) отправить текущий кадр в энкодер
-        match enc.send(&y_buf, cw, &uv_buf, cw, frame_id as i64) {
-            Ok(0) => {
-                let t_sent = Instant::now();
-                inflight.push_back((frame_id, t0, t_sent));
-                frame_id += 1;
-            }
-            Ok(_) => {
-                // EAGAIN — энкодер ещё занят, пропускаем этот кадр
-                stats.lock().unwrap().dropped += 1;
-            }
-            Err(e) => {
-                let mut st = stats.lock().unwrap();
-                st.errors += 1;
-                st.last_error = e;
-            }
-        }
-    }
-
+    let _ = thread_a.join();
+    let _ = thread_b.join();
     Ok(())
 }
