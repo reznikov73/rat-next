@@ -4,8 +4,8 @@
 
 # --- IDE ---
 .idea/
-.vscode/
 *.iml
+# .vscode — конфиги проекта (launch/tasks/settings/extensions) коммитим
 
 # --- Служебные каталоги агентных инструментов (не версионируем) ---
 .agents/

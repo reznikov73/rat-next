@@ -1,0 +1,92 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "check: fmt + clippy + build + test",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\scripts\\check.ps1"],
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "build: workspace",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\scripts\\vsc-task.ps1", "-Dir", ".", "-Cmd", "build"],
+      "group": "build",
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "build: ui_egui",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\scripts\\vsc-task.ps1", "-Dir", "spikes/ui_egui", "-Cmd", "build"],
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "build: ui_iced",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\scripts\\vsc-task.ps1", "-Dir", "spikes/ui_iced", "-Cmd", "build"],
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "build: dxgi_capture",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\scripts\\vsc-task.ps1", "-Dir", "spikes/dxgi_capture", "-Cmd", "build"],
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "build: quic_echo",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\scripts\\vsc-task.ps1", "-Dir", "spikes/quic_echo", "-Cmd", "build"],
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "build: ice_str0m",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\scripts\\vsc-task.ps1", "-Dir", "spikes/ice_str0m", "-Cmd", "build"],
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "run: ui_egui",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\scripts\\vsc-task.ps1", "-Dir", "spikes/ui_egui", "-Cmd", "run"]
+    },
+    {
+      "label": "run: ui_egui (smoke)",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\scripts\\vsc-task.ps1", "-Dir", "spikes/ui_egui", "-Cmd", "run -- --smoke"]
+    },
+    {
+      "label": "run: ui_iced",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\scripts\\vsc-task.ps1", "-Dir", "spikes/ui_iced", "-Cmd", "run"]
+    },
+    {
+      "label": "run: dxgi_capture",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\scripts\\vsc-task.ps1", "-Dir", "spikes/dxgi_capture", "-Cmd", "run"]
+    },
+    {
+      "label": "run: quic_echo",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\scripts\\vsc-task.ps1", "-Dir", "spikes/quic_echo", "-Cmd", "run"]
+    },
+    {
+      "label": "run: ice_str0m",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\scripts\\vsc-task.ps1", "-Dir", "spikes/ice_str0m", "-Cmd", "run"]
+    }
+  ]
+}

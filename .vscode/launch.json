@@ -1,0 +1,65 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Спайк: ui_egui — окно вьюера",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}\\spikes\\ui_egui\\target\\debug\\ui-egui.exe",
+      "args": [],
+      "cwd": "${workspaceFolder}\\spikes\\ui_egui",
+      "preLaunchTask": "build: ui_egui",
+      "console": "internalConsole"
+    },
+    {
+      "name": "Спайк: ui_iced — окно вьюера",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}\\spikes\\ui_iced\\target\\debug\\ui-iced.exe",
+      "args": [],
+      "cwd": "${workspaceFolder}\\spikes\\ui_iced",
+      "preLaunchTask": "build: ui_iced",
+      "console": "internalConsole"
+    },
+    {
+      "name": "Спайк: dxgi_capture — снять экран",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}\\spikes\\dxgi_capture\\target\\debug\\dxgi-capture.exe",
+      "args": [],
+      "cwd": "${workspaceFolder}\\spikes\\dxgi_capture",
+      "preLaunchTask": "build: dxgi_capture",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Спайк: quic_echo",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}\\spikes\\quic_echo\\target\\debug\\quic-echo.exe",
+      "args": [],
+      "cwd": "${workspaceFolder}\\spikes\\quic_echo",
+      "preLaunchTask": "build: quic_echo",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Спайк: ice_str0m",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}\\spikes\\ice_str0m\\target\\debug\\ice-str0m.exe",
+      "args": [],
+      "cwd": "${workspaceFolder}\\spikes\\ice_str0m",
+      "preLaunchTask": "build: ice_str0m",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Продукт: rat-viewer (заглушка)",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}\\target\\debug\\rat-viewer.exe",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "build: workspace",
+      "console": "integratedTerminal"
+    }
+  ]
+}
