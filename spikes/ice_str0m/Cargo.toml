@@ -1,0 +1,13 @@
+# Спайк — standalone-пакет вне основного cargo workspace.
+[workspace]
+
+[package]
+name = "ice-str0m"
+description = "Спайк P0-Б: ICE connectivity на str0m (loopback, in-memory transport)"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# ICE-слой из str0m 0.24 (крейт `is`, он же `str0m::ice`); без crypto-бэкендов.
+is = "0.11"

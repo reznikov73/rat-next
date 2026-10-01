@@ -1,0 +1,12 @@
+# Спайк — standalone-пакет вне основного cargo workspace.
+[workspace]
+
+[package]
+name = "ui-egui"
+description = "Спайк P0-Б: минимальный UI вьюера на egui/eframe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+eframe = "0.36"

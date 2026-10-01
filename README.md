@@ -35,4 +35,6 @@ CI: `.github/workflows/ci.yml` (заработает после публикац
 
 ## Статус
 
-Фаза P0-A: каркас репозитория, схема v0, спайки `quic_echo` и `dxgi_capture` — см. `spikes/README.md`.
+Фаза P0 завершена: каркас репозитория, схема v0, спайки `quic_echo`, `dxgi_capture`, `ui_egui`,
+`ui_iced`, `ice_str0m`, `encode_qsv` — см. `spikes/README.md`; решение по UI-киту —
+`spikes/UI_KIT_DECISION.md`.
