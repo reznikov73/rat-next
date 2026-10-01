@@ -16,11 +16,18 @@ use crate::capture::Capture;
 use crate::control;
 use crate::ffmpeg::{Encoder, Sws, pix_fmt, sws_bgra_to_nv12};
 use crate::frame;
+use crate::input::{self, InputEvent, OutputGeom, RectI};
 use crate::link::Duplex;
 use crate::stats::{SessionStats, TimeBase, now_us};
 
 /// Возможности агента для Hello.
-pub const AGENT_CAPABILITIES: &[&str] = &["video.h264", "mux.v1"];
+pub const AGENT_CAPABILITIES: &[&str] = &[
+    "video.h264",
+    "mux.v1",
+    "input.v0",
+    "cursor.v0",
+    "monitors.v0",
+];
 
 #[derive(Clone)]
 pub struct AgentConfig {
@@ -31,6 +38,8 @@ pub struct AgentConfig {
     pub preset: String,
     pub async_depth: i32,
     pub low_delay: i32,
+    /// Индекс вывода (монитора) для захвата.
+    pub monitor: u32,
 }
 
 impl Default for AgentConfig {
@@ -43,6 +52,7 @@ impl Default for AgentConfig {
             preset: "veryfast".to_string(),
             async_depth: 1,
             low_delay: 1,
+            monitor: 0,
         }
     }
 }
@@ -55,8 +65,15 @@ pub fn spawn_agent(
     link: Duplex,
     cfg: AgentConfig,
 ) -> Result<Vec<std::thread::JoinHandle<()>>, String> {
-    let cap = Capture::new()?;
+    let cap = Capture::new_with_output(cfg.monitor)?;
     let (cw, ch) = (cap.width, cap.height);
+    let out_geom = OutputGeom {
+        origin_x: cap.origin.0,
+        origin_y: cap.origin.1,
+        width: cw as i32,
+        height: ch as i32,
+    };
+    let virt = cap.virt;
 
     let open_enc = |codec: &str, preset: &str, async_depth: i32, low_delay: i32| {
         Encoder::new(
@@ -194,12 +211,25 @@ pub fn spawn_agent(
         let mut dec = rat_mux::Decoder::new();
         let mut pkt_buf = vec![0u8; 8 * 1024 * 1024];
 
+        // Курсор: отправляем не чаще ~30 Гц и только при изменении.
+        let mut last_cursor_t = Instant::now() - Duration::from_secs(1);
+        let mut last_cursor: Option<(u16, u16, bool)> = None;
+
         // Hello (capabilities) сразу при старте.
         let hello = control::hello(
             concat!("rat-agent-", env!("CARGO_PKG_VERSION")),
             AGENT_CAPABILITIES,
         );
         mux.push(Channel::Control, 0, &control::encode_env(&hello));
+        let mut meta = Vec::with_capacity(20);
+        input::pack_session_info(
+            &mut meta,
+            input::SessionInfo {
+                out: out_geom,
+                virt,
+            },
+        );
+        mux.push(Channel::Control, 0, &meta);
         if !flush(&mut mux, &link) {
             stop_b.store(true, Ordering::Relaxed);
             return;
@@ -235,6 +265,11 @@ pub fn spawn_agent(
                                     let pong = control::pong(env.request_id, p.nonce);
                                     mux.push(Channel::Control, 0, &control::encode_env(&pong));
                                 }
+                            }
+                        } else if f.channel == Channel::Input {
+                            if let Some(evs) = input::parse_batch(f.payload) {
+                                let n = inject_events(&evs, out_geom, virt);
+                                stats_b.lock().unwrap().input_recv += n as u64;
                             }
                         }
                     }
@@ -285,6 +320,20 @@ pub fn spawn_agent(
                 }
             }
 
+            // 2.5) курсор агента (droppable, «последний выигрывает»).
+            if last_cursor_t.elapsed() >= Duration::from_millis(33) {
+                last_cursor_t = Instant::now();
+                if let Some((cx, cy, vis)) = cursor_captured_norm(out_geom) {
+                    if last_cursor != Some((cx, cy, vis)) {
+                        let mut cb = [0u8; 5];
+                        input::pack_cursor(&mut cb, cx, cy, vis);
+                        mux.push(Channel::Cursor, flags::DROPPABLE, &cb);
+                        last_cursor = Some((cx, cy, vis));
+                        stats_b.lock().unwrap().cursor_sent += 1;
+                    }
+                }
+            }
+
             // 3) выгрузить накопленные mux-кадры в линк.
             if !mux.is_empty() {
                 did = true;
@@ -301,6 +350,158 @@ pub fn spawn_agent(
     });
 
     Ok(vec![thread_a, thread_b])
+}
+
+/// Инъекция событий ввода через SendInput. Возвращает число обработанных событий.
+fn inject_events(evs: &[InputEvent], out: OutputGeom, virt: RectI) -> u32 {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
+        KEYEVENTF_FLAGS, KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, MOUSEEVENTF_HWHEEL,
+        MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
+        MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
+        MOUSEEVENTF_XUP, MOUSEINPUT, MapVirtualKeyW, SendInput,
+    };
+
+    let mut ok = 0u32;
+    let mut buf: Vec<INPUT> = Vec::with_capacity(4);
+    for ev in evs {
+        buf.clear();
+        match *ev {
+            InputEvent::Move { x, y } => {
+                let (vx, vy) = input::captured_norm_to_virtual_norm(x, y, out, virt);
+                buf.push(mouse_move_input(vx, vy));
+            }
+            InputEvent::Button { btn, down, x, y } => {
+                let (vx, vy) = input::captured_norm_to_virtual_norm(x, y, out, virt);
+                buf.push(mouse_move_input(vx, vy));
+                let (flag, data) = match (btn, down) {
+                    (0, true) => (MOUSEEVENTF_LEFTDOWN, 0u32),
+                    (0, false) => (MOUSEEVENTF_LEFTUP, 0),
+                    (1, true) => (MOUSEEVENTF_RIGHTDOWN, 0),
+                    (1, false) => (MOUSEEVENTF_RIGHTUP, 0),
+                    (2, true) => (MOUSEEVENTF_MIDDLEDOWN, 0),
+                    (2, false) => (MOUSEEVENTF_MIDDLEUP, 0),
+                    (3, true) => (MOUSEEVENTF_XDOWN, 1),
+                    (3, false) => (MOUSEEVENTF_XUP, 1),
+                    (4, true) => (MOUSEEVENTF_XDOWN, 2),
+                    (4, false) => (MOUSEEVENTF_XUP, 2),
+                    _ => continue,
+                };
+                buf.push(INPUT {
+                    r#type: INPUT_MOUSE,
+                    Anonymous: INPUT_0 {
+                        Mouse: MOUSEINPUT {
+                            dx: 0,
+                            dy: 0,
+                            mouseData: data,
+                            dwFlags: flag,
+                            time: 0,
+                            dwExtraInfo: 0,
+                        },
+                    },
+                });
+            }
+            InputEvent::Wheel { dx, dy, x, y } => {
+                let (vx, vy) = input::captured_norm_to_virtual_norm(x, y, out, virt);
+                buf.push(mouse_move_input(vx, vy));
+                if dy != 0 {
+                    buf.push(INPUT {
+                        r#type: INPUT_MOUSE,
+                        Anonymous: INPUT_0 {
+                            Mouse: MOUSEINPUT {
+                                dx: 0,
+                                dy: 0,
+                                mouseData: dy as i32 as u32,
+                                dwFlags: MOUSEEVENTF_WHEEL,
+                                time: 0,
+                                dwExtraInfo: 0,
+                            },
+                        },
+                    });
+                }
+                if dx != 0 {
+                    buf.push(INPUT {
+                        r#type: INPUT_MOUSE,
+                        Anonymous: INPUT_0 {
+                            Mouse: MOUSEINPUT {
+                                dx: 0,
+                                dy: 0,
+                                mouseData: dx as i32 as u32,
+                                dwFlags: MOUSEEVENTF_HWHEEL,
+                                time: 0,
+                                dwExtraInfo: 0,
+                            },
+                        },
+                    });
+                }
+            }
+            InputEvent::Key { vk, down } => {
+                let base = if is_extended_key(vk) {
+                    KEYEVENTF_EXTENDEDKEY
+                } else {
+                    KEYEVENTF_FLAGS(0)
+                };
+                let flags = if down { base } else { base | KEYEVENTF_KEYUP };
+                buf.push(INPUT {
+                    r#type: INPUT_KEYBOARD,
+                    Anonymous: INPUT_0 {
+                        Keyboard: KEYBDINPUT {
+                            wVk: vk,
+                            wScan: unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) } as u16,
+                            dwFlags: flags,
+                            time: 0,
+                            dwExtraInfo: 0,
+                        },
+                    },
+                });
+            }
+        }
+        if buf.is_empty() {
+            continue;
+        }
+        let sent = unsafe { SendInput(&buf, std::mem::size_of::<INPUT>() as i32) };
+        if sent == buf.len() as u32 {
+            ok += 1;
+        }
+    }
+    ok
+}
+
+/// Абсолютный перенос курсора (виртуальный рабочий стол, 0..=65535).
+fn mouse_move_input(vx: u16, vy: u16) -> windows::Win32::UI::Input::KeyboardAndMouse::INPUT {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_MOVE,
+        MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT,
+    };
+    INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            Mouse: MOUSEINPUT {
+                dx: vx as i32,
+                dy: vy as i32,
+                mouseData: 0,
+                dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
+/// VK-коды, требующие флага extended (стрелки/Ins/Del/Home/End/PgUp/PgDn и др.).
+fn is_extended_key(vk: u16) -> bool {
+    matches!(vk, 0x21..=0x28 | 0x2D | 0x2E | 0x5B..=0x5D | 0x6F)
+}
+
+/// Текущий курсор агента в нормализованных координатах области захвата.
+fn cursor_captured_norm(out: OutputGeom) -> Option<(u16, u16, bool)> {
+    use windows::Win32::UI::WindowsAndMessaging::{CURSOR_SHOWING, CURSORINFO, GetCursorInfo};
+    let mut ci = CURSORINFO::default();
+    ci.cbSize = std::mem::size_of::<CURSORINFO>() as u32;
+    unsafe { GetCursorInfo(&mut ci) }.ok()?;
+    let visible = (ci.flags & CURSOR_SHOWING) != 0;
+    let (nx, ny) = input::screen_to_captured_norm(ci.ptScreenPos.x, ci.ptScreenPos.y, out);
+    Some((nx, ny, visible))
 }
 
 fn flush(mux: &mut MuxEncoder, link: &Duplex) -> bool {

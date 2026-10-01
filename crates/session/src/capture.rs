@@ -17,14 +17,25 @@ use windows::Win32::Graphics::Dxgi::{
 };
 use windows::core::Interface;
 
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+};
+
+use crate::input::RectI;
+
 /// Захват экрана: D3D11-девайс + дупликация вывода 0 + staging-текстура.
 pub struct Capture {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     dupl: IDXGIOutputDuplication,
     staging: ID3D11Texture2D,
+    output_index: u32,
     pub width: usize,
     pub height: usize,
+    /// Левый верхний угол захваченного вывода на виртуальном рабочем столе.
+    pub origin: (i32, i32),
+    /// Виртуальный рабочий стол (все мониторы).
+    pub virt: RectI,
 }
 
 // SAFETY: захват живёт и используется только в одном потоке;
@@ -33,6 +44,11 @@ unsafe impl Send for Capture {}
 
 impl Capture {
     pub fn new() -> Result<Self, String> {
+        Self::new_with_output(0)
+    }
+
+    /// Захват вывода `index` (0 — обычно основной монитор; см. `--monitor` у агента).
+    pub fn new_with_output(index: u32) -> Result<Self, String> {
         unsafe {
             let mut device = None;
             let mut context = None;
@@ -50,15 +66,24 @@ impl Capture {
             .map_err(|e| format!("D3D11CreateDevice: {e}"))?;
             let device = device.ok_or("D3D11 device not created")?;
             let context = context.ok_or("D3D11 context not created")?;
-            let (dupl, w, h) = create_duplication(&device)?;
+            let (dupl, w, h, origin) = create_duplication(&device, index)?;
             let staging = create_staging(&device, w, h)?;
+            let virt = RectI {
+                x: GetSystemMetrics(SM_XVIRTUALSCREEN),
+                y: GetSystemMetrics(SM_YVIRTUALSCREEN),
+                w: GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                h: GetSystemMetrics(SM_CYVIRTUALSCREEN),
+            };
             Ok(Self {
                 device,
                 context,
                 dupl,
                 staging,
+                output_index: index,
                 width: w as usize,
                 height: h as usize,
+                origin,
+                virt,
             })
         }
     }
@@ -66,7 +91,7 @@ impl Capture {
     /// Пересоздать дупликацию после ACCESS_LOST (например, смена разрешения).
     pub fn try_recreate(&mut self) -> bool {
         unsafe {
-            if let Ok((dupl, w, h)) = create_duplication(&self.device) {
+            if let Ok((dupl, w, h, _origin)) = create_duplication(&self.device, self.output_index) {
                 if let Ok(staging) = create_staging(&self.device, w, h) {
                     self.dupl = dupl;
                     self.staging = staging;
@@ -123,15 +148,25 @@ impl Capture {
 
 unsafe fn create_duplication(
     device: &ID3D11Device,
-) -> Result<(IDXGIOutputDuplication, u32, u32), String> {
+    index: u32,
+) -> Result<(IDXGIOutputDuplication, u32, u32, (i32, i32)), String> {
     unsafe {
         let dxgi_device: IDXGIDevice = device.cast().map_err(|e| e.to_string())?;
         let adapter: IDXGIAdapter = dxgi_device.GetAdapter().map_err(|e| e.to_string())?;
-        let output = adapter.EnumOutputs(0).map_err(|e| e.to_string())?;
+        let output = adapter
+            .EnumOutputs(index)
+            .map_err(|e| format!("EnumOutputs({index}): {e}"))?;
+        let desc = output.GetDesc().map_err(|e| e.to_string())?;
+        let origin = (desc.DesktopCoordinates.left, desc.DesktopCoordinates.top);
         let output1: IDXGIOutput1 = output.cast().map_err(|e| e.to_string())?;
         let dupl = output1.DuplicateOutput(device).map_err(|e| e.to_string())?;
-        let desc = dupl.GetDesc();
-        Ok((dupl, desc.ModeDesc.Width, desc.ModeDesc.Height))
+        let dupl_desc = dupl.GetDesc();
+        Ok((
+            dupl,
+            dupl_desc.ModeDesc.Width,
+            dupl_desc.ModeDesc.Height,
+            origin,
+        ))
     }
 }
 

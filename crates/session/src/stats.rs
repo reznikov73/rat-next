@@ -29,6 +29,13 @@ pub struct SessionStats {
     pub codec: String,
     pub recv_bytes: u64,
     pub control_msgs: u64,
+    // ввод/курсор (P3)
+    /// Событий ввода отправлено вьюером.
+    pub input_sent: u64,
+    /// Событий ввода проинъектировано агентом.
+    pub input_recv: u64,
+    /// Обновлений курсора отправлено агентом.
+    pub cursor_sent: u64,
     // выборки (мс)
     pub e2e_ms: Vec<f32>,
     pub rtt_ms: Vec<f32>,
@@ -64,6 +71,7 @@ impl SessionStats {
             "frames: captured={} sent_pkts={} shown={} drops(agent={} viewer={})\n\
              bytes: sent={} recv={}\n\
              fps={:.1}  codec={}  control_msgs={}\n\
+             input: sent={} injected={} cursor={}\n\
              e2e:   avg {:.2}ms  p50 {:.2}ms  p95 {:.2}ms\n\
              rtt:   avg {:.2}ms  p95 {:.2}ms\n\
              errors: agent={} viewer={}{}",
@@ -81,6 +89,9 @@ impl SessionStats {
                 &self.codec
             },
             self.control_msgs,
+            self.input_sent,
+            self.input_recv,
+            self.cursor_sent,
             Self::avg(&self.e2e_ms),
             Self::pct(&self.e2e_ms, 0.5),
             Self::pct(&self.e2e_ms, 0.95),

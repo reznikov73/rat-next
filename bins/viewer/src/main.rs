@@ -61,9 +61,10 @@ mod ui {
     use std::time::{Duration, Instant};
 
     use eframe::egui;
+    use rat_session::input::{self, CursorState, InputEvent, SessionInfo};
     use rat_session::link::{TcpCloser, tcp_connect};
     use rat_session::stats::{SessionStats, TimeBase};
-    use rat_session::viewer::{FrameOut, spawn_viewer};
+    use rat_session::viewer::{FrameOut, ViewerShared, spawn_viewer};
 
     use super::Args;
 
@@ -101,6 +102,11 @@ mod ui {
         finished: bool,
         ui_e2e_ms: Vec<f32>,
         connect: String,
+        input_q: Arc<Mutex<Vec<InputEvent>>>,
+        cursor: Arc<Mutex<CursorState>>,
+        info: Arc<Mutex<Option<SessionInfo>>>,
+        last_pointer: Option<(u16, u16)>,
+        prev_mods: egui::Modifiers,
     }
 
     impl App {
@@ -131,7 +137,21 @@ mod ui {
             let stop = Arc::new(AtomicBool::new(false));
             let base = TimeBase(Instant::now());
             let (tx, rx) = sync_channel::<FrameOut>(3);
-            let handle = spawn_viewer(base, stop.clone(), stats.clone(), link, tx);
+            let input_q: Arc<Mutex<Vec<InputEvent>>> = Arc::new(Mutex::new(Vec::new()));
+            let cursor = Arc::new(Mutex::new(CursorState::default()));
+            let info: Arc<Mutex<Option<SessionInfo>>> = Arc::new(Mutex::new(None));
+            let handle = spawn_viewer(
+                base,
+                stop.clone(),
+                stats.clone(),
+                link,
+                tx,
+                ViewerShared {
+                    input_q: input_q.clone(),
+                    cursor: cursor.clone(),
+                    info: info.clone(),
+                },
+            );
 
             Self {
                 rx,
@@ -147,6 +167,11 @@ mod ui {
                 finished: false,
                 ui_e2e_ms: Vec::new(),
                 connect,
+                input_q,
+                cursor,
+                info,
+                last_pointer: None,
+                prev_mods: egui::Modifiers::default(),
             }
         }
 
@@ -177,6 +202,9 @@ mod ui {
 
     impl eframe::App for App {
         fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+            let input_q = self.input_q.clone();
+            let cursor = self.cursor.clone();
+            let info = self.info.clone();
             loop {
                 match self.rx.try_recv() {
                     Ok(f) => {
@@ -231,6 +259,13 @@ mod ui {
                     ui.label(format!("rtt {:.2}ms", SessionStats::avg(&st.rtt_ms)));
                     ui.separator();
                     ui.label(format!("ctrl msgs: {}", st.control_msgs));
+                    ui.separator();
+                    if let Some(si) = info.lock().unwrap().as_ref() {
+                        ui.label(format!(
+                            "монитор {}×{} @ ({},{})",
+                            si.out.width, si.out.height, si.out.origin_x, si.out.origin_y
+                        ));
+                    }
                 });
             });
 
@@ -248,12 +283,14 @@ mod ui {
                     ));
                 } else {
                     ui.label(
-                        "P2-пилот: сессия агент ↔ вьюер поверх TCP. \
+                        "P3-пилот: видео + ввод (мышь/клава/курсор). \
+                         Ввод активен, когда курсор над видео. \
                          Закройте окно для остановки.",
                     );
                 }
             });
 
+            let mut video_rect: Option<egui::Rect> = None;
             egui::CentralPanel::default().show(ui, |ui| {
                 let rect = ui.available_rect_before_wrap();
                 ui.painter()
@@ -280,6 +317,7 @@ mod ui {
                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                         egui::Color32::WHITE,
                     );
+                    video_rect = Some(draw);
                 } else {
                     ui.painter().text(
                         rect.center(),
@@ -290,6 +328,140 @@ mod ui {
                     );
                 }
             });
+
+            // Захват ввода над видео и отрисовка удалённого курсора (P3).
+            if let Some(draw) = video_rect {
+                let resp = ui.allocate_rect(draw, egui::Sense::click_and_drag());
+                let mut locked = input_q.lock().unwrap();
+                if resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+                    if let Some(p) = resp.interact_pointer_pos() {
+                        let rel = p - draw.min;
+                        let (nx, ny) =
+                            input::ui_px_to_norm(rel.x, rel.y, draw.width(), draw.height());
+                        self.last_pointer = Some((nx, ny));
+                        locked.push(InputEvent::Move { x: nx, y: ny });
+                    }
+                    let (mx, my) = self.last_pointer.unwrap_or((32768, 32768));
+                    ui.ctx().input(|inp| {
+                        use egui::PointerButton as PB;
+                        for (b, idx) in [
+                            (PB::Primary, 0u8),
+                            (PB::Secondary, 1),
+                            (PB::Middle, 2),
+                            (PB::Extra1, 3),
+                            (PB::Extra2, 4),
+                        ] {
+                            if inp.pointer.button_clicked(b) {
+                                locked.push(InputEvent::Button {
+                                    btn: idx,
+                                    down: true,
+                                    x: mx,
+                                    y: my,
+                                });
+                            }
+                            if inp.pointer.button_released(b) {
+                                locked.push(InputEvent::Button {
+                                    btn: idx,
+                                    down: false,
+                                    x: mx,
+                                    y: my,
+                                });
+                            }
+                        }
+                        let sd = inp.raw_scroll_delta;
+                        if sd.x.abs() > 0.5 || sd.y.abs() > 0.5 {
+                            locked.push(InputEvent::Wheel {
+                                dx: sd.x.clamp(-32768.0, 32767.0) as i16,
+                                dy: sd.y.clamp(-32768.0, 32767.0) as i16,
+                                x: mx,
+                                y: my,
+                            });
+                        }
+                        for ev in &inp.events {
+                            match ev {
+                                egui::Event::Key { key, pressed, .. } => {
+                                    if let Some(vk) = vk_of_key(*key) {
+                                        locked.push(InputEvent::Key { vk, down: *pressed });
+                                    }
+                                }
+                                egui::Event::Text(t) => {
+                                    for ch in t.chars() {
+                                        if let Some((vk, sh, ct, al)) = input::vk_for_char(ch) {
+                                            if al {
+                                                locked.push(InputEvent::Key {
+                                                    vk: 0x12,
+                                                    down: true,
+                                                });
+                                            }
+                                            if ct {
+                                                locked.push(InputEvent::Key {
+                                                    vk: 0x11,
+                                                    down: true,
+                                                });
+                                            }
+                                            if sh {
+                                                locked.push(InputEvent::Key {
+                                                    vk: 0x10,
+                                                    down: true,
+                                                });
+                                            }
+                                            locked.push(InputEvent::Key { vk, down: true });
+                                            locked.push(InputEvent::Key { vk, down: false });
+                                            if sh {
+                                                locked.push(InputEvent::Key {
+                                                    vk: 0x10,
+                                                    down: false,
+                                                });
+                                            }
+                                            if ct {
+                                                locked.push(InputEvent::Key {
+                                                    vk: 0x11,
+                                                    down: false,
+                                                });
+                                            }
+                                            if al {
+                                                locked.push(InputEvent::Key {
+                                                    vk: 0x12,
+                                                    down: false,
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    });
+                    // Модификаторы egui отдаёт состоянием, а не событием — шлём рёбра.
+                    let m = ui.ctx().input(|i| i.modifiers);
+                    let pm = self.prev_mods;
+                    for (now_on, was_on, vk) in [
+                        (m.shift, pm.shift, 0x10u16),
+                        (m.ctrl, pm.ctrl, 0x11),
+                        (m.alt, pm.alt, 0x12),
+                    ] {
+                        if now_on && !was_on {
+                            locked.push(InputEvent::Key { vk, down: true });
+                        }
+                        if !now_on && was_on {
+                            locked.push(InputEvent::Key { vk, down: false });
+                        }
+                    }
+                    self.prev_mods = m;
+                }
+                drop(locked);
+
+                // Удалённый курсор поверх видео.
+                let cs = *cursor.lock().unwrap();
+                if cs.visible {
+                    let (px, py) = input::norm_to_ui_px(cs.x, cs.y, draw.width(), draw.height());
+                    let pos = egui::pos2(draw.min.x + px, draw.min.y + py);
+                    ui.painter()
+                        .circle_filled(pos, 5.0, egui::Color32::from_black_alpha_180());
+                    ui.painter().circle_filled(pos, 2.5, egui::Color32::WHITE);
+                }
+            }
 
             if let Some(secs) = self.smoke {
                 if self.started.elapsed().as_secs_f32() >= secs && !self.finished {
@@ -309,5 +481,76 @@ mod ui {
         fn drop(&mut self) {
             self.finish();
         }
+    }
+
+    /// egui-клавиша → Windows VK (для непечатаемых; печатные идут через vk_for_char).
+    fn vk_of_key(key: egui::Key) -> Option<u16> {
+        use egui::Key as K;
+        Some(match key {
+            K::ArrowUp => 0x26,
+            K::ArrowDown => 0x28,
+            K::ArrowLeft => 0x25,
+            K::ArrowRight => 0x27,
+            K::Enter => 0x0D,
+            K::Escape => 0x1B,
+            K::Backspace => 0x08,
+            K::Delete => 0x2E,
+            K::Insert => 0x2D,
+            K::Home => 0x24,
+            K::End => 0x23,
+            K::PageUp => 0x21,
+            K::PageDown => 0x22,
+            K::Tab => 0x09,
+            K::Space => 0x20,
+            K::F1 => 0x70,
+            K::F2 => 0x71,
+            K::F3 => 0x72,
+            K::F4 => 0x73,
+            K::F5 => 0x74,
+            K::F6 => 0x75,
+            K::F7 => 0x76,
+            K::F8 => 0x77,
+            K::F9 => 0x78,
+            K::F10 => 0x79,
+            K::F11 => 0x7A,
+            K::F12 => 0x7B,
+            K::A => 0x41,
+            K::B => 0x42,
+            K::C => 0x43,
+            K::D => 0x44,
+            K::E => 0x45,
+            K::F => 0x46,
+            K::G => 0x47,
+            K::H => 0x48,
+            K::I => 0x49,
+            K::J => 0x4A,
+            K::K => 0x4B,
+            K::L => 0x4C,
+            K::M => 0x4D,
+            K::N => 0x4E,
+            K::O => 0x4F,
+            K::P => 0x50,
+            K::Q => 0x51,
+            K::R => 0x52,
+            K::S => 0x53,
+            K::T => 0x54,
+            K::U => 0x55,
+            K::V => 0x56,
+            K::W => 0x57,
+            K::X => 0x58,
+            K::Y => 0x59,
+            K::Z => 0x5A,
+            K::Num0 => 0x30,
+            K::Num1 => 0x31,
+            K::Num2 => 0x32,
+            K::Num3 => 0x33,
+            K::Num4 => 0x34,
+            K::Num5 => 0x35,
+            K::Num6 => 0x36,
+            K::Num7 => 0x37,
+            K::Num8 => 0x38,
+            K::Num9 => 0x39,
+            _ => return None,
+        })
     }
 }

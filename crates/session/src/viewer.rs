@@ -15,6 +15,7 @@ use rat_proto::rat::v0::envelope::Body;
 use crate::control;
 use crate::ffmpeg::{Decoder, Sws, pix_fmt, sws_yuv_to_rgba};
 use crate::frame;
+use crate::input::{self, CursorState, InputEvent, SessionInfo};
 use crate::link::Duplex;
 use crate::stats::{SessionStats, TimeBase, now_us};
 
@@ -33,6 +34,13 @@ fn send_ping(out: &mut MuxEncoder, id: u64, pending: &mut HashMap<u64, Instant>)
     pending.insert(id, Instant::now());
 }
 
+/// Общее состояние вьюерской стороны: очередь ввода из UI, курсор и геометрия от агента.
+pub struct ViewerShared {
+    pub input_q: Arc<Mutex<Vec<InputEvent>>>,
+    pub cursor: Arc<Mutex<CursorState>>,
+    pub info: Arc<Mutex<Option<SessionInfo>>>,
+}
+
 /// Запустить вьюерскую половину сессии.
 pub fn spawn_viewer(
     base: TimeBase,
@@ -40,6 +48,7 @@ pub fn spawn_viewer(
     stats: Arc<Mutex<SessionStats>>,
     link: Duplex,
     ui_tx: SyncSender<FrameOut>,
+    shared: ViewerShared,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         set_above_normal();
@@ -79,7 +88,11 @@ pub fn spawn_viewer(
                 match mux.poll_frame() {
                     Ok(Some(f)) => match f.channel {
                         Channel::Control => {
-                            if let Some(env) = control::decode_env(f.payload) {
+                            if f.payload.first() == Some(&input::META_MAGIC) {
+                                if let Some(si) = input::parse_session_info(f.payload) {
+                                    *shared.info.lock().unwrap() = Some(si);
+                                }
+                            } else if let Some(env) = control::decode_env(f.payload) {
                                 stats.lock().unwrap().control_msgs += 1;
                                 match env.body {
                                     Some(Body::Hello(_)) => {
@@ -202,6 +215,11 @@ pub fn spawn_viewer(
                                 }
                             }
                         }
+                        Channel::Cursor => {
+                            if let Some(c) = input::parse_cursor(f.payload) {
+                                *shared.cursor.lock().unwrap() = c;
+                            }
+                        }
                         _ => {}
                     },
                     Ok(None) => break,
@@ -220,6 +238,15 @@ pub fn spawn_viewer(
                 send_ping(&mut out, next_ping, &mut pending);
                 next_ping += 1;
                 last_ping = Instant::now();
+            }
+            // Отправить накопленный ввод (с коалессингом движений мыши).
+            let batch: Vec<InputEvent> = std::mem::take(&mut *shared.input_q.lock().unwrap());
+            if !batch.is_empty() {
+                let coalesced = input::coalesce_moves(batch);
+                let mut buf = Vec::with_capacity(2 + coalesced.len() * 9);
+                input::pack_batch(&mut buf, &coalesced);
+                out.push(Channel::Input, 0, &buf);
+                stats.lock().unwrap().input_sent += coalesced.len() as u64;
             }
             if !out.is_empty() && link.tx.send(out.take_bytes()).is_err() {
                 break;

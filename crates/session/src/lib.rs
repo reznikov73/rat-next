@@ -6,6 +6,7 @@
 
 pub mod control;
 pub mod frame;
+pub mod input;
 pub mod link;
 pub mod stats;
 

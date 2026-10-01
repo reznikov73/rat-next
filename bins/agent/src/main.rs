@@ -15,6 +15,7 @@ struct Args {
     fps: u32,
     bitrate: i64,
     codec: String,
+    monitor: u32,
     smoke: Option<f32>,
 }
 
@@ -24,6 +25,7 @@ fn parse_args() -> Args {
         fps: 30,
         bitrate: 8_000_000,
         codec: std::env::var("VIDEO_CODEC").unwrap_or_else(|_| "h264_qsv".to_string()),
+        monitor: 0,
         smoke: None,
     };
     let args: Vec<String> = std::env::args().collect();
@@ -45,6 +47,10 @@ fn parse_args() -> Args {
             }
             "--codec" if i + 1 < args.len() => {
                 a.codec = args[i + 1].clone();
+                i += 2;
+            }
+            "--monitor" if i + 1 < args.len() => {
+                a.monitor = args[i + 1].parse().unwrap_or(0);
                 i += 2;
             }
             s if s.starts_with("--smoke=") => {
@@ -113,6 +119,7 @@ fn run(args: Args) -> Result<(), String> {
         fps: args.fps,
         bitrate: args.bitrate,
         codec: args.codec,
+        monitor: args.monitor,
         ..AgentConfig::default()
     };
     let handles = spawn_agent(base, stop.clone(), stats.clone(), link, cfg)?;
