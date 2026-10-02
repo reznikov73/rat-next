@@ -47,23 +47,21 @@ fn main() {
         .compile("rlvideo_shim");
 
     // Копируем DLL ffmpeg рядом с exe (target/<profile>/).
-    if let Ok(out) = std::env::var("OUT_DIR") {
-        if let Some(profile_dir) = Path::new(&out).ancestors().nth(3) {
-            if bin.exists() {
-                if let Ok(rd) = std::fs::read_dir(&bin) {
-                    let mut copied = 0;
-                    for e in rd.flatten() {
-                        let p = e.path();
-                        if p.extension().map(|x| x == "dll").unwrap_or(false) {
-                            if std::fs::copy(&p, profile_dir.join(p.file_name().unwrap())).is_ok() {
-                                copied += 1;
-                            }
-                        }
-                    }
-                    println!("cargo:warning=скопировано DLL ffmpeg: {copied}");
-                }
+    if let Ok(out) = std::env::var("OUT_DIR")
+        && let Some(profile_dir) = Path::new(&out).ancestors().nth(3)
+        && bin.exists()
+        && let Ok(rd) = std::fs::read_dir(&bin)
+    {
+        let mut copied = 0;
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().map(|x| x == "dll").unwrap_or(false)
+                && std::fs::copy(&p, profile_dir.join(p.file_name().unwrap())).is_ok()
+            {
+                copied += 1;
             }
         }
+        println!("cargo:warning=скопировано DLL ffmpeg: {copied}");
     }
 }
 

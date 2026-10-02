@@ -72,14 +72,23 @@
       "console": "internalConsole"
     },
     {
-      "name": "Продукт: rat-viewer (заглушка)",
+      "name": "Прод: rat-agent (debug)",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}\\target\\debug\\rat-agent.exe",
+      "args": ["--listen", "127.0.0.1:55140"],
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "build: agent (debug, ffmpeg)",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Прод: rat-viewer (debug)",
       "type": "cppvsdbg",
       "request": "launch",
       "program": "${workspaceFolder}\\target\\debug\\rat-viewer.exe",
-      "args": [],
+      "args": ["--connect", "127.0.0.1:55140"],
       "cwd": "${workspaceFolder}",
-      "preLaunchTask": "build: workspace",
+      "preLaunchTask": "build: viewer (debug, ffmpeg)",
       "console": "integratedTerminal"
-    }
-  ]
+    }]
 }

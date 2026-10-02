@@ -125,6 +125,62 @@
       "type": "shell",
       "command": "powershell",
       "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\scripts\\vsc-task.ps1", "-Dir", "spikes/session_loopback", "-Cmd", "run --release -- --smoke=15"]
+    },
+    {
+      "label": "build: agent (release, ffmpeg)",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\scripts\\vsc-task.ps1", "-Dir", ".", "-Cmd", "build --release -p rat-agent --features rat-agent/ffmpeg"],
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "build: viewer (release, ffmpeg)",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\scripts\\vsc-task.ps1", "-Dir", ".", "-Cmd", "build --release -p rat-viewer --features rat-viewer/ffmpeg"],
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "build: agent (debug, ffmpeg)",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\scripts\\vsc-task.ps1", "-Dir", ".", "-Cmd", "build -p rat-agent --features rat-agent/ffmpeg"],
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "build: viewer (debug, ffmpeg)",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\scripts\\vsc-task.ps1", "-Dir", ".", "-Cmd", "build -p rat-viewer --features rat-viewer/ffmpeg"],
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "run: agent (release, ffmpeg)",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\scripts\\vsc-task.ps1", "-Dir", ".", "-Cmd", "run --release -p rat-agent --features rat-agent/ffmpeg -- --listen 127.0.0.1:55140"],
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "run: viewer (release, ffmpeg)",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\scripts\\vsc-task.ps1", "-Dir", ".", "-Cmd", "run --release -p rat-viewer --features rat-viewer/ffmpeg -- --connect 127.0.0.1:55140"],
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "run: agent (smoke 20s)",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\scripts\\vsc-task.ps1", "-Dir", ".", "-Cmd", "run --release -p rat-agent --features rat-agent/ffmpeg -- --listen 127.0.0.1:55140 --smoke=20"],
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "run: viewer (smoke 15s)",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\scripts\\vsc-task.ps1", "-Dir", ".", "-Cmd", "run --release -p rat-viewer --features rat-viewer/ffmpeg -- --connect 127.0.0.1:55140 --smoke=15"],
+      "problemMatcher": ["$rustc"]
     }
   ]
 }

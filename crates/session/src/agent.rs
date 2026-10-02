@@ -29,6 +29,9 @@ pub const AGENT_CAPABILITIES: &[&str] = &[
     "monitors.v0",
 ];
 
+/// Кадры «в полёте»: (frame_id, ts_us_capture, t_sent, cap_ms).
+type Inflight = VecDeque<(u64, u64, Instant, f32)>;
+
 #[derive(Clone)]
 pub struct AgentConfig {
     pub fps: u32,
@@ -101,9 +104,7 @@ pub fn spawn_agent(
 
     let sws_in = Sws::new(cw as u32, ch as u32, pix_fmt(0), pix_fmt(1))?;
     let enc_shared = Arc::new(Mutex::new(enc));
-    // (frame_id, ts_us_capture, t_sent, cap_ms)
-    let inflight: Arc<Mutex<VecDeque<(u64, u64, Instant, f32)>>> =
-        Arc::new(Mutex::new(VecDeque::new()));
+    let inflight: Arc<Mutex<Inflight>> = Arc::new(Mutex::new(VecDeque::new()));
 
     // --- Поток A: пейсинг + захват + отправка в энкодер ---
     let stop_a = stop.clone();
@@ -266,11 +267,11 @@ pub fn spawn_agent(
                                     mux.push(Channel::Control, 0, &control::encode_env(&pong));
                                 }
                             }
-                        } else if f.channel == Channel::Input {
-                            if let Some(evs) = input::parse_batch(f.payload) {
-                                let n = inject_events(&evs, out_geom, virt);
-                                stats_b.lock().unwrap().input_recv += n as u64;
-                            }
+                        } else if f.channel == Channel::Input
+                            && let Some(evs) = input::parse_batch(f.payload)
+                        {
+                            let n = inject_events(&evs, out_geom, virt);
+                            stats_b.lock().unwrap().input_recv += n as u64;
                         }
                     }
                     Ok(None) => break,
@@ -323,14 +324,14 @@ pub fn spawn_agent(
             // 2.5) курсор агента (droppable, «последний выигрывает»).
             if last_cursor_t.elapsed() >= Duration::from_millis(33) {
                 last_cursor_t = Instant::now();
-                if let Some((cx, cy, vis)) = cursor_captured_norm(out_geom) {
-                    if last_cursor != Some((cx, cy, vis)) {
-                        let mut cb = [0u8; 5];
-                        input::pack_cursor(&mut cb, cx, cy, vis);
-                        mux.push(Channel::Cursor, flags::DROPPABLE, &cb);
-                        last_cursor = Some((cx, cy, vis));
-                        stats_b.lock().unwrap().cursor_sent += 1;
-                    }
+                if let Some((cx, cy, vis)) = cursor_captured_norm(out_geom)
+                    && last_cursor != Some((cx, cy, vis))
+                {
+                    let mut cb = [0u8; 5];
+                    input::pack_cursor(&mut cb, cx, cy, vis);
+                    mux.push(Channel::Cursor, flags::DROPPABLE, &cb);
+                    last_cursor = Some((cx, cy, vis));
+                    stats_b.lock().unwrap().cursor_sent += 1;
                 }
             }
 
@@ -355,11 +356,11 @@ pub fn spawn_agent(
 /// Инъекция событий ввода через SendInput. Возвращает число обработанных событий.
 fn inject_events(evs: &[InputEvent], out: OutputGeom, virt: RectI) -> u32 {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
-        KEYEVENTF_FLAGS, KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, MOUSEEVENTF_HWHEEL,
+        INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
+        KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, MOUSEEVENTF_HWHEEL,
         MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
         MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
-        MOUSEEVENTF_XUP, MOUSEINPUT, MapVirtualKeyW, SendInput,
+        MOUSEEVENTF_XUP, MOUSEINPUT, MapVirtualKeyW, SendInput, VIRTUAL_KEY,
     };
 
     let mut ok = 0u32;
@@ -390,7 +391,7 @@ fn inject_events(evs: &[InputEvent], out: OutputGeom, virt: RectI) -> u32 {
                 buf.push(INPUT {
                     r#type: INPUT_MOUSE,
                     Anonymous: INPUT_0 {
-                        Mouse: MOUSEINPUT {
+                        mi: MOUSEINPUT {
                             dx: 0,
                             dy: 0,
                             mouseData: data,
@@ -408,7 +409,7 @@ fn inject_events(evs: &[InputEvent], out: OutputGeom, virt: RectI) -> u32 {
                     buf.push(INPUT {
                         r#type: INPUT_MOUSE,
                         Anonymous: INPUT_0 {
-                            Mouse: MOUSEINPUT {
+                            mi: MOUSEINPUT {
                                 dx: 0,
                                 dy: 0,
                                 mouseData: dy as i32 as u32,
@@ -423,7 +424,7 @@ fn inject_events(evs: &[InputEvent], out: OutputGeom, virt: RectI) -> u32 {
                     buf.push(INPUT {
                         r#type: INPUT_MOUSE,
                         Anonymous: INPUT_0 {
-                            Mouse: MOUSEINPUT {
+                            mi: MOUSEINPUT {
                                 dx: 0,
                                 dy: 0,
                                 mouseData: dx as i32 as u32,
@@ -439,14 +440,14 @@ fn inject_events(evs: &[InputEvent], out: OutputGeom, virt: RectI) -> u32 {
                 let base = if is_extended_key(vk) {
                     KEYEVENTF_EXTENDEDKEY
                 } else {
-                    KEYEVENTF_FLAGS(0)
+                    KEYBD_EVENT_FLAGS(0)
                 };
                 let flags = if down { base } else { base | KEYEVENTF_KEYUP };
                 buf.push(INPUT {
                     r#type: INPUT_KEYBOARD,
                     Anonymous: INPUT_0 {
-                        Keyboard: KEYBDINPUT {
-                            wVk: vk,
+                        ki: KEYBDINPUT {
+                            wVk: VIRTUAL_KEY(vk),
                             wScan: unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) } as u16,
                             dwFlags: flags,
                             time: 0,
@@ -476,7 +477,7 @@ fn mouse_move_input(vx: u16, vy: u16) -> windows::Win32::UI::Input::KeyboardAndM
     INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 {
-            Mouse: MOUSEINPUT {
+            mi: MOUSEINPUT {
                 dx: vx as i32,
                 dy: vy as i32,
                 mouseData: 0,
@@ -496,10 +497,12 @@ fn is_extended_key(vk: u16) -> bool {
 /// Текущий курсор агента в нормализованных координатах области захвата.
 fn cursor_captured_norm(out: OutputGeom) -> Option<(u16, u16, bool)> {
     use windows::Win32::UI::WindowsAndMessaging::{CURSOR_SHOWING, CURSORINFO, GetCursorInfo};
-    let mut ci = CURSORINFO::default();
-    ci.cbSize = std::mem::size_of::<CURSORINFO>() as u32;
+    let mut ci = CURSORINFO {
+        cbSize: std::mem::size_of::<CURSORINFO>() as u32,
+        ..Default::default()
+    };
     unsafe { GetCursorInfo(&mut ci) }.ok()?;
-    let visible = (ci.flags & CURSOR_SHOWING) != 0;
+    let visible = (ci.flags.0 & CURSOR_SHOWING.0) != 0;
     let (nx, ny) = input::screen_to_captured_norm(ci.ptScreenPos.x, ci.ptScreenPos.y, out);
     Some((nx, ny, visible))
 }

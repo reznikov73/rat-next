@@ -364,6 +364,10 @@ impl Drop for Sws {
 // (sws_in — в потоке захвата, sws_out — в потоке декода).
 unsafe impl Send for Sws {}
 
+/// # Safety
+/// `sws` — валидный контекст под пару BGRA→NV12; указатели буферов валидны для
+/// заявленных размеров/шагов.
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn sws_bgra_to_nv12(
     sws: *mut c_void,
     bgra: *const u8,
@@ -388,6 +392,8 @@ pub unsafe fn sws_bgra_to_nv12(
     }
 }
 
+/// # Safety
+/// Аналогично [`sws_bgra_to_nv12`]: валидные указатели и буферы заявленных размеров.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn sws_yuv_to_rgba(
     sws: *mut c_void,

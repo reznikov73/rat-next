@@ -369,7 +369,7 @@ mod ui {
                                 });
                             }
                         }
-                        let sd = inp.raw_scroll_delta;
+                        let sd = inp.smooth_scroll_delta;
                         if sd.x.abs() > 0.5 || sd.y.abs() > 0.5 {
                             locked.push(InputEvent::Wheel {
                                 dx: sd.x.clamp(-32768.0, 32767.0) as i16,
@@ -458,15 +458,16 @@ mod ui {
                     let (px, py) = input::norm_to_ui_px(cs.x, cs.y, draw.width(), draw.height());
                     let pos = egui::pos2(draw.min.x + px, draw.min.y + py);
                     ui.painter()
-                        .circle_filled(pos, 5.0, egui::Color32::from_black_alpha_180());
+                        .circle_filled(pos, 5.0, egui::Color32::from_black_alpha(180));
                     ui.painter().circle_filled(pos, 2.5, egui::Color32::WHITE);
                 }
             }
 
-            if let Some(secs) = self.smoke {
-                if self.started.elapsed().as_secs_f32() >= secs && !self.finished {
-                    self.finish();
-                }
+            if let Some(secs) = self.smoke
+                && self.started.elapsed().as_secs_f32() >= secs
+                && !self.finished
+            {
+                self.finish();
             }
 
             if self.finished {

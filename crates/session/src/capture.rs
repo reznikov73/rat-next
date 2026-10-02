@@ -91,14 +91,14 @@ impl Capture {
     /// Пересоздать дупликацию после ACCESS_LOST (например, смена разрешения).
     pub fn try_recreate(&mut self) -> bool {
         unsafe {
-            if let Ok((dupl, w, h, _origin)) = create_duplication(&self.device, self.output_index) {
-                if let Ok(staging) = create_staging(&self.device, w, h) {
-                    self.dupl = dupl;
-                    self.staging = staging;
-                    self.width = w as usize;
-                    self.height = h as usize;
-                    return true;
-                }
+            if let Ok((dupl, w, h, _origin)) = create_duplication(&self.device, self.output_index)
+                && let Ok(staging) = create_staging(&self.device, w, h)
+            {
+                self.dupl = dupl;
+                self.staging = staging;
+                self.width = w as usize;
+                self.height = h as usize;
+                return true;
             }
             false
         }

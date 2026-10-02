@@ -60,12 +60,13 @@ pub enum InputEvent {
     Key { vk: u16, down: bool },
 }
 
+/// Длина ТЕЛА события (без тега) в байтах.
 fn event_len(tag: u8) -> Option<usize> {
     Some(match tag {
-        1 => 5,
-        2 => 7,
-        3 => 9,
-        4 => 5,
+        1 => 4,
+        2 => 6,
+        3 => 8,
+        4 => 3,
         _ => return None,
     })
 }
@@ -149,12 +150,12 @@ pub fn parse_batch(payload: &[u8]) -> Option<Vec<InputEvent>> {
 pub fn coalesce_moves(events: Vec<InputEvent>) -> Vec<InputEvent> {
     let mut out: Vec<InputEvent> = Vec::with_capacity(events.len());
     for e in events {
-        if let InputEvent::Move { x, y } = e {
-            if let Some(InputEvent::Move { x: lx, y: ly }) = out.last_mut() {
-                *lx = x;
-                *ly = y;
-                continue;
-            }
+        if let InputEvent::Move { x, y } = e
+            && let Some(InputEvent::Move { x: lx, y: ly }) = out.last_mut()
+        {
+            *lx = x;
+            *ly = y;
+            continue;
         }
         out.push(e);
     }
@@ -305,7 +306,7 @@ mod tests {
         ];
         let mut buf = Vec::new();
         pack_batch(&mut buf, &evs);
-        assert_eq!(buf.len(), 2 + 5 + 7 + 9 + 5);
+        assert_eq!(buf.len(), 2 + 5 + 7 + 9 + 4);
         assert_eq!(parse_batch(&buf).unwrap(), evs);
     }
 
