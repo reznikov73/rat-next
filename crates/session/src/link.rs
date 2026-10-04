@@ -45,6 +45,9 @@ pub fn tcp_accept(listener: &TcpListener) -> io::Result<(Duplex, TcpCloser)> {
 }
 
 fn tcp_wrap(stream: TcpStream) -> io::Result<(Duplex, TcpCloser)> {
+    // Принятое соединение всегда блокирующее (листенер может быть неблокирующим
+    // при accept-цикле агента).
+    stream.set_nonblocking(false)?;
     stream.set_nodelay(true)?;
     let mut rd = stream.try_clone()?;
     let mut wr = stream.try_clone()?;

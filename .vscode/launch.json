@@ -76,7 +76,7 @@
       "type": "cppvsdbg",
       "request": "launch",
       "program": "${workspaceFolder}\\target\\debug\\rat-agent.exe",
-      "args": ["--listen", "127.0.0.1:55140"],
+      "args": ["--listen", "0.0.0.0:55140"],
       "cwd": "${workspaceFolder}",
       "preLaunchTask": "build: agent (debug, ffmpeg)",
       "console": "integratedTerminal"

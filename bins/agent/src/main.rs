@@ -1,6 +1,7 @@
 //! `rat-agent` — агент Rat Next.
 //!
-//! P2 (пилот): одна видеосессия поверх TCP — захват экрана → H.264 → mux-кадры.
+//! P3 (пилот): видеосессии поверх TCP в цикле — агент обслуживает подключения
+//! подряд (после отключения вьюера снова ждёт следующий), Ctrl+C — остановить.
 //! Продуктовый запуск — служба Windows (Session 0), см. docs/ARCHITECTURE_DESIGN_v1.1.md §3.
 //!
 //! Запуск:
@@ -86,7 +87,7 @@ fn main() {
 fn run(args: Args) -> Result<(), String> {
     use std::io::Write as _;
     use std::net::TcpListener;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -96,40 +97,65 @@ fn run(args: Args) -> Result<(), String> {
 
     let listener =
         TcpListener::bind(&args.listen).map_err(|e| format!("bind {}: {e}", args.listen))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("set_nonblocking: {e}"))?;
     println!("AGENT_LISTENING {}", args.listen);
+    if args.listen.starts_with("127.") || args.listen.starts_with("localhost") {
+        println!(
+            "[agent] ВНИМАНИЕ: слушаю только локально — из сети этот порт недоступен. \
+             Для доступа из сети: --listen 0.0.0.0:55140 (или scripts\\run-agent-lan.cmd)"
+        );
+    }
+    println!("[agent] Жду подключения. Ctrl+C — остановить.");
     let _ = std::io::stdout().flush();
 
-    let (link, closer) = tcp_accept(&listener).map_err(|e| format!("accept: {e}"))?;
-    println!("AGENT_CLIENT_CONNECTED");
-    let _ = std::io::stdout().flush();
+    let started = Instant::now();
+    loop {
+        if let Some(secs) = args.smoke
+            && started.elapsed().as_secs_f32() >= secs
+        {
+            println!("AGENT_STOPPED (smoke-таймер истёк)");
+            break;
+        }
+        match tcp_accept(&listener) {
+            Ok((link, closer)) => {
+                println!("AGENT_CLIENT_CONNECTED");
+                let _ = std::io::stdout().flush();
 
-    let base = TimeBase(Instant::now());
-    let stop = Arc::new(AtomicBool::new(false));
-    let stats = Arc::new(Mutex::new(SessionStats::default()));
-
-    if let Some(secs) = args.smoke {
-        let stop_wd = stop.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs_f32(secs));
-            stop_wd.store(true, Ordering::Relaxed);
-        });
+                let base = TimeBase(Instant::now());
+                let stop = Arc::new(AtomicBool::new(false));
+                let stats = Arc::new(Mutex::new(SessionStats::default()));
+                let cfg = AgentConfig {
+                    fps: args.fps,
+                    bitrate: args.bitrate,
+                    codec: args.codec.clone(),
+                    monitor: args.monitor,
+                    ..AgentConfig::default()
+                };
+                match spawn_agent(base, stop.clone(), stats.clone(), link, cfg) {
+                    Ok(handles) => {
+                        for h in handles {
+                            let _ = h.join();
+                        }
+                        closer.close();
+                        let st = stats.lock().unwrap();
+                        println!("=== AGENT SUMMARY ===");
+                        println!("{}", st.summary());
+                    }
+                    Err(e) => {
+                        closer.close();
+                        eprintln!("[agent] ошибка старта сессии: {e}");
+                    }
+                }
+                println!("AGENT_WAITING_FOR_CLIENT");
+                let _ = std::io::stdout().flush();
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => return Err(format!("accept: {e}")),
+        }
     }
-
-    let cfg = AgentConfig {
-        fps: args.fps,
-        bitrate: args.bitrate,
-        codec: args.codec,
-        monitor: args.monitor,
-        ..AgentConfig::default()
-    };
-    let handles = spawn_agent(base, stop.clone(), stats.clone(), link, cfg)?;
-    for h in handles {
-        let _ = h.join();
-    }
-    closer.close();
-
-    let st = stats.lock().unwrap();
-    println!("=== AGENT SUMMARY ===");
-    println!("{}", st.summary());
     Ok(())
 }
