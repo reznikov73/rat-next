@@ -1,14 +1,25 @@
 @echo off
-chcp 65001 >nul
-title Rat Next — Вьюер
-set /p IP=Введите IP-адрес машины агента (например 192.168.1.50): 
-if "%IP%"=="" (
-  echo IP не введён.
+setlocal
+title Rat Next - Viewer
+set "EXE=%~dp0..\target\release\rat-viewer.exe"
+if not exist "%EXE%" (
+  echo [rat-next] rat-viewer.exe not found:
+  echo   %EXE%
+  echo Build it first:
+  echo   cargo build --release -p rat-viewer --features rat-viewer/ffmpeg
   pause
   exit /b 1
 )
-echo Подключение к %IP%:55140 ...
-"%~dp0..\target\release\rat-viewer.exe" --connect %IP%:55140
+set "IP="
+set /p "IP=Enter agent machine IP (e.g. 192.168.1.50): "
+set "IP=%IP: =%"
+if "%IP%"=="" (
+  echo [rat-next] No IP entered.
+  pause
+  exit /b 1
+)
+echo [rat-next] Connecting to %IP%:55140 ...
+"%EXE%" --connect %IP%:55140
 echo.
-echo Вьюер закрыт.
+echo [rat-next] Viewer closed.
 pause
