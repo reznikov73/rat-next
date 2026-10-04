@@ -9,6 +9,7 @@
 //! rat.exe                                  # сервер стартует автоматически, порт 55140
 //! rat.exe --port 55140
 //! rat.exe --monitor 1                      # отдавать второй экран (индекс 1)
+//! rat.exe --switch-after=4                 # тест: через 4 сек переключить монитор
 //! rat.exe --autoconnect 192.168.1.50:55140
 //! rat.exe --smoke=15                       # авто-выход через 15 сек (тесты)
 //! ```
@@ -20,6 +21,7 @@ struct Args {
     monitor: u32,
     autoconnect: Option<String>,
     smoke: Option<f32>,
+    switch_after: Option<f32>,
 }
 
 #[cfg_attr(not(feature = "ffmpeg"), allow(dead_code))]
@@ -29,6 +31,7 @@ fn parse_args() -> Args {
         monitor: 0,
         autoconnect: None,
         smoke: None,
+        switch_after: None,
     };
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -46,6 +49,10 @@ fn parse_args() -> Args {
             "--autoconnect" if i + 1 < args.len() => {
                 a.autoconnect = Some(args[i + 1].clone());
                 i += 2;
+            }
+            s if s.starts_with("--switch-after=") => {
+                a.switch_after = s["--switch-after=".len()..].parse().ok();
+                i += 1;
             }
             s if s.starts_with("--smoke=") => {
                 a.smoke = s["--smoke=".len()..].parse().ok();
@@ -364,6 +371,11 @@ mod ui {
         input_q: Arc<Mutex<Vec<InputEvent>>>,
         cursor: Arc<Mutex<CursorState>>,
         info: Arc<Mutex<Option<SessionInfo>>>,
+        monitors: Arc<Mutex<Vec<(u16, u16, u16)>>>,
+        pending_switch: Arc<Mutex<Option<u16>>>,
+        switch_after: Option<f32>,
+        switch_done: bool,
+        connected_at: Instant,
         last_pointer: Option<(u16, u16)>,
         prev_mods: egui::Modifiers,
         buttons_down: [bool; 5],
@@ -469,6 +481,7 @@ mod ui {
                 crate::note(&format!("[ui] сервер запущен, порт {port}"));
             }
             let monitors = rat_session::capture::list_outputs().unwrap_or_default();
+            crate::note(&format!("[ui] мониторов найдено: {}", monitors.len()));
             let monitor_sel = args.monitor;
             server.monitor.store(monitor_sel, Ordering::Relaxed);
             Self {
@@ -510,6 +523,7 @@ mod ui {
             let (tx, rx) = std::sync::mpsc::channel();
             let addr_conn = addr.clone();
             let name_conn = name.clone();
+            let switch_after = self.args.switch_after;
             std::thread::spawn(move || {
                 let mut connected = None;
                 let mut last_err = String::new();
@@ -536,6 +550,9 @@ mod ui {
                         let input_q: Arc<Mutex<Vec<InputEvent>>> = Arc::new(Mutex::new(Vec::new()));
                         let cursor = Arc::new(Mutex::new(CursorState::default()));
                         let info: Arc<Mutex<Option<SessionInfo>>> = Arc::new(Mutex::new(None));
+                        let monitors: Arc<Mutex<Vec<(u16, u16, u16)>>> =
+                            Arc::new(Mutex::new(Vec::new()));
+                        let pending_switch: Arc<Mutex<Option<u16>>> = Arc::new(Mutex::new(None));
                         let handle = spawn_viewer(
                             base,
                             stop.clone(),
@@ -546,6 +563,8 @@ mod ui {
                                 input_q: input_q.clone(),
                                 cursor: cursor.clone(),
                                 info: info.clone(),
+                                monitors: monitors.clone(),
+                                pending_switch: pending_switch.clone(),
                             },
                         );
                         Ok(ViewerSession {
@@ -562,6 +581,11 @@ mod ui {
                             input_q,
                             cursor,
                             info,
+                            monitors,
+                            pending_switch,
+                            switch_after,
+                            switch_done: false,
+                            connected_at: Instant::now(),
                             last_pointer: None,
                             prev_mods: egui::Modifiers::default(),
                             buttons_down: [false; 5],
@@ -976,6 +1000,26 @@ mod ui {
                     }
                 }
             }
+            // Тестовый авто-переключатель монитора (--switch-after=СЕК).
+            if let Some(sec) = v.switch_after
+                && !v.switch_done
+                && v.connected_at.elapsed().as_secs_f32() >= sec
+            {
+                v.switch_done = true;
+                let ids: Vec<u16> = v.monitors.lock().unwrap().iter().map(|m| m.0).collect();
+                if !ids.is_empty() {
+                    let cur = v
+                        .info
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .map(|s| s.active)
+                        .unwrap_or(ids[0]);
+                    let next = ids.iter().copied().find(|&i| i != cur).unwrap_or(cur);
+                    *v.pending_switch.lock().unwrap() = Some(next);
+                    crate::note(&format!("[ui] авто-переключение монитора -> {next}"));
+                }
+            }
             egui::Panel::top("vt").show(ui, |ui| {
                 ui.horizontal(|ui| {
                     if ui.button("← Назад").clicked() {
@@ -995,7 +1039,27 @@ mod ui {
                         ui.colored_label(OFF, format!("ошибка: {}", st.last_error));
                     }
                     ui.separator();
-                    if let Some(si) = v.info.lock().unwrap().as_ref() {
+                    let mons = v.monitors.lock().unwrap().clone();
+                    let cur = v
+                        .info
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .map(|s| s.active)
+                        .unwrap_or(0);
+                    if !mons.is_empty() {
+                        ui.label("Монитор:");
+                        for (idx, mw, mh) in &mons {
+                            let sel = cur == *idx;
+                            if ui
+                                .selectable_label(sel, format!("{} ({}×{})", idx + 1, mw, mh))
+                                .clicked()
+                                && !sel
+                            {
+                                *v.pending_switch.lock().unwrap() = Some(*idx);
+                            }
+                        }
+                    } else if let Some(si) = v.info.lock().unwrap().as_ref() {
                         ui.label(format!("монитор {}×{}", si.out.width, si.out.height));
                     }
                 });

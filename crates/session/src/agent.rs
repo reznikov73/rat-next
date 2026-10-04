@@ -4,7 +4,8 @@
 //! Поток B: пакеты энкодера → mux-кадры (Video) → линк; Control: Ping→Pong.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::io::Write as _;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::TryRecvError;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -78,28 +79,13 @@ pub fn spawn_agent(
     };
     let virt = cap.virt;
 
-    let open_enc = |codec: &str, preset: &str, async_depth: i32, low_delay: i32| {
-        Encoder::new(
-            codec,
-            cw as u32,
-            ch as u32,
-            cfg.fps,
-            cfg.bitrate,
-            cfg.gop,
-            preset,
-            async_depth,
-            low_delay,
-        )
-    };
-    let (enc, codec_used) = match open_enc(&cfg.codec, &cfg.preset, cfg.async_depth, cfg.low_delay)
-    {
-        Ok(e) => (e, cfg.codec.clone()),
-        Err(e1) => {
-            println!("[agent] {e1} — fallback на libx264");
-            let e = open_enc("libx264", "veryfast", 0, 0)?;
-            (e, "libx264".to_string())
-        }
-    };
+    // Общее состояние для переключения монитора «на лету».
+    let sh_geom: Arc<Mutex<OutputGeom>> = Arc::new(Mutex::new(out_geom));
+    let sh_active = Arc::new(AtomicU32::new(cfg.monitor));
+    let switch_req: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+    let geom_dirty = Arc::new(AtomicBool::new(false));
+
+    let (enc, codec_used) = open_encoder(&cfg, cw as u32, ch as u32)?;
     stats.lock().unwrap().codec = codec_used;
 
     let sws_in = Sws::new(cw as u32, ch as u32, pix_fmt(0), pix_fmt(1))?;
@@ -111,10 +97,17 @@ pub fn spawn_agent(
     let stats_a = stats.clone();
     let enc_a = enc_shared.clone();
     let inflight_a = inflight.clone();
+    let cfg_a = cfg.clone();
+    let geom_a = sh_geom.clone();
+    let active_a = sh_active.clone();
+    let switch_a = switch_req.clone();
+    let dirty_a = geom_dirty.clone();
     let fps = cfg.fps.max(1);
     let thread_a = std::thread::spawn(move || {
         set_above_normal();
         let mut cap = cap;
+        let (mut cw, mut ch) = (cw, ch);
+        let mut sws_in = sws_in;
         let mut y_buf = vec![0u8; cw * ch];
         let mut uv_buf = vec![0u8; cw * ch / 2];
         let frame_interval = Duration::from_micros(1_000_000 / fps as u64);
@@ -123,6 +116,52 @@ pub fn spawn_agent(
         let mut consec_err: u32 = 0;
 
         while !stop_a.load(Ordering::Relaxed) {
+            // Переключение монитора по запросу вьюера: пересоздаём весь конвейер.
+            if let Some(idx) = switch_a.lock().unwrap().take() {
+                let res: Result<(), String> = 'sw: {
+                    let new_cap = match Capture::new_with_output(idx) {
+                        Ok(c) => c,
+                        Err(e) => break 'sw Err(e),
+                    };
+                    let (nw, nh) = (new_cap.width, new_cap.height);
+                    let new_sws = match Sws::new(nw as u32, nh as u32, pix_fmt(0), pix_fmt(1)) {
+                        Ok(s) => s,
+                        Err(e) => break 'sw Err(e),
+                    };
+                    let (new_enc, codec_used) = match open_encoder(&cfg_a, nw as u32, nh as u32) {
+                        Ok(v) => v,
+                        Err(e) => break 'sw Err(e),
+                    };
+                    cap = new_cap;
+                    cw = nw;
+                    ch = nh;
+                    sws_in = new_sws;
+                    y_buf = vec![0u8; cw * ch];
+                    uv_buf = vec![0u8; cw * ch / 2];
+                    *enc_a.lock().unwrap() = new_enc;
+                    inflight_a.lock().unwrap().clear();
+                    *geom_a.lock().unwrap() = OutputGeom {
+                        origin_x: cap.origin.0,
+                        origin_y: cap.origin.1,
+                        width: cw as i32,
+                        height: ch as i32,
+                    };
+                    active_a.store(idx, Ordering::Relaxed);
+                    dirty_a.store(true, Ordering::Relaxed);
+                    {
+                        let mut st = stats_a.lock().unwrap();
+                        st.capture_switches += 1;
+                        st.codec = codec_used;
+                    }
+                    Ok(())
+                };
+                if let Err(e) = res {
+                    let mut st = stats_a.lock().unwrap();
+                    st.agent_errors += 1;
+                    st.last_error = format!("переключение монитора {idx}: {e}");
+                }
+            }
+
             let now = Instant::now();
             if next_t > now {
                 std::thread::sleep(next_t - now);
@@ -206,6 +245,10 @@ pub fn spawn_agent(
     let stats_b = stats.clone();
     let enc_b = enc_shared.clone();
     let inflight_b = inflight.clone();
+    let geom_b = sh_geom.clone();
+    let active_b = sh_active.clone();
+    let switch_b = switch_req.clone();
+    let dirty_b = geom_dirty.clone();
     let thread_b = std::thread::spawn(move || {
         set_above_normal();
         let mut mux = MuxEncoder::new();
@@ -222,15 +265,29 @@ pub fn spawn_agent(
             AGENT_CAPABILITIES,
         );
         mux.push(Channel::Control, 0, &control::encode_env(&hello));
-        let mut meta = Vec::with_capacity(20);
-        input::pack_session_info(
-            &mut meta,
-            input::SessionInfo {
-                out: out_geom,
-                virt,
-            },
-        );
+        let mut meta = Vec::with_capacity(24);
+        {
+            let g = *geom_b.lock().unwrap();
+            input::pack_session_info(
+                &mut meta,
+                input::SessionInfo {
+                    out: g,
+                    virt,
+                    active: active_b.load(Ordering::Relaxed) as u16,
+                },
+            );
+        }
         mux.push(Channel::Control, 0, &meta);
+        // Список мониторов — для кнопок переключения у вьюера.
+        if let Ok(list) = crate::capture::list_outputs() {
+            let tuples: Vec<(u16, u16, u16)> = list
+                .iter()
+                .map(|m| (m.index as u16, m.width as u16, m.height as u16))
+                .collect();
+            let mut mb = Vec::with_capacity(3 + tuples.len() * 6);
+            input::pack_monitors(&mut mb, &tuples);
+            mux.push(Channel::Control, 0, &mb);
+        }
         if !flush(&mut mux, &link) {
             stop_b.store(true, Ordering::Relaxed);
             return;
@@ -260,7 +317,11 @@ pub fn spawn_agent(
                     Ok(Some(f)) => {
                         did = true;
                         if f.channel == Channel::Control {
-                            if let Some(env) = control::decode_env(f.payload) {
+                            if f.payload.first() == Some(&input::META_MAGIC)
+                                && let Some(idx) = input::parse_switch(f.payload)
+                            {
+                                *switch_b.lock().unwrap() = Some(idx as u32);
+                            } else if let Some(env) = control::decode_env(f.payload) {
                                 stats_b.lock().unwrap().control_msgs += 1;
                                 if let Some(Body::Ping(p)) = env.body {
                                     let pong = control::pong(env.request_id, p.nonce);
@@ -270,7 +331,8 @@ pub fn spawn_agent(
                         } else if f.channel == Channel::Input
                             && let Some(evs) = input::parse_batch(f.payload)
                         {
-                            let n = inject_events(&evs, out_geom, virt);
+                            let g = *geom_b.lock().unwrap();
+                            let n = inject_events(&evs, g, virt);
                             stats_b.lock().unwrap().input_recv += n as u64;
                         }
                     }
@@ -324,7 +386,8 @@ pub fn spawn_agent(
             // 2.5) курсор агента (droppable, «последний выигрывает»).
             if last_cursor_t.elapsed() >= Duration::from_millis(33) {
                 last_cursor_t = Instant::now();
-                if let Some((cx, cy, vis)) = cursor_captured_norm(out_geom)
+                let g = *geom_b.lock().unwrap();
+                if let Some((cx, cy, vis)) = cursor_captured_norm(g)
                     && last_cursor != Some((cx, cy, vis))
                 {
                     let mut cb = [0u8; 5];
@@ -333,6 +396,21 @@ pub fn spawn_agent(
                     last_cursor = Some((cx, cy, vis));
                     stats_b.lock().unwrap().cursor_sent += 1;
                 }
+            }
+
+            // 2.6) после переключения монитора — обновлённый SessionInfo вьюеру.
+            if dirty_b.swap(false, Ordering::Relaxed) {
+                let mut meta = Vec::with_capacity(24);
+                let g = *geom_b.lock().unwrap();
+                input::pack_session_info(
+                    &mut meta,
+                    input::SessionInfo {
+                        out: g,
+                        virt,
+                        active: active_b.load(Ordering::Relaxed) as u16,
+                    },
+                );
+                mux.push(Channel::Control, 0, &meta);
             }
 
             // 3) выгрузить накопленные mux-кадры в линк.
@@ -351,6 +429,38 @@ pub fn spawn_agent(
     });
 
     Ok(vec![thread_a, thread_b])
+}
+
+/// Открыть энкодер под размер кадра (с фолбэком на libx264).
+fn open_encoder(cfg: &AgentConfig, w: u32, h: u32) -> Result<(Encoder, String), String> {
+    match Encoder::new(
+        &cfg.codec,
+        w,
+        h,
+        cfg.fps,
+        cfg.bitrate,
+        cfg.gop,
+        &cfg.preset,
+        cfg.async_depth,
+        cfg.low_delay,
+    ) {
+        Ok(e) => Ok((e, cfg.codec.clone())),
+        Err(e1) => {
+            let _ = writeln!(std::io::stdout(), "[agent] {e1} — fallback на libx264");
+            Encoder::new(
+                "libx264",
+                w,
+                h,
+                cfg.fps,
+                cfg.bitrate,
+                cfg.gop,
+                "veryfast",
+                0,
+                0,
+            )
+            .map(|e| (e, "libx264".to_string()))
+        }
+    }
 }
 
 /// Инъекция событий ввода через SendInput. Возвращает число обработанных событий.

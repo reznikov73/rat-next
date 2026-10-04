@@ -17,6 +17,10 @@
 pub const META_MAGIC: u8 = 0xAA;
 /// Meta-тип: геометрия захвата + виртуальный рабочий стол.
 pub const META_SESSION_INFO: u8 = 1;
+/// Meta-тип: запрос вьюера «переключи захват на монитор N» (viewer → agent).
+pub const META_SWITCH: u8 = 2;
+/// Meta-тип: список мониторов агента (agent → viewer).
+pub const META_MONITORS: u8 = 3;
 
 /// Прямоугольник в экранных координатах.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +45,8 @@ pub struct OutputGeom {
 pub struct SessionInfo {
     pub out: OutputGeom,
     pub virt: RectI,
+    /// Индекс активного монитора (DXGI output).
+    pub active: u16,
 }
 
 /// Состояние курсора агента (нормализованные координаты области захвата).
@@ -193,15 +199,25 @@ pub fn pack_session_info(out: &mut Vec<u8>, si: SessionInfo) {
     out.extend_from_slice(&(si.virt.y as i16).to_be_bytes());
     out.extend_from_slice(&(si.virt.w as i16).to_be_bytes());
     out.extend_from_slice(&(si.virt.h as i16).to_be_bytes());
+    out.extend_from_slice(&si.active.to_be_bytes());
 }
 
 /// Разобрать SessionInfo (None — не meta или битые данные).
 pub fn parse_session_info(payload: &[u8]) -> Option<SessionInfo> {
-    if payload.len() != 18 || payload[0] != META_MAGIC || payload[1] != META_SESSION_INFO {
+    // 18 байт — старый формат (без active), 20 — новый.
+    if (payload.len() != 18 && payload.len() != 20)
+        || payload[0] != META_MAGIC
+        || payload[1] != META_SESSION_INFO
+    {
         return None;
     }
     let i16b = |b: &[u8]| i16::from_be_bytes([b[0], b[1]]) as i32;
     let u16b = |b: &[u8]| u16::from_be_bytes([b[0], b[1]]) as i32;
+    let active = if payload.len() == 20 {
+        u16::from_be_bytes([payload[18], payload[19]])
+    } else {
+        0
+    };
     Some(SessionInfo {
         out: OutputGeom {
             origin_x: i16b(&payload[2..4]),
@@ -215,7 +231,57 @@ pub fn parse_session_info(payload: &[u8]) -> Option<SessionInfo> {
             w: i16b(&payload[14..16]),
             h: i16b(&payload[16..18]),
         },
+        active,
     })
+}
+
+/// Упаковать запрос переключения монитора (вьюер → агент).
+pub fn pack_switch(out: &mut [u8; 4], index: u16) {
+    out[0] = META_MAGIC;
+    out[1] = META_SWITCH;
+    out[2..4].copy_from_slice(&index.to_be_bytes());
+}
+
+/// Разобрать запрос переключения монитора.
+pub fn parse_switch(payload: &[u8]) -> Option<u16> {
+    if payload.len() != 4 || payload[0] != META_MAGIC || payload[1] != META_SWITCH {
+        return None;
+    }
+    Some(u16::from_be_bytes([payload[2], payload[3]]))
+}
+
+/// Упаковать список мониторов агента: (индекс, ширина, высота).
+pub fn pack_monitors(out: &mut Vec<u8>, list: &[(u16, u16, u16)]) {
+    out.push(META_MAGIC);
+    out.push(META_MONITORS);
+    let n = list.len().min(255);
+    out.push(n as u8);
+    for &(idx, w, h) in list.iter().take(n) {
+        out.extend_from_slice(&idx.to_be_bytes());
+        out.extend_from_slice(&w.to_be_bytes());
+        out.extend_from_slice(&h.to_be_bytes());
+    }
+}
+
+/// Разобрать список мониторов.
+pub fn parse_monitors(payload: &[u8]) -> Option<Vec<(u16, u16, u16)>> {
+    if payload.len() < 3 || payload[0] != META_MAGIC || payload[1] != META_MONITORS {
+        return None;
+    }
+    let count = payload[2] as usize;
+    if payload.len() != 3 + count * 6 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let b = &payload[3 + i * 6..9 + i * 6];
+        out.push((
+            u16::from_be_bytes([b[0], b[1]]),
+            u16::from_be_bytes([b[2], b[3]]),
+            u16::from_be_bytes([b[4], b[5]]),
+        ));
+    }
+    Some(out)
 }
 
 /// Нормализованные координаты области захвата → экранные пиксели агента.
@@ -379,11 +445,16 @@ mod tests {
                 w: 3840,
                 h: 1080,
             },
+            active: 1,
         };
         let mut buf = Vec::new();
         pack_session_info(&mut buf, si);
-        assert_eq!(buf.len(), 18);
+        assert_eq!(buf.len(), 20);
         assert_eq!(parse_session_info(&buf).unwrap(), si);
+        // старый формат (18 байт, без active) по-прежнему принимаем
+        let mut old_buf = Vec::new();
+        pack_session_info(&mut old_buf, SessionInfo { active: 0, ..si });
+        assert_eq!(parse_session_info(&old_buf[..18]).unwrap().active, 0);
         // protobuf-подобные данные не распознаются как meta
         assert!(
             parse_session_info(&[
@@ -424,5 +495,24 @@ mod tests {
         assert!((nx as i32 - 32768).abs() < 2 && (ny as i32 - 32768).abs() < 2);
         let (px, py) = norm_to_ui_px(nx, ny, 1280.0, 720.0);
         assert!((px - 640.0).abs() < 1.0 && (py - 360.0).abs() < 1.0);
+    }
+    #[test]
+    fn switch_roundtrip() {
+        let mut b = [0u8; 4];
+        pack_switch(&mut b, 1234);
+        assert_eq!(parse_switch(&b).unwrap(), 1234);
+        assert!(parse_switch(&b[..3]).is_none());
+        assert!(parse_switch(&[0, 1, 0, 2]).is_none());
+    }
+
+    #[test]
+    fn monitors_roundtrip() {
+        let list = vec![(0u16, 1920u16, 1080u16), (1, 2560, 1440)];
+        let mut buf = Vec::new();
+        pack_monitors(&mut buf, &list);
+        assert_eq!(buf.len(), 3 + 12);
+        assert_eq!(parse_monitors(&buf).unwrap(), list);
+        assert!(parse_monitors(&buf[..buf.len() - 1]).is_none());
+        assert!(parse_monitors(&[]).is_none());
     }
 }

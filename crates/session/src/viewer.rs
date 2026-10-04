@@ -39,6 +39,10 @@ pub struct ViewerShared {
     pub input_q: Arc<Mutex<Vec<InputEvent>>>,
     pub cursor: Arc<Mutex<CursorState>>,
     pub info: Arc<Mutex<Option<SessionInfo>>>,
+    /// Список мониторов агента: (индекс, ширина, высота).
+    pub monitors: Arc<Mutex<Vec<(u16, u16, u16)>>>,
+    /// Запрос на переключение монитора (последний выигрывает).
+    pub pending_switch: Arc<Mutex<Option<u16>>>,
 }
 
 /// Запустить вьюерскую половину сессии.
@@ -64,6 +68,7 @@ pub fn spawn_viewer(
             }
         };
         let mut sws_out: Option<Sws> = None;
+        let mut sws_dims: Option<(usize, usize)> = None;
         let mut rgba: Vec<u8> = Vec::new();
         let mut out = MuxEncoder::new();
         let mut pending: HashMap<u64, Instant> = HashMap::new();
@@ -91,6 +96,8 @@ pub fn spawn_viewer(
                             if f.payload.first() == Some(&input::META_MAGIC) {
                                 if let Some(si) = input::parse_session_info(f.payload) {
                                     *shared.info.lock().unwrap() = Some(si);
+                                } else if let Some(list) = input::parse_monitors(f.payload) {
+                                    *shared.monitors.lock().unwrap() = list;
                                 }
                             } else if let Some(env) = control::decode_env(f.payload) {
                                 stats.lock().unwrap().control_msgs += 1;
@@ -160,14 +167,19 @@ pub fn spawn_viewer(
                                     break;
                                 }
                                 if let Some(pv) = dec.planes() {
-                                    if sws_out.is_none() {
+                                    // Пересоздаём масштабирование при смене разрешения
+                                    // (например, после переключения монитора).
+                                    if sws_dims != Some((pv.w, pv.h)) {
                                         match Sws::new(
                                             pv.w as u32,
                                             pv.h as u32,
                                             pix_fmt(2),
                                             pix_fmt(3),
                                         ) {
-                                            Ok(s) => sws_out = Some(s),
+                                            Ok(s) => {
+                                                sws_out = Some(s);
+                                                sws_dims = Some((pv.w, pv.h));
+                                            }
                                             Err(e) => {
                                                 let mut st = stats.lock().unwrap();
                                                 st.viewer_errors += 1;
@@ -238,6 +250,13 @@ pub fn spawn_viewer(
                 send_ping(&mut out, next_ping, &mut pending);
                 next_ping += 1;
                 last_ping = Instant::now();
+            }
+            // Запрос переключения монитора от UI (последний выигрывает).
+            let sw = shared.pending_switch.lock().unwrap().take();
+            if let Some(idx) = sw {
+                let mut b = [0u8; 4];
+                input::pack_switch(&mut b, idx);
+                out.push(Channel::Control, 0, &b);
             }
             // Отправить накопленный ввод (с коалессингом движений мыши).
             let batch: Vec<InputEvent> = std::mem::take(&mut *shared.input_q.lock().unwrap());

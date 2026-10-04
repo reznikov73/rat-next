@@ -105,6 +105,8 @@ mod ui {
         input_q: Arc<Mutex<Vec<InputEvent>>>,
         cursor: Arc<Mutex<CursorState>>,
         info: Arc<Mutex<Option<SessionInfo>>>,
+        monitors: Arc<Mutex<Vec<(u16, u16, u16)>>>,
+        pending_switch: Arc<Mutex<Option<u16>>>,
         last_pointer: Option<(u16, u16)>,
         prev_mods: egui::Modifiers,
         buttons_down: [bool; 5],
@@ -141,6 +143,8 @@ mod ui {
             let input_q: Arc<Mutex<Vec<InputEvent>>> = Arc::new(Mutex::new(Vec::new()));
             let cursor = Arc::new(Mutex::new(CursorState::default()));
             let info: Arc<Mutex<Option<SessionInfo>>> = Arc::new(Mutex::new(None));
+            let monitors: Arc<Mutex<Vec<(u16, u16, u16)>>> = Arc::new(Mutex::new(Vec::new()));
+            let pending_switch: Arc<Mutex<Option<u16>>> = Arc::new(Mutex::new(None));
             let handle = spawn_viewer(
                 base,
                 stop.clone(),
@@ -151,6 +155,8 @@ mod ui {
                     input_q: input_q.clone(),
                     cursor: cursor.clone(),
                     info: info.clone(),
+                    monitors: monitors.clone(),
+                    pending_switch: pending_switch.clone(),
                 },
             );
 
@@ -171,6 +177,8 @@ mod ui {
                 input_q,
                 cursor,
                 info,
+                monitors,
+                pending_switch,
                 last_pointer: None,
                 prev_mods: egui::Modifiers::default(),
                 buttons_down: [false; 5],
@@ -207,6 +215,8 @@ mod ui {
             let input_q = self.input_q.clone();
             let cursor = self.cursor.clone();
             let info = self.info.clone();
+            let monitors = self.monitors.clone();
+            let pending_switch = self.pending_switch.clone();
             loop {
                 match self.rx.try_recv() {
                     Ok(f) => {
@@ -262,7 +272,21 @@ mod ui {
                     ui.separator();
                     ui.label(format!("ctrl msgs: {}", st.control_msgs));
                     ui.separator();
-                    if let Some(si) = info.lock().unwrap().as_ref() {
+                    let mons = monitors.lock().unwrap().clone();
+                    let cur = info.lock().unwrap().as_ref().map(|s| s.active).unwrap_or(0);
+                    if !mons.is_empty() {
+                        ui.label("Монитор:");
+                        for (idx, mw, mh) in &mons {
+                            let sel = cur == *idx;
+                            if ui
+                                .selectable_label(sel, format!("{} ({}×{})", idx + 1, mw, mh))
+                                .clicked()
+                                && !sel
+                            {
+                                *pending_switch.lock().unwrap() = Some(*idx);
+                            }
+                        }
+                    } else if let Some(si) = info.lock().unwrap().as_ref() {
                         ui.label(format!(
                             "монитор {}×{} @ ({},{})",
                             si.out.width, si.out.height, si.out.origin_x, si.out.origin_y
