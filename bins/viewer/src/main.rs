@@ -107,6 +107,7 @@ mod ui {
         info: Arc<Mutex<Option<SessionInfo>>>,
         last_pointer: Option<(u16, u16)>,
         prev_mods: egui::Modifiers,
+        buttons_down: [bool; 5],
     }
 
     impl App {
@@ -172,6 +173,7 @@ mod ui {
                 info,
                 last_pointer: None,
                 prev_mods: egui::Modifiers::default(),
+                buttons_down: [false; 5],
             }
         }
 
@@ -333,44 +335,24 @@ mod ui {
             if let Some(draw) = video_rect {
                 let resp = ui.allocate_rect(draw, egui::Sense::click_and_drag());
                 let mut locked = input_q.lock().unwrap();
-                if resp.hovered() {
+                // Ввод активен над видео и пока «тянется» начатое на видео (в т.ч. за пределами rect).
+                let engaged =
+                    resp.hovered() || resp.dragged() || self.buttons_down.iter().any(|d| *d);
+                if engaged {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::None);
-                    if let Some(p) = resp.interact_pointer_pos() {
+                    if let Some(p) = ui.ctx().input(|i| i.pointer.latest_pos()) {
                         let rel = p - draw.min;
                         let (nx, ny) =
                             input::ui_px_to_norm(rel.x, rel.y, draw.width(), draw.height());
-                        self.last_pointer = Some((nx, ny));
-                        locked.push(InputEvent::Move { x: nx, y: ny });
+                        if self.last_pointer != Some((nx, ny)) {
+                            self.last_pointer = Some((nx, ny));
+                            locked.push(InputEvent::Move { x: nx, y: ny });
+                        }
                     }
                     let (mx, my) = self.last_pointer.unwrap_or((32768, 32768));
                     ui.ctx().input(|inp| {
-                        use egui::PointerButton as PB;
-                        for (b, idx) in [
-                            (PB::Primary, 0u8),
-                            (PB::Secondary, 1),
-                            (PB::Middle, 2),
-                            (PB::Extra1, 3),
-                            (PB::Extra2, 4),
-                        ] {
-                            if inp.pointer.button_clicked(b) {
-                                locked.push(InputEvent::Button {
-                                    btn: idx,
-                                    down: true,
-                                    x: mx,
-                                    y: my,
-                                });
-                            }
-                            if inp.pointer.button_released(b) {
-                                locked.push(InputEvent::Button {
-                                    btn: idx,
-                                    down: false,
-                                    x: mx,
-                                    y: my,
-                                });
-                            }
-                        }
                         let sd = inp.smooth_scroll_delta;
-                        if sd.x.abs() > 0.5 || sd.y.abs() > 0.5 {
+                        if resp.hovered() && (sd.x.abs() > 0.5 || sd.y.abs() > 0.5) {
                             locked.push(InputEvent::Wheel {
                                 dx: sd.x.clamp(-32768.0, 32767.0) as i16,
                                 dy: sd.y.clamp(-32768.0, 32767.0) as i16,
@@ -380,6 +362,39 @@ mod ui {
                         }
                         for ev in &inp.events {
                             match ev {
+                                egui::Event::PointerButton {
+                                    pos,
+                                    button,
+                                    pressed,
+                                    ..
+                                } => {
+                                    let idx = match button {
+                                        egui::PointerButton::Primary => 0usize,
+                                        egui::PointerButton::Secondary => 1,
+                                        egui::PointerButton::Middle => 2,
+                                        egui::PointerButton::Extra1 => 3,
+                                        egui::PointerButton::Extra2 => 4,
+                                    };
+                                    // Новое нажатие — только внутри видео;
+                                    // отпускание — всегда, если кнопку уже отправили зажатой.
+                                    if resp.hovered() || self.buttons_down[idx] {
+                                        let rel = *pos - draw.min;
+                                        let (nx, ny) = input::ui_px_to_norm(
+                                            rel.x,
+                                            rel.y,
+                                            draw.width(),
+                                            draw.height(),
+                                        );
+                                        self.last_pointer = Some((nx, ny));
+                                        self.buttons_down[idx] = *pressed;
+                                        locked.push(InputEvent::Button {
+                                            btn: idx as u8,
+                                            down: *pressed,
+                                            x: nx,
+                                            y: ny,
+                                        });
+                                    }
+                                }
                                 egui::Event::Key { key, pressed, .. } => {
                                     if let Some(vk) = vk_of_key(*key) {
                                         locked.push(InputEvent::Key { vk, down: *pressed });
@@ -433,6 +448,22 @@ mod ui {
                             }
                         }
                     });
+                    // Потеря фокуса окна — отпустить все «зажатые» кнопки (защита от залипания).
+                    let focused = ui.ctx().input(|i| i.focused);
+                    if !focused && self.buttons_down.iter().any(|d| *d) {
+                        for (idx, d) in self.buttons_down.iter_mut().enumerate() {
+                            if *d {
+                                *d = false;
+                                let (x, y) = self.last_pointer.unwrap_or((32768, 32768));
+                                locked.push(InputEvent::Button {
+                                    btn: idx as u8,
+                                    down: false,
+                                    x,
+                                    y,
+                                });
+                            }
+                        }
+                    }
                     // Модификаторы egui отдаёт состоянием, а не событием — шлём рёбра.
                     let m = ui.ctx().input(|i| i.modifiers);
                     let pm = self.prev_mods;
