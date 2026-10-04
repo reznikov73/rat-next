@@ -9,6 +9,7 @@ members = [
     "crates/session",
     "bins/agent",
     "bins/agent-helper",
+    "bins/rat",
     "bins/relay",
     "bins/signaling",
     "bins/viewer",

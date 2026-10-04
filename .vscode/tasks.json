@@ -182,5 +182,18 @@
       "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\scripts\\vsc-task.ps1", "-Dir", ".", "-Cmd", "run --release -p rat-viewer --features rat-viewer/ffmpeg -- --connect 127.0.0.1:55140 --smoke=15"],
       "problemMatcher": ["$rustc"]
     }
+    {
+      "label": "build: rat app (release)",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\scripts\\vsc-task.ps1", "-Dir", ".", "-Cmd", "build --release -p rat --features rat/ffmpeg"],
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "run: rat app",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\scripts\\vsc-task.ps1", "-Dir", ".", "-Cmd", "run --release -p rat --features rat/ffmpeg"]
+    }
   ]
 }
