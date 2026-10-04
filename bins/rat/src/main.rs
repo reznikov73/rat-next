@@ -8,13 +8,16 @@
 //! ```text
 //! rat.exe                                  # сервер стартует автоматически, порт 55140
 //! rat.exe --port 55140
+//! rat.exe --monitor 1                      # отдавать второй экран (индекс 1)
 //! rat.exe --autoconnect 192.168.1.50:55140
 //! rat.exe --smoke=15                       # авто-выход через 15 сек (тесты)
 //! ```
+#![windows_subsystem = "windows"]
 
 #[cfg_attr(not(feature = "ffmpeg"), allow(dead_code))]
 struct Args {
     port: u16,
+    monitor: u32,
     autoconnect: Option<String>,
     smoke: Option<f32>,
 }
@@ -23,6 +26,7 @@ struct Args {
 fn parse_args() -> Args {
     let mut a = Args {
         port: 55140,
+        monitor: 0,
         autoconnect: None,
         smoke: None,
     };
@@ -33,6 +37,10 @@ fn parse_args() -> Args {
         match cur {
             "--port" if i + 1 < args.len() => {
                 a.port = args[i + 1].parse().unwrap_or(55140);
+                i += 2;
+            }
+            "--monitor" if i + 1 < args.len() => {
+                a.monitor = args[i + 1].parse().unwrap_or(0);
                 i += 2;
             }
             "--autoconnect" if i + 1 < args.len() => {
@@ -63,9 +71,40 @@ fn main() {
 fn main() {
     let args = parse_args();
     if let Err(e) = ui::run(args) {
-        eprintln!("rat: {e}");
+        note(&format!("rat: {e}"));
         std::process::exit(1);
     }
+}
+
+// ================== журнал ==================
+
+/// Записать строку в `rat.log` рядом с exe (переживает отсутствие консоли).
+#[cfg(feature = "ffmpeg")]
+fn log_line(s: &str) {
+    use std::io::Write as _;
+    let path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("rat.log")));
+    if let Some(p) = path
+        && let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&p)
+    {
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(f, "{t} {s}");
+    }
+}
+
+/// Лог: в stdout (если он есть) и в `rat.log`.
+#[cfg(feature = "ffmpeg")]
+fn note(s: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stdout(), "{s}");
+    log_line(s);
 }
 
 // ================== хранилище машин ==================
@@ -139,7 +178,7 @@ mod store {
 #[cfg(feature = "ffmpeg")]
 mod server {
     use std::net::TcpListener;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
@@ -154,6 +193,8 @@ mod server {
         stop_current: Arc<Mutex<Option<Arc<AtomicBool>>>>,
         thread: Option<JoinHandle<()>>,
         pub sessions: Arc<AtomicU64>,
+        /// Какой монитор отдавать (индекс DXGI; применяется к новым сессиям).
+        pub monitor: Arc<AtomicU32>,
         pub last_err: Arc<Mutex<Option<String>>>,
     }
 
@@ -165,6 +206,7 @@ mod server {
                 stop_current: Arc::new(Mutex::new(None)),
                 thread: None,
                 sessions: Arc::new(AtomicU64::new(0)),
+                monitor: Arc::new(AtomicU32::new(0)),
                 last_err: Arc::new(Mutex::new(None)),
             }
         }
@@ -186,18 +228,23 @@ mod server {
             let running = self.running.clone();
             let stop_current = self.stop_current.clone();
             let sessions = self.sessions.clone();
+            let monitor = self.monitor.clone();
             let last_err = self.last_err.clone();
+            crate::note(&format!("[server] слушаю 0.0.0.0:{port}"));
             self.thread = Some(std::thread::spawn(move || {
                 while running.load(Ordering::Relaxed) {
                     match tcp_accept(&listener) {
                         Ok((link, closer)) => {
-                            println!("[server] клиент подключился");
+                            crate::note("[server] клиент подключился");
                             sessions.fetch_add(1, Ordering::Relaxed);
                             let base = TimeBase(Instant::now());
                             let stop = Arc::new(AtomicBool::new(false));
                             *stop_current.lock().unwrap() = Some(stop.clone());
                             let stats = Arc::new(Mutex::new(SessionStats::default()));
-                            let cfg = AgentConfig::default();
+                            let cfg = AgentConfig {
+                                monitor: monitor.load(Ordering::Relaxed),
+                                ..AgentConfig::default()
+                            };
                             match spawn_agent(base, stop.clone(), stats.clone(), link, cfg) {
                                 Ok(handles) => {
                                     for h in handles {
@@ -205,11 +252,14 @@ mod server {
                                     }
                                     closer.close();
                                     let st = stats.lock().unwrap();
-                                    println!("[server] сессия завершена\n{}", st.summary());
+                                    crate::note(&format!(
+                                        "[server] сессия завершена\n{}",
+                                        st.summary()
+                                    ));
                                 }
                                 Err(e) => {
                                     closer.close();
-                                    println!("[server] ошибка сессии: {e}");
+                                    crate::note(&format!("[server] ошибка сессии: {e}"));
                                     *last_err.lock().unwrap() = Some(e);
                                 }
                             }
@@ -224,7 +274,7 @@ mod server {
                         }
                     }
                 }
-                println!("[server] остановлен");
+                crate::note("[server] остановлен");
             }));
             Ok(())
         }
@@ -258,6 +308,7 @@ mod ui {
     use std::time::{Duration, Instant};
 
     use eframe::egui;
+    use rat_session::capture::MonitorInfo;
     use rat_session::input::{self, CursorState, InputEvent, SessionInfo};
     use rat_session::link::{TcpCloser, tcp_connect};
     use rat_session::stats::{SessionStats, TimeBase};
@@ -327,13 +378,17 @@ mod ui {
             }
             self.closer.close();
             let st = self.stats.lock().unwrap();
-            println!("=== SESSION SUMMARY ({}) ===\n{}", self.addr, st.summary());
+            crate::note(&format!(
+                "=== SESSION SUMMARY ({}) ===\n{}",
+                self.addr,
+                st.summary()
+            ));
             if !self.ui_e2e_ms.is_empty() {
-                println!(
+                crate::note(&format!(
                     "ui present e2e: avg {:.2}ms p95 {:.2}ms",
                     SessionStats::avg(&self.ui_e2e_ms),
                     SessionStats::pct(&self.ui_e2e_ms, 0.95)
-                );
+                ));
             }
         }
     }
@@ -349,6 +404,8 @@ mod ui {
         machines: Arc<Mutex<Vec<Machine>>>,
         statuses: Arc<Mutex<HashMap<String, bool>>>,
         server: ServerHandle,
+        monitors: Vec<MonitorInfo>,
+        monitor_sel: u32,
         port_edit: String,
         my_ip: String,
         my_name: String,
@@ -406,12 +463,20 @@ mod ui {
             let mut server = ServerHandle::new();
             let mut toast = None;
             if let Err(e) = server.start(port) {
+                crate::note(&format!("[ui] сервер не запустился: {e}"));
                 toast = Some((format!("Сервер не запустился: {e}"), Instant::now()));
+            } else {
+                crate::note(&format!("[ui] сервер запущен, порт {port}"));
             }
+            let monitors = rat_session::capture::list_outputs().unwrap_or_default();
+            let monitor_sel = args.monitor;
+            server.monitor.store(monitor_sel, Ordering::Relaxed);
             Self {
                 machines,
                 statuses,
                 server,
+                monitors,
+                monitor_sel,
                 port_edit: port.to_string(),
                 my_ip: local_ip(),
                 my_name: std::env::var("COMPUTERNAME").unwrap_or_default(),
@@ -519,6 +584,7 @@ mod ui {
                 Ok(Ok(session)) => {
                     self.connecting_to = None;
                     self.connect_rx = None;
+                    crate::note(&format!("[ui] подключено: {}", session.addr));
                     {
                         let mut list = self.machines.lock().unwrap();
                         if let Some(m) = list.iter_mut().find(|m| m.addr == session.addr) {
@@ -532,6 +598,7 @@ mod ui {
                 Ok(Err(e)) => {
                     self.connecting_to = None;
                     self.connect_rx = None;
+                    crate::note(&format!("[ui] ошибка подключения: {e}"));
                     self.toast(e);
                 }
                 Err(TryRecvError::Empty) => {}
@@ -571,6 +638,24 @@ mod ui {
                         ));
                     }
                     ui.separator();
+                    if !self.monitors.is_empty() {
+                        ui.label("Монитор:");
+                        let mut pick: Option<u32> = None;
+                        for m in &self.monitors {
+                            let selected = self.monitor_sel == m.index;
+                            let txt = format!("{} ({}×{})", m.index + 1, m.width, m.height);
+                            if ui.selectable_label(selected, txt).clicked() {
+                                pick = Some(m.index);
+                            }
+                        }
+                        if let Some(idx) = pick
+                            && idx != self.monitor_sel
+                        {
+                            self.monitor_sel = idx;
+                            self.server.monitor.store(idx, Ordering::Relaxed);
+                            self.toast("Сменил монитор — применится к следующему подключению");
+                        }
+                    }
                     if running {
                         let stop_clicked = ui.button("Остановить сервер").clicked();
                         if stop_clicked {
@@ -1280,7 +1365,7 @@ mod ui {
                     v.shutdown();
                 }
                 self.server.stop();
-                println!("APP_DONE");
+                crate::note("APP_DONE");
             }
             if self.finished {
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);

@@ -198,3 +198,58 @@ unsafe fn create_staging(
         texture.ok_or_else(|| "CreateTexture2D failed".to_string())
     }
 }
+/// Информация о мониторе (DXGI output).
+pub struct MonitorInfo {
+    pub index: u32,
+    pub name: String,
+    pub width: i32,
+    pub height: i32,
+    pub x: i32,
+    pub y: i32,
+}
+
+/// Перечислить мониторы основного адаптера (индексы DXGI: 0, 1, …).
+pub fn list_outputs() -> Result<Vec<MonitorInfo>, String> {
+    unsafe {
+        let mut device = None;
+        D3D11CreateDevice(
+            None,
+            D3D_DRIVER_TYPE_HARDWARE,
+            HMODULE::default(),
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            None,
+            D3D11_SDK_VERSION,
+            Some(&mut device),
+            None,
+            None,
+        )
+        .map_err(|e| format!("D3D11CreateDevice: {e}"))?;
+        let device = device.ok_or("D3D11 device not created")?;
+        let dxgi_device: IDXGIDevice = device.cast().map_err(|e| e.to_string())?;
+        let adapter: IDXGIAdapter = dxgi_device.GetAdapter().map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for index in 0..16u32 {
+            let Ok(output) = adapter.EnumOutputs(index) else {
+                break;
+            };
+            let desc = output.GetDesc().map_err(|e| e.to_string())?;
+            let mut name = String::new();
+            for &c in desc.DeviceName.iter() {
+                if c == 0 {
+                    break;
+                }
+                name.push(char::from_u32(c as u32).unwrap_or('?'));
+            }
+            let dc = desc.DesktopCoordinates;
+            out.push(MonitorInfo {
+                index,
+                name,
+                width: dc.right - dc.left,
+                height: dc.bottom - dc.top,
+                x: dc.left,
+                y: dc.top,
+            });
+        }
+        Ok(out)
+    }
+}
