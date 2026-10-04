@@ -181,7 +181,7 @@
       "command": "powershell",
       "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\scripts\\vsc-task.ps1", "-Dir", ".", "-Cmd", "run --release -p rat-viewer --features rat-viewer/ffmpeg -- --connect 127.0.0.1:55140 --smoke=15"],
       "problemMatcher": ["$rustc"]
-    }
+    },
     {
       "label": "build: rat app (release)",
       "type": "shell",
