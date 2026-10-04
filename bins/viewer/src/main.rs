@@ -286,7 +286,7 @@ mod ui {
                 } else {
                     ui.label(
                         "P3-пилот: видео + ввод (мышь/клава/курсор). \
-                         Ввод активен, когда курсор над видео. \
+                         Мышь — над видео; клавиатура — когда окно в фокусе. \
                          Закройте окно для остановки.",
                     );
                 }
@@ -335,7 +335,9 @@ mod ui {
             if let Some(draw) = video_rect {
                 let resp = ui.allocate_rect(draw, egui::Sense::click_and_drag());
                 let mut locked = input_q.lock().unwrap();
-                // Ввод активен над видео и пока «тянется» начатое на видео (в т.ч. за пределами rect).
+                let focused = ui.ctx().input(|i| i.focused);
+
+                // ---- Указатель: движения, кнопки, колесо ----
                 let engaged =
                     resp.hovered() || resp.dragged() || self.buttons_down.iter().any(|d| *d);
                 if engaged {
@@ -361,43 +363,62 @@ mod ui {
                             });
                         }
                         for ev in &inp.events {
+                            if let egui::Event::PointerButton {
+                                pos,
+                                button,
+                                pressed,
+                                ..
+                            } = ev
+                            {
+                                let idx = match button {
+                                    egui::PointerButton::Primary => 0usize,
+                                    egui::PointerButton::Secondary => 1,
+                                    egui::PointerButton::Middle => 2,
+                                    egui::PointerButton::Extra1 => 3,
+                                    egui::PointerButton::Extra2 => 4,
+                                };
+                                // Новое нажатие — только внутри видео;
+                                // отпускание — всегда, если кнопку уже отправили зажатой.
+                                if resp.hovered() || self.buttons_down[idx] {
+                                    let rel = *pos - draw.min;
+                                    let (nx, ny) = input::ui_px_to_norm(
+                                        rel.x,
+                                        rel.y,
+                                        draw.width(),
+                                        draw.height(),
+                                    );
+                                    self.last_pointer = Some((nx, ny));
+                                    self.buttons_down[idx] = *pressed;
+                                    locked.push(InputEvent::Button {
+                                        btn: idx as u8,
+                                        down: *pressed,
+                                        x: nx,
+                                        y: ny,
+                                    });
+                                }
+                            }
+                        }
+                    });
+                }
+
+                // ---- Клавиатура: пока окно в фокусе ----
+                if focused {
+                    ui.ctx().input(|inp| {
+                        for ev in &inp.events {
                             match ev {
-                                egui::Event::PointerButton {
-                                    pos,
-                                    button,
+                                egui::Event::Key {
+                                    key,
                                     pressed,
+                                    modifiers,
                                     ..
                                 } => {
-                                    let idx = match button {
-                                        egui::PointerButton::Primary => 0usize,
-                                        egui::PointerButton::Secondary => 1,
-                                        egui::PointerButton::Middle => 2,
-                                        egui::PointerButton::Extra1 => 3,
-                                        egui::PointerButton::Extra2 => 4,
-                                    };
-                                    // Новое нажатие — только внутри видео;
-                                    // отпускание — всегда, если кнопку уже отправили зажатой.
-                                    if resp.hovered() || self.buttons_down[idx] {
-                                        let rel = *pos - draw.min;
-                                        let (nx, ny) = input::ui_px_to_norm(
-                                            rel.x,
-                                            rel.y,
-                                            draw.width(),
-                                            draw.height(),
-                                        );
-                                        self.last_pointer = Some((nx, ny));
-                                        self.buttons_down[idx] = *pressed;
-                                        locked.push(InputEvent::Button {
-                                            btn: idx as u8,
-                                            down: *pressed,
-                                            x: nx,
-                                            y: ny,
-                                        });
-                                    }
-                                }
-                                egui::Event::Key { key, pressed, .. } => {
                                     if let Some(vk) = vk_of_key(*key) {
-                                        locked.push(InputEvent::Key { vk, down: *pressed });
+                                        // Печатные символы без Ctrl/Alt идут через Text-событие;
+                                        // здесь — служебные клавиши и горячие комбинации.
+                                        let shortcut = modifiers.ctrl || modifiers.alt;
+                                        if shortcut || !is_char_vk(vk) {
+                                            locked.push(InputEvent::Key { vk, down: *pressed });
+                                        }
                                     }
                                 }
                                 egui::Event::Text(t) => {
@@ -444,26 +465,41 @@ mod ui {
                                         }
                                     }
                                 }
+                                // egui перехватывает Ctrl+C/X/V сам — транслируем на удалённую машину.
+                                egui::Event::Copy => {
+                                    locked.push(InputEvent::Key {
+                                        vk: 0x43,
+                                        down: true,
+                                    });
+                                    locked.push(InputEvent::Key {
+                                        vk: 0x43,
+                                        down: false,
+                                    });
+                                }
+                                egui::Event::Cut => {
+                                    locked.push(InputEvent::Key {
+                                        vk: 0x58,
+                                        down: true,
+                                    });
+                                    locked.push(InputEvent::Key {
+                                        vk: 0x58,
+                                        down: false,
+                                    });
+                                }
+                                egui::Event::Paste(_) => {
+                                    locked.push(InputEvent::Key {
+                                        vk: 0x56,
+                                        down: true,
+                                    });
+                                    locked.push(InputEvent::Key {
+                                        vk: 0x56,
+                                        down: false,
+                                    });
+                                }
                                 _ => {}
                             }
                         }
                     });
-                    // Потеря фокуса окна — отпустить все «зажатые» кнопки (защита от залипания).
-                    let focused = ui.ctx().input(|i| i.focused);
-                    if !focused && self.buttons_down.iter().any(|d| *d) {
-                        for (idx, d) in self.buttons_down.iter_mut().enumerate() {
-                            if *d {
-                                *d = false;
-                                let (x, y) = self.last_pointer.unwrap_or((32768, 32768));
-                                locked.push(InputEvent::Button {
-                                    btn: idx as u8,
-                                    down: false,
-                                    x,
-                                    y,
-                                });
-                            }
-                        }
-                    }
                     // Модификаторы egui отдаёт состоянием, а не событием — шлём рёбра.
                     let m = ui.ctx().input(|i| i.modifiers);
                     let pm = self.prev_mods;
@@ -480,6 +516,31 @@ mod ui {
                         }
                     }
                     self.prev_mods = m;
+                }
+
+                // ---- Потеря фокуса: отпустить зажатое, чтобы не «залипло» на удалённой машине ----
+                if !focused {
+                    if self.buttons_down.iter().any(|d| *d) {
+                        for (idx, d) in self.buttons_down.iter_mut().enumerate() {
+                            if *d {
+                                *d = false;
+                                let (x, y) = self.last_pointer.unwrap_or((32768, 32768));
+                                locked.push(InputEvent::Button {
+                                    btn: idx as u8,
+                                    down: false,
+                                    x,
+                                    y,
+                                });
+                            }
+                        }
+                    }
+                    let pm = self.prev_mods;
+                    for (was_on, vk) in [(pm.shift, 0x10u16), (pm.ctrl, 0x11), (pm.alt, 0x12)] {
+                        if was_on {
+                            locked.push(InputEvent::Key { vk, down: false });
+                        }
+                    }
+                    self.prev_mods = egui::Modifiers::default();
                 }
                 drop(locked);
 
@@ -513,6 +574,11 @@ mod ui {
         fn drop(&mut self) {
             self.finish();
         }
+    }
+
+    /// VK печатных клавиш: их доставляет Text-событие, по Key-пути не дублируем.
+    fn is_char_vk(vk: u16) -> bool {
+        matches!(vk, 0x20 | 0x30..=0x39 | 0x41..=0x5A)
     }
 
     /// egui-клавиша → Windows VK (для непечатаемых; печатные идут через vk_for_char).
