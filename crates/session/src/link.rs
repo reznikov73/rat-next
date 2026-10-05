@@ -7,6 +7,7 @@
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::time::Duration;
 
 /// Дуплекс: `tx` — отправка байтов «в сеть», `rx` — приём байтов «из сети».
 pub struct Duplex {
@@ -29,6 +30,13 @@ pub struct TcpCloser {
 impl TcpCloser {
     pub fn close(&self) {
         let _ = self.stream.shutdown(Shutdown::Both);
+    }
+
+    /// Дескриптор закрытия из клона сокета (для прерывания ожиданий relay).
+    pub fn from_stream(stream: &TcpStream) -> io::Result<Self> {
+        Ok(Self {
+            stream: stream.try_clone()?,
+        })
     }
 }
 
@@ -93,6 +101,109 @@ fn tcp_wrap(stream: TcpStream) -> io::Result<(Duplex, TcpCloser)> {
         },
         TcpCloser { stream },
     ))
+}
+
+// ================== интернет-режим (relay) ==================
+
+/// Прочитать строку протокола relay байт-в-байт, чтобы не «съесть» данные сессии.
+fn read_proto_line(stream: &mut TcpStream, max: usize) -> io::Result<String> {
+    let mut out = Vec::with_capacity(32);
+    let mut b = [0u8; 1];
+    loop {
+        let n = stream.read(&mut b)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "relay: соединение закрыто",
+            ));
+        }
+        if b[0] == b'\n' {
+            break;
+        }
+        out.push(b[0]);
+        if out.len() > max {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "relay: слишком длинная строка",
+            ));
+        }
+    }
+    String::from_utf8(out)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "relay: строка не UTF-8"))
+}
+
+fn send_proto_line(stream: &mut TcpStream, line: &str) -> io::Result<()> {
+    let mut s = String::with_capacity(line.len() + 1);
+    s.push_str(line);
+    s.push('\n');
+    stream.write_all(s.as_bytes())
+}
+
+fn connect_with_timeout(relay: impl ToSocketAddrs, ms: u64) -> io::Result<TcpStream> {
+    let sa = relay.to_socket_addrs()?.next().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "relay: пустой адрес сервера")
+    })?;
+    TcpStream::connect_timeout(&sa, Duration::from_millis(ms))
+}
+
+/// Вьюер: подключиться через relay к устройству `id`. После `OK` — сырой режим.
+pub fn relay_connect(relay: impl ToSocketAddrs, id: &str) -> io::Result<(Duplex, TcpCloser)> {
+    let mut stream = connect_with_timeout(relay, 5000)?;
+    stream.set_nodelay(true)?;
+    send_proto_line(&mut stream, &format!("CONNECT {id}"))?;
+    let line = read_proto_line(&mut stream, 256)?;
+    if !line.starts_with("OK") {
+        let msg = if line.starts_with("ERR OFFLINE") {
+            "устройство не в сети (через сервер)".to_string()
+        } else {
+            format!("relay: {line}")
+        };
+        return Err(io::Error::new(io::ErrorKind::ConnectionRefused, msg));
+    }
+    tcp_wrap(stream)
+}
+
+/// Агент: зарегистрировать устройство на relay. После `OK` — ждать [`relay_wait_paired`].
+/// Возвращает сокет и дескриптор для прерывания ожидания.
+pub fn relay_register(
+    relay: impl ToSocketAddrs,
+    id: &str,
+    name: &str,
+) -> io::Result<(TcpStream, TcpCloser)> {
+    let mut stream = connect_with_timeout(relay, 5000)?;
+    stream.set_nodelay(true)?;
+    let name = name.replace(['\n', '\r'], " ");
+    send_proto_line(&mut stream, &format!("REG {id} {name}"))?;
+    let line = read_proto_line(&mut stream, 256)?;
+    if !line.starts_with("OK") {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            format!("relay: {line}"),
+        ));
+    }
+    let closer = TcpCloser::from_stream(&stream)?;
+    Ok((stream, closer))
+}
+
+/// Агент: дождаться подключения вьюера (`PAIRED`) и перейти в сырой режим.
+pub fn relay_wait_paired(stream: TcpStream) -> io::Result<(Duplex, TcpCloser)> {
+    let mut stream = stream;
+    let line = read_proto_line(&mut stream, 64)?;
+    if !line.starts_with("PAIRED") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("relay: {line}"),
+        ));
+    }
+    tcp_wrap(stream)
+}
+
+/// Спросить у relay, зарегистрировано ли устройство (короткое соединение).
+pub fn relay_who(relay: impl ToSocketAddrs, id: &str) -> io::Result<bool> {
+    let mut stream = connect_with_timeout(relay, 1500)?;
+    send_proto_line(&mut stream, &format!("WHO {id}"))?;
+    let line = read_proto_line(&mut stream, 64)?;
+    Ok(line.starts_with("OK"))
 }
 
 #[cfg(test)]
