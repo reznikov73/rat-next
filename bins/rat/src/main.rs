@@ -11,7 +11,10 @@
 //! rat.exe --monitor 1                      # отдавать второй экран (индекс 1)
 //! rat.exe --switch-after=4                 # тест: через 4 сек переключить монитор
 //! rat.exe --autoconnect 192.168.1.50:55140
-//! rat.exe --relay 91.x.x.x:55141 --device-id XXXX-XXXX-XXXX   # интернет-режим
+//! rat.exe --relay 91.x.x.x:55141 --device-id 123456           # интернет-режим
+//! rat.exe --tray                              # стартовать сразу в трее (без окна)
+//! rat.exe --install-autostart                 # автозапуск при входе в Windows
+//! rat.exe --remove-autostart                  # выключить автозапуск
 //! rat.exe --smoke=15                       # авто-выход через 15 сек (тесты)
 //! ```
 #![windows_subsystem = "windows"]
@@ -25,6 +28,9 @@ struct Args {
     switch_after: Option<f32>,
     relay: Option<String>,
     device_id: Option<String>,
+    tray: bool,
+    install_autostart: bool,
+    remove_autostart: bool,
 }
 
 #[cfg_attr(not(feature = "ffmpeg"), allow(dead_code))]
@@ -37,6 +43,9 @@ fn parse_args() -> Args {
         switch_after: None,
         relay: None,
         device_id: None,
+        tray: false,
+        install_autostart: false,
+        remove_autostart: false,
     };
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -54,6 +63,18 @@ fn parse_args() -> Args {
             "--autoconnect" if i + 1 < args.len() => {
                 a.autoconnect = Some(args[i + 1].clone());
                 i += 2;
+            }
+            "--install-autostart" => {
+                a.install_autostart = true;
+                i += 1;
+            }
+            "--remove-autostart" => {
+                a.remove_autostart = true;
+                i += 1;
+            }
+            "--tray" => {
+                a.tray = true;
+                i += 1;
             }
             "--relay" if i + 1 < args.len() => {
                 a.relay = Some(args[i + 1].clone());
@@ -90,6 +111,34 @@ fn main() {
 #[cfg(feature = "ffmpeg")]
 fn main() {
     let args = parse_args();
+    if args.install_autostart {
+        match autostart::install() {
+            Ok(()) => {
+                println!("Автозапуск включён (задача «Rat Next»).");
+                note("autostart: установлен");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("autostart: {e}");
+                note(&format!("autostart: ошибка установки: {e}"));
+                std::process::exit(1);
+            }
+        }
+    }
+    if args.remove_autostart {
+        match autostart::remove() {
+            Ok(()) => {
+                println!("Автозапуск выключен.");
+                note("autostart: удалён");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("autostart: {e}");
+                note(&format!("autostart: ошибка удаления: {e}"));
+                std::process::exit(1);
+            }
+        }
+    }
     if !rat_session::single_instance::try_acquire("app") {
         if args.smoke.is_none() {
             rat_session::single_instance::warn(
@@ -346,6 +395,64 @@ mod store {
             assert_eq!(normalize_relay(""), DEFAULT_RELAY);
             assert_eq!(normalize_relay("relay.example:9000"), "relay.example:9000");
             assert_eq!(normalize_relay("relay.example:bad"), "relay.example:bad");
+        }
+    }
+}
+
+#[cfg(feature = "ffmpeg")]
+mod autostart {
+    //! Автозапуск при входе пользователя через Планировщик задач (`schtasks`).
+
+    const TASK: &str = "Rat Next";
+
+    /// Установлена ли задача автозапуска.
+    pub fn is_installed() -> bool {
+        std::process::Command::new("schtasks")
+            .args(["/Query", "/TN", TASK])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Создать (или пересоздать) задачу: запуск при входе, сразу в трей.
+    pub fn install() -> Result<(), String> {
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let tr = format!("\"{}\" --tray", exe.display());
+        let out = std::process::Command::new("schtasks")
+            .args([
+                "/Create", "/F", "/SC", "ONLOGON", "/TN", TASK, "/TR", &tr, "/RL", "LIMITED",
+            ])
+            .output()
+            .map_err(|e| format!("schtasks: {e}"))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let err = if err.is_empty() {
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            } else {
+                err
+            };
+            Err(err)
+        }
+    }
+
+    /// Удалить задачу автозапуска.
+    pub fn remove() -> Result<(), String> {
+        let out = std::process::Command::new("schtasks")
+            .args(["/Delete", "/F", "/TN", TASK])
+            .output()
+            .map_err(|e| format!("schtasks: {e}"))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let err = if err.is_empty() {
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            } else {
+                err
+            };
+            Err(err)
         }
     }
 }
@@ -856,6 +963,7 @@ mod ui {
         settings_relay_edit: String,
         settings_auto_allow: bool,
         settings_tray: bool,
+        settings_autostart: bool,
         settings_error: Option<String>,
         incoming_rx: Receiver<Request>,
         incoming_pending: Option<Request>,
@@ -884,6 +992,8 @@ mod ui {
         quitting: bool,
         /// Окно скрыто в трей — перерисовку можно замедлить.
         hidden: bool,
+        /// Первый кадр: при `--tray` спрятать окно.
+        tray_hide_done: bool,
     }
 
     impl RatApp {
@@ -1002,6 +1112,7 @@ mod ui {
                 settings_relay_edit,
                 settings_auto_allow,
                 settings_tray,
+                settings_autostart: false,
                 settings_error: None,
                 incoming_rx,
                 incoming_pending: None,
@@ -1027,6 +1138,7 @@ mod ui {
                 tray,
                 quitting: false,
                 hidden: false,
+                tray_hide_done: false,
                 args,
             }
         }
@@ -1249,6 +1361,7 @@ mod ui {
                         self.settings_relay_edit = self.device.relay.clone();
                         self.settings_auto_allow = self.device.auto_allow;
                         self.settings_tray = self.device.tray;
+                        self.settings_autostart = crate::autostart::is_installed();
                         self.settings_error = None;
                         self.settings_open = true;
                     }
@@ -1467,6 +1580,10 @@ mod ui {
                             .color(egui::Color32::from_gray(150)),
                         );
                         ui.checkbox(&mut self.settings_tray, "Сворачивать в трей");
+                        ui.checkbox(
+                            &mut self.settings_autostart,
+                            "Запускать при входе в Windows (сразу в трее)",
+                        );
                         if let Some(error) = &self.settings_error {
                             ui.colored_label(OFF, error);
                         }
@@ -1516,6 +1633,25 @@ mod ui {
                             } else {
                                 self.tray = None;
                                 self.device.tray = false;
+                            }
+                        }
+                        let autostart_now = crate::autostart::is_installed();
+                        if self.settings_autostart != autostart_now {
+                            let result = if self.settings_autostart {
+                                crate::autostart::install()
+                            } else {
+                                crate::autostart::remove()
+                            };
+                            match result {
+                                Ok(()) => self.toast(if self.settings_autostart {
+                                    "Автозапуск включён"
+                                } else {
+                                    "Автозапуск выключен"
+                                }),
+                                Err(e) => {
+                                    self.settings_autostart = autostart_now;
+                                    self.toast(format!("Автозапуск: {e}"));
+                                }
                             }
                         }
                         save_device(&self.device);
@@ -2193,6 +2329,13 @@ mod ui {
             let ctx = ui.ctx().clone();
             self.poll_tray(&ctx);
             self.handle_close(&ctx);
+            if !self.tray_hide_done {
+                self.tray_hide_done = true;
+                if self.args.tray && self.tray.is_some() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                    self.hidden = true;
+                }
+            }
             if !self.autoconnect_done {
                 self.autoconnect_done = true;
                 if let Some(raw_addr) = self.args.autoconnect.clone() {
