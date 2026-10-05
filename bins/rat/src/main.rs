@@ -450,7 +450,10 @@ mod autostart {
         let tr = format!("\"{}\" --tray", exe.display());
         let out = schtasks()
             .args([
-                "/Create", "/F", "/SC", "ONLOGON", "/TN", TASK, "/TR", &tr, "/RL", "LIMITED",
+                // HIGHEST: агент должен работать с повышенными правами, иначе Windows
+                // (UIPI) не пропускает ввод в окна администраторских процессов —
+                // «мышь работает только в самом окне rat».
+                "/Create", "/F", "/SC", "ONLOGON", "/TN", TASK, "/TR", &tr, "/RL", "HIGHEST",
             ])
             .output()
             .map_err(|e| format!("schtasks: {e}"))?;
