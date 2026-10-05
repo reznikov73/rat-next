@@ -10,6 +10,4 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 eframe = "0.36"
 tray-icon = "0.19"
-
-[dev-dependencies]
 rat-session = { path = "../../crates/session" }

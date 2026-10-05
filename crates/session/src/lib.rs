@@ -8,6 +8,7 @@ pub mod control;
 pub mod frame;
 pub mod input;
 pub mod link;
+pub mod single_instance;
 pub mod stats;
 
 #[cfg(windows)]

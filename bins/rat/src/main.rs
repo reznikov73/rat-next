@@ -90,6 +90,16 @@ fn main() {
 #[cfg(feature = "ffmpeg")]
 fn main() {
     let args = parse_args();
+    if !rat_session::single_instance::try_acquire("app") {
+        if args.smoke.is_none() {
+            rat_session::single_instance::warn(
+                "Rat Next",
+                "Rat Next уже запущен.\nОкно можно открыть из значка в трее.",
+            );
+        }
+        note("rat: экземпляр уже запущен (двойной запуск заблокирован)");
+        std::process::exit(2);
+    }
     if let Err(e) = ui::run(args) {
         note(&format!("rat: {e}"));
         std::process::exit(1);

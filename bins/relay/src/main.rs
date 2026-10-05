@@ -40,6 +40,17 @@ fn main() {
             }
         }
     }
+    if !rat_session::single_instance::try_acquire("relay") {
+        if smoke.is_none() {
+            rat_session::single_instance::warn(
+                "Rat Next relay",
+                "Relay уже запущен.\nОкно можно открыть из значка в трее.",
+            );
+        }
+        eprintln!("relay: экземпляр уже запущен");
+        std::process::exit(2);
+    }
+
     if let Some(secs) = smoke {
         run_headless(listen, secs);
         return;
