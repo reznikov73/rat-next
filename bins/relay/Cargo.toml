@@ -4,3 +4,6 @@ description = "Rat Next: relay-сервер (pairing, форвард непро�
 version.workspace = true
 edition.workspace = true
 publish = false
+
+[dev-dependencies]
+rat-session = { path = "../../crates/session" }
