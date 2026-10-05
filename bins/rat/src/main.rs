@@ -881,6 +881,39 @@ mod ui {
     const ID_COLOR: egui::Color32 = egui::Color32::from_rgb(96, 176, 255);
     /// Ещё ярче — для самого номера ID.
     const ID_BRIGHT: egui::Color32 = egui::Color32::from_rgb(140, 205, 255);
+    /// Имя семейства с настоящим жирным шрифтом для номера ID.
+    const ID_BOLD: &str = "id-bold";
+
+    /// Подключает системный жирный шрифт для номера ID (`strong()` в egui
+    /// меняет только цвет — реальной жирности в комплекте нет).
+    fn install_ui_fonts(ctx: &egui::Context) {
+        let candidates = [
+            r"C:\Windows\Fonts\segoeuib.ttf",
+            r"C:\Windows\Fonts\seguisb.ttf",
+            r"C:\Windows\Fonts\arialbd.ttf",
+        ];
+        let Some(bytes) = candidates.iter().find_map(|p| std::fs::read(p).ok()) else {
+            return;
+        };
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert(
+            ID_BOLD.to_owned(),
+            Arc::new(egui::FontData::from_owned(bytes)),
+        );
+        let mut family = vec![ID_BOLD.to_owned()];
+        // Запасной вариант — шрифт по умолчанию.
+        if let Some(default_font) = fonts
+            .families
+            .get(&egui::FontFamily::Proportional)
+            .and_then(|f| f.first().cloned())
+        {
+            family.push(default_font);
+        }
+        fonts
+            .families
+            .insert(egui::FontFamily::Name(ID_BOLD.into()), family);
+        ctx.set_fonts(fonts);
+    }
 
     pub fn run(args: Args) -> Result<(), String> {
         if std::env::var_os("WGPU_BACKEND").is_none() {
@@ -896,7 +929,10 @@ mod ui {
         eframe::run_native(
             "Rat Next",
             options,
-            Box::new(move |_cc| Ok(Box::new(RatApp::new(args)))),
+            Box::new(move |cc| {
+                install_ui_fonts(&cc.egui_ctx);
+                Ok(Box::new(RatApp::new(args)))
+            }),
         )
         .map_err(|e| e.to_string())
     }
@@ -1376,26 +1412,21 @@ mod ui {
                 });
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Мой ID").color(DIM));
+                    // «Мой ID» слева: подпись — по высоте номера, номер — жирный.
+                    let id_font = egui::FontId::new(34.0, egui::FontFamily::Name(ID_BOLD.into()));
+                    // Резервируем высоту строки заранее — иначе подпись
+                    // центрируется по ещё «короткой» строке и уезжает вверх.
+                    let line_h = ui.ctx().fonts_mut(|f| f.row_height(&id_font));
+                    ui.set_min_height(line_h);
+                    ui.vertical(|ui| {
+                        // Подпись — по оптическому центру цифр номера
+                        // (18px выверены по пикселям; при смене кегля подстроить).
+                        ui.add_space(18.0);
+                        ui.label(egui::RichText::new("Мой ID").color(ID_COLOR));
+                    });
                     ui.label(
                         egui::RichText::new(self.device.id.clone())
-                            .size(26.0)
-                            .strong()
-                            .color(ID_COLOR),
-                    );
-                    if ui.button("копировать").clicked() {
-                        ui.ctx().copy_text(self.device.id.clone());
-                    }
-                    // «Мой ID» — по центру шапки, акцентно.
-                    let reserve = 340.0;
-                    if ui.available_width() > reserve {
-                        ui.add_space((ui.available_width() - reserve) / 2.0);
-                    }
-                    ui.label(egui::RichText::new("Мой ID").strong().color(ID_COLOR));
-                    ui.label(
-                        egui::RichText::new(self.device.id.clone())
-                            .size(34.0)
-                            .strong()
+                            .font(id_font)
                             .color(ID_BRIGHT),
                     );
                     if ui.button("копировать").clicked() {
