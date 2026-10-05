@@ -970,6 +970,12 @@ mod ui {
         info: Arc<Mutex<Option<SessionInfo>>>,
         monitors: Arc<Mutex<Vec<(u16, u16, u16)>>>,
         pending_switch: Arc<Mutex<Option<u16>>>,
+        // Панели-оверлеи: автоскрытие и анимация выезда.
+        top_open: bool,
+        bottom_open: bool,
+        top_t: f32,
+        bottom_t: f32,
+        pinned: bool,
         clip_in: Arc<Mutex<Option<String>>>,
         pending_paste: Arc<Mutex<Option<String>>>,
         last_clip_applied: Option<String>,
@@ -1293,6 +1299,11 @@ mod ui {
                             clip_in,
                             pending_paste,
                             last_clip_applied: None,
+                            top_open: false,
+                            bottom_open: false,
+                            top_t: 0.0,
+                            bottom_t: 0.0,
+                            pinned: false,
                             switch_after,
                             switch_done: false,
                             connected_at: Instant::now(),
@@ -1999,55 +2010,167 @@ mod ui {
                 }
                 v.last_clip_applied = clip_now;
             }
-            egui::Panel::top("vt").show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    if ui.button("← Назад").clicked() {
-                        back = true;
-                    }
-                    ui.separator();
-                    ui.label(format!("{} ({})", v.name, v.addr));
-                    let st = v.stats.lock().unwrap();
-                    ui.separator();
-                    ui.label(format!("fps: {:.1}", st.fps));
-                    ui.separator();
-                    ui.label(format!("e2e {:.0}ms", SessionStats::avg(&st.e2e_ms)));
-                    ui.separator();
-                    ui.label(format!("sent {} | shown {}", st.sent_pkts, st.shown));
-                    if !st.last_error.is_empty() {
-                        ui.separator();
-                        ui.colored_label(OFF, format!("ошибка: {}", st.last_error));
-                    }
-                    ui.separator();
-                    let mons = v.monitors.lock().unwrap().clone();
-                    let cur = v
-                        .info
-                        .lock()
-                        .unwrap()
-                        .as_ref()
-                        .map(|s| s.active)
-                        .unwrap_or(0);
-                    if !mons.is_empty() {
-                        ui.label("Монитор:");
-                        for (idx, mw, mh) in &mons {
-                            let sel = cur == *idx;
-                            if ui
-                                .selectable_label(sel, format!("{} ({}×{})", idx + 1, mw, mh))
-                                .clicked()
-                                && !sel
-                            {
-                                *v.pending_switch.lock().unwrap() = Some(*idx);
-                            }
-                        }
-                    } else if let Some(si) = v.info.lock().unwrap().as_ref() {
-                        ui.label(format!("монитор {}×{}", si.out.width, si.out.height));
-                    }
-                });
+            // ---- панели-оверлеи: прячутся, выезжают при наведении к краю ----
+            const TOP_H: f32 = 42.0;
+            const BOT_H: f32 = 30.0;
+            const EDGE: f32 = 6.0;
+            let screen = ui.ctx().content_rect();
+            let (ptr0, any_down, dt) = ui.ctx().input(|i| {
+                (
+                    i.pointer.hover_pos(),
+                    i.pointer.any_down(),
+                    i.stable_dt.clamp(0.001, 0.05),
+                )
             });
-            egui::Panel::bottom("vh").show(ui, |ui| {
-                ui.label(
-                    "Мышь — над видео; клавиатура — когда окно в фокусе. «← Назад» — отключиться.",
-                );
-            });
+            let in_win = |p: egui::Pos2| screen.expand(4.0).contains(p);
+            let want_top = v.pinned
+                || (!any_down && ptr0.is_some_and(|p| in_win(p) && p.y <= screen.top() + EDGE))
+                || (v.top_open
+                    && ptr0.is_some_and(|p| in_win(p) && p.y <= screen.top() + TOP_H + 4.0));
+            let want_bottom = v.pinned
+                || (!any_down && ptr0.is_some_and(|p| in_win(p) && p.y >= screen.bottom() - EDGE))
+                || (v.bottom_open
+                    && ptr0.is_some_and(|p| in_win(p) && p.y >= screen.bottom() - BOT_H - 4.0));
+            v.top_open = want_top;
+            v.bottom_open = want_bottom;
+            for (t, open, dur_in, dur_out) in [
+                (&mut v.top_t, v.top_open, 0.35f32, 0.20f32),
+                (&mut v.bottom_t, v.bottom_open, 0.30f32, 0.18f32),
+            ] {
+                let target = if open { 1.0 } else { 0.0 };
+                let dur = if target > *t { dur_in } else { dur_out };
+                let step = dt / dur;
+                *t = if (target - *t).abs() <= step {
+                    target
+                } else {
+                    *t + (target - *t).signum() * step
+                };
+            }
+            let bar_fill = egui::Color32::from_rgba_unmultiplied(18, 22, 28, 235);
+            if v.top_t > 0.01 {
+                let y = screen.top() - TOP_H * (1.0 - v.top_t);
+                egui::Area::new(egui::Id::new("vt_top"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(egui::pos2(screen.left(), y))
+                    .interactable(true)
+                    .show(ui.ctx(), |ui| {
+                        let bg = egui::Rect::from_min_size(
+                            egui::pos2(screen.left(), y),
+                            egui::vec2(screen.width(), TOP_H),
+                        );
+                        ui.painter().rect_filled(bg, 0.0, bar_fill);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(screen.width(), TOP_H),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.add_space(10.0);
+                                ui.horizontal(|ui| {
+                                    if ui.button("← Назад").clicked() {
+                                        back = true;
+                                    }
+                                    ui.separator();
+                                    ui.label(format!("{} ({})", v.name, v.addr));
+                                    let st = v.stats.lock().unwrap();
+                                    ui.separator();
+                                    ui.label(format!("fps: {:.1}", st.fps));
+                                    ui.separator();
+                                    ui.label(format!("e2e {:.0}ms", SessionStats::avg(&st.e2e_ms)));
+                                    ui.separator();
+                                    ui.label(format!("sent {} | shown {}", st.sent_pkts, st.shown));
+                                    if !st.last_error.is_empty() {
+                                        ui.separator();
+                                        ui.colored_label(OFF, format!("ошибка: {}", st.last_error));
+                                    }
+                                    ui.separator();
+                                    let mons = v.monitors.lock().unwrap().clone();
+                                    let cur = v
+                                        .info
+                                        .lock()
+                                        .unwrap()
+                                        .as_ref()
+                                        .map(|s| s.active)
+                                        .unwrap_or(0);
+                                    if !mons.is_empty() {
+                                        ui.label("Монитор:");
+                                        for (idx, mw, mh) in &mons {
+                                            let sel = cur == *idx;
+                                            if ui
+                                                .selectable_label(
+                                                    sel,
+                                                    format!("{} ({}×{})", idx + 1, mw, mh),
+                                                )
+                                                .clicked()
+                                                && !sel
+                                            {
+                                                *v.pending_switch.lock().unwrap() = Some(*idx);
+                                            }
+                                        }
+                                    } else if let Some(si) = v.info.lock().unwrap().as_ref() {
+                                        ui.label(format!(
+                                            "монитор {}×{}",
+                                            si.out.width, si.out.height
+                                        ));
+                                    }
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.add_space(10.0);
+                                            let is_fs = ui
+                                                .ctx()
+                                                .input(|i| i.viewport().fullscreen)
+                                                .unwrap_or(false);
+                                            let label = if is_fs {
+                                                "В окно"
+                                            } else {
+                                                "Во весь экран"
+                                            };
+                                            if ui
+                                                .button(label)
+                                                .on_hover_text("Полноэкранный режим / обратно")
+                                                .clicked()
+                                            {
+                                                ui.ctx().send_viewport_cmd(
+                                                    egui::ViewportCommand::Fullscreen(!is_fs),
+                                                );
+                                            }
+                                            if ui
+                                                .selectable_label(v.pinned, "Закрепить")
+                                                .on_hover_text("Не скрывать панели автоматически")
+                                                .clicked()
+                                            {
+                                                v.pinned = !v.pinned;
+                                            }
+                                        },
+                                    );
+                                });
+                            },
+                        );
+                    });
+            }
+            if v.bottom_t > 0.01 {
+                let y = screen.bottom() - BOT_H * v.bottom_t;
+                egui::Area::new(egui::Id::new("vt_bottom"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(egui::pos2(screen.left(), y))
+                    .interactable(true)
+                    .show(ui.ctx(), |ui| {
+                        let bg = egui::Rect::from_min_size(
+                            egui::pos2(screen.left(), y),
+                            egui::vec2(screen.width(), BOT_H),
+                        );
+                        ui.painter().rect_filled(bg, 0.0, bar_fill);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(screen.width(), BOT_H),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.add_space(10.0);
+                                ui.label(
+                                    "Мышь — над видео; клавиатура — когда окно в фокусе. Панели выезжают при наведении к верхнему/нижнему краю. «← Назад» — отключиться.",
+                                );
+                            },
+                        );
+                    });
+            }
 
             let mut video_rect: Option<egui::Rect> = None;
             egui::CentralPanel::default().show(ui, |ui| {
@@ -2096,11 +2219,18 @@ mod ui {
                 let mut locked = input_q.lock().unwrap();
                 let focused = ui.ctx().input(|i| i.focused);
 
+                // Панель поверх видео: пока указатель над ней, ввод в сессию не шлём.
+                let over_bars = ptr0.is_some_and(|p| {
+                    p.y <= screen.top() + TOP_H * v.top_t + 1.0
+                        || p.y >= screen.bottom() - BOT_H * v.bottom_t - 1.0
+                });
+
                 // Указатель: движение, кнопки, колесо.
-                let engaged = resp.hovered() || resp.dragged() || v.buttons_down.iter().any(|d| *d);
+                let engaged = ((resp.hovered() || resp.dragged()) && !over_bars)
+                    || v.buttons_down.iter().any(|d| *d);
                 if engaged {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::None);
-                    if let Some(p) = ui.ctx().input(|i| i.pointer.latest_pos()) {
+                    if !over_bars && let Some(p) = ui.ctx().input(|i| i.pointer.latest_pos()) {
                         let rel = p - draw.min;
                         let (nx, ny) =
                             input::ui_px_to_norm(rel.x, rel.y, draw.width(), draw.height());
@@ -2136,7 +2266,7 @@ mod ui {
                     });
                     for (idx, pressed, rx, ry) in pb {
                         let i = idx as usize;
-                        if resp.hovered() || v.buttons_down[i] {
+                        if (resp.hovered() && !over_bars) || v.buttons_down[i] {
                             let (nx, ny) =
                                 input::ui_px_to_norm(rx, ry, draw.width(), draw.height());
                             v.last_pointer = Some((nx, ny));
@@ -2149,7 +2279,8 @@ mod ui {
                             });
                         }
                     }
-                    if resp.hovered() && (wheel.0.abs() > 0.5 || wheel.1.abs() > 0.5) {
+                    if resp.hovered() && !over_bars && (wheel.0.abs() > 0.5 || wheel.1.abs() > 0.5)
+                    {
                         locked.push(InputEvent::Wheel {
                             dx: wheel.0.clamp(-32768.0, 32767.0) as i16,
                             dy: wheel.1.clamp(-32768.0, 32767.0) as i16,
