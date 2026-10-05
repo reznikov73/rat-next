@@ -127,6 +127,16 @@ fn note(s: &str) {
     log_line(s);
 }
 
+// ================== значок приложения и трей ==================
+
+/// Рисование иконки: тот же код использует `build.rs`, чтобы вложить `.ico` в exe.
+#[cfg(feature = "ffmpeg")]
+mod icon;
+
+/// Значок в области уведомлений.
+#[cfg(feature = "ffmpeg")]
+mod tray;
+
 // ================== хранилище машин ==================
 
 #[cfg(feature = "ffmpeg")]
@@ -162,13 +172,39 @@ mod store {
         }
     }
 
+    pub const DEFAULT_RELAY: &str = "194.37.254.233:8889";
+
+    #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ConnectionMode {
+        #[default]
+        Internet,
+        Lan,
+    }
+
     /// Настройки этого узла (device.json рядом с exe).
-    #[derive(Serialize, Deserialize, Clone, Default)]
+    #[derive(Serialize, Deserialize, Clone)]
+    #[serde(default)]
     pub struct Device {
-        #[serde(default)]
         pub id: String,
-        #[serde(default)]
         pub relay: String,
+        pub mode: ConnectionMode,
+        /// Принимать входящие подключения без запроса подтверждения.
+        pub auto_allow: bool,
+        /// Прятать окно в трей вместо выхода по крестику.
+        pub tray: bool,
+    }
+
+    impl Default for Device {
+        fn default() -> Self {
+            Self {
+                id: String::new(),
+                relay: DEFAULT_RELAY.to_string(),
+                mode: ConnectionMode::Internet,
+                auto_allow: false,
+                tray: true,
+            }
+        }
     }
 
     pub fn device_path() -> PathBuf {
@@ -179,10 +215,12 @@ mod store {
     }
 
     pub fn load_device() -> Device {
-        std::fs::read_to_string(device_path())
+        let mut device = std::fs::read_to_string(device_path())
             .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+            .and_then(|s| serde_json::from_str::<Device>(&s).ok())
+            .unwrap_or_default();
+        device.relay = normalize_relay(&device.relay);
+        device
     }
 
     pub fn save_device(d: &Device) {
@@ -191,32 +229,63 @@ mod store {
         }
     }
 
-    /// Сгенерировать ID устройства (XXXX-XXXX-XXXX; без похожих символов).
-    pub fn gen_id() -> String {
-        const AL: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
-        let mut seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0x9E37_79B9_7F4A_7C15);
-        seed ^= (std::process::id() as u64) << 33;
-        seed ^= (&seed as *const u64 as u64) >> 3;
-        let mut x = seed | 1;
-        let mut out = String::with_capacity(14);
-        for i in 0..12 {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            if i == 4 || i == 8 {
-                out.push('-');
-            }
-            out.push(AL[(x % AL.len() as u64) as usize] as char);
-        }
-        out
+    pub fn is_valid_id(id: &str) -> bool {
+        id.len() == 6 && id.bytes().all(|byte| byte.is_ascii_digit())
     }
 
-    /// Похоже ли на прямой адрес (`IP:порт`), иначе — ID интернет-режима.
-    pub fn is_direct_addr(s: &str) -> bool {
-        s.contains(':')
+    pub fn gen_id() -> Result<String, std::io::Error> {
+        let mut bytes = [0_u8; 4];
+        fill_random(&mut bytes)?;
+        let number = 100_000 + u32::from_le_bytes(bytes) % 900_000;
+        Ok(format!("{number:06}"))
+    }
+
+    #[cfg(windows)]
+    fn fill_random(bytes: &mut [u8]) -> Result<(), std::io::Error> {
+        #[link(name = "bcrypt")]
+        unsafe extern "system" {
+            fn BCryptGenRandom(
+                algorithm: *mut std::ffi::c_void,
+                buffer: *mut u8,
+                length: u32,
+                flags: u32,
+            ) -> i32;
+        }
+        let status = unsafe {
+            BCryptGenRandom(
+                std::ptr::null_mut(),
+                bytes.as_mut_ptr(),
+                bytes.len() as u32,
+                2,
+            )
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!("BCryptGenRandom: {status}")))
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn fill_random(bytes: &mut [u8]) -> Result<(), std::io::Error> {
+        use std::io::Read;
+        std::fs::File::open("/dev/urandom")?.read_exact(bytes)
+    }
+
+    pub fn normalize_relay(raw: &str) -> String {
+        let relay = raw.trim();
+        if relay.is_empty() {
+            return DEFAULT_RELAY.to_string();
+        }
+        let has_port = relay
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.parse::<u16>().ok())
+            .is_some();
+        if has_port || relay.contains(':') {
+            relay.to_string()
+        } else {
+            format!("{relay}:8889")
+        }
     }
 
     /// Нормализовать: IP → добавить порт по умолчанию; ID — как есть.
@@ -250,6 +319,90 @@ mod store {
             format!("{} дн назад", d / 86400)
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn generated_id_has_six_digits() {
+            let id = gen_id().unwrap();
+            assert!(is_valid_id(&id));
+        }
+
+        #[test]
+        fn relay_address_gets_default_port() {
+            assert_eq!(normalize_relay("194.37.254.233"), "194.37.254.233:8889");
+            assert_eq!(normalize_relay(""), DEFAULT_RELAY);
+            assert_eq!(normalize_relay("relay.example:9000"), "relay.example:9000");
+            assert_eq!(normalize_relay("relay.example:bad"), "relay.example:bad");
+        }
+    }
+}
+
+#[cfg(feature = "ffmpeg")]
+mod approval {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::{self, Sender, SyncSender};
+    use std::time::{Duration, Instant};
+
+    #[derive(Clone, Copy)]
+    pub enum Source {
+        Lan,
+        Internet,
+    }
+
+    pub struct Request {
+        pub source: Source,
+        pub expires_at: Instant,
+        pub reply: SyncSender<bool>,
+    }
+
+    /// Настройка «Подключать без подтверждения» из окна настроек.
+    static AUTO_ALLOW: AtomicBool = AtomicBool::new(false);
+
+    pub fn set_auto_allow(on: bool) {
+        AUTO_ALLOW.store(on, Ordering::Relaxed);
+    }
+
+    pub fn request(requests: &Sender<Request>, source: Source, running: &AtomicBool) -> bool {
+        if AUTO_ALLOW.load(Ordering::Relaxed) {
+            crate::note(&format!(
+                "[guard] подключение разрешено без подтверждения ({})",
+                match source {
+                    Source::Lan => "локальная сеть",
+                    Source::Internet => "интернет",
+                }
+            ));
+            return true;
+        }
+        let (reply, decision) = mpsc::sync_channel(1);
+        let expires_at = Instant::now() + Duration::from_secs(60);
+        if requests
+            .send(Request {
+                source,
+                expires_at,
+                reply,
+            })
+            .is_err()
+        {
+            return false;
+        }
+        loop {
+            if !running.load(Ordering::Relaxed) {
+                return false;
+            }
+            let remaining = expires_at.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            match decision.recv_timeout(remaining.min(Duration::from_millis(200))) {
+                Ok(allowed) => return allowed,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return false,
+            }
+        }
+    }
 }
 
 // ================== встроенный сервер ==================
@@ -262,6 +415,8 @@ mod server {
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
 
+    use std::sync::mpsc::Sender;
+
     use rat_session::agent::{AgentConfig, spawn_agent};
     use rat_session::link::tcp_accept;
     use rat_session::stats::{SessionStats, TimeBase};
@@ -271,6 +426,7 @@ mod server {
         running: Arc<AtomicBool>,
         stop_current: Arc<Mutex<Option<Arc<AtomicBool>>>>,
         thread: Option<JoinHandle<()>>,
+        incoming_requests: Sender<crate::approval::Request>,
         pub sessions: Arc<AtomicU64>,
         /// Какой монитор отдавать (индекс DXGI; применяется к новым сессиям).
         pub monitor: Arc<AtomicU32>,
@@ -278,12 +434,13 @@ mod server {
     }
 
     impl ServerHandle {
-        pub fn new() -> Self {
+        pub fn new(incoming_requests: Sender<crate::approval::Request>) -> Self {
             Self {
                 port: 55140,
                 running: Arc::new(AtomicBool::new(false)),
                 stop_current: Arc::new(Mutex::new(None)),
                 thread: None,
+                incoming_requests,
                 sessions: Arc::new(AtomicU64::new(0)),
                 monitor: Arc::new(AtomicU32::new(0)),
                 last_err: Arc::new(Mutex::new(None)),
@@ -306,6 +463,7 @@ mod server {
             self.port = port;
             let running = self.running.clone();
             let stop_current = self.stop_current.clone();
+            let incoming_requests = self.incoming_requests.clone();
             let sessions = self.sessions.clone();
             let monitor = self.monitor.clone();
             let last_err = self.last_err.clone();
@@ -314,6 +472,15 @@ mod server {
                 while running.load(Ordering::Relaxed) {
                     match tcp_accept(&listener) {
                         Ok((link, closer)) => {
+                            let approved = crate::approval::request(
+                                &incoming_requests,
+                                crate::approval::Source::Lan,
+                                &running,
+                            );
+                            if !approved {
+                                closer.close();
+                                continue;
+                            }
                             crate::note("[server] клиент подключился");
                             sessions.fetch_add(1, Ordering::Relaxed);
                             let base = TimeBase(Instant::now());
@@ -368,12 +535,6 @@ mod server {
             }
         }
     }
-
-    impl Default for ServerHandle {
-        fn default() -> Self {
-            Self::new()
-        }
-    }
 }
 
 // ================== интернет-режим (relay-клиент) ==================
@@ -381,6 +542,7 @@ mod server {
 #[cfg(feature = "ffmpeg")]
 mod internet {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::mpsc::Sender;
     use std::sync::{Arc, Mutex};
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
@@ -392,6 +554,7 @@ mod internet {
     pub struct InternetHandle {
         running: Arc<AtomicBool>,
         thread: Option<JoinHandle<()>>,
+        incoming_requests: Sender<crate::approval::Request>,
         pub status: Arc<Mutex<String>>,
         pub sessions: Arc<AtomicU64>,
         abort: Arc<Mutex<Option<TcpCloser>>>,
@@ -400,10 +563,14 @@ mod internet {
     }
 
     impl InternetHandle {
-        pub fn new(monitor: Arc<std::sync::atomic::AtomicU32>) -> Self {
+        pub fn new(
+            monitor: Arc<std::sync::atomic::AtomicU32>,
+            incoming_requests: Sender<crate::approval::Request>,
+        ) -> Self {
             Self {
                 running: Arc::new(AtomicBool::new(false)),
                 thread: None,
+                incoming_requests,
                 status: Arc::new(Mutex::new("выключен".to_string())),
                 sessions: Arc::new(AtomicU64::new(0)),
                 abort: Arc::new(Mutex::new(None)),
@@ -426,6 +593,7 @@ mod internet {
             let sessions = self.sessions.clone();
             let abort = self.abort.clone();
             let stop_current = self.stop_current.clone();
+            let incoming_requests = self.incoming_requests.clone();
             let monitor = self.monitor.clone();
             self.thread = Some(std::thread::spawn(move || {
                 while running.load(Ordering::Relaxed) {
@@ -457,6 +625,19 @@ mod internet {
                         }
                         Ok((link, closer)) => {
                             *abort.lock().unwrap() = None;
+                            *status.lock().unwrap() =
+                                "ожидаю разрешения на подключение".to_string();
+                            let approved = crate::approval::request(
+                                &incoming_requests,
+                                crate::approval::Source::Internet,
+                                &running,
+                            );
+                            if !approved {
+                                closer.close();
+                                *status.lock().unwrap() =
+                                    "подключение отклонено или истёк запрос".to_string();
+                                continue;
+                            }
                             *status.lock().unwrap() = "сессия (через сервер)".to_string();
                             sessions.fetch_add(1, Ordering::Relaxed);
                             let mon = monitor.load(Ordering::Relaxed);
@@ -533,7 +714,7 @@ mod ui {
     use std::collections::HashMap;
     use std::net::ToSocketAddrs;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
+    use std::sync::mpsc::{Receiver, TryRecvError, channel, sync_channel};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -545,11 +726,12 @@ mod ui {
     use rat_session::viewer::{FrameOut, ViewerShared, spawn_viewer};
 
     use super::Args;
+    use super::approval::{Request, Source};
     use super::internet::InternetHandle;
     use super::server::ServerHandle;
     use super::store::{
-        Device, Machine, ago_text, gen_id, is_direct_addr, load, load_device, normalize_addr,
-        now_unix, save, save_device,
+        ConnectionMode, Device, Machine, ago_text, gen_id, is_valid_id, load, load_device,
+        normalize_addr, normalize_relay, now_unix, save, save_device,
     };
 
     const CARD_BG: egui::Color32 = egui::Color32::from_rgb(34, 39, 47);
@@ -559,6 +741,8 @@ mod ui {
     const OFF: egui::Color32 = egui::Color32::from_rgb(244, 67, 54);
     const DIM: egui::Color32 = egui::Color32::from_rgb(150, 158, 170);
     const DIM2: egui::Color32 = egui::Color32::from_rgb(120, 128, 140);
+    /// Свой ID — самое важное число в главном окне: его диктуют оператору.
+    const ID_COLOR: egui::Color32 = egui::Color32::from_rgb(96, 176, 255);
 
     pub fn run(args: Args) -> Result<(), String> {
         if std::env::var_os("WGPU_BACKEND").is_none() {
@@ -566,7 +750,9 @@ mod ui {
             unsafe { std::env::set_var("WGPU_BACKEND", "dx12") };
         }
         let options = eframe::NativeOptions {
-            viewport: egui::ViewportBuilder::default().with_inner_size([1020.0, 700.0]),
+            viewport: egui::ViewportBuilder::default()
+                .with_inner_size([1020.0, 700.0])
+                .with_icon(window_icon()),
             ..Default::default()
         };
         eframe::run_native(
@@ -575,6 +761,16 @@ mod ui {
             Box::new(move |_cc| Ok(Box::new(RatApp::new(args)))),
         )
         .map_err(|e| e.to_string())
+    }
+
+    /// Иконка окна и панели задач — тот же рисунок, что у трея и у exe.
+    fn window_icon() -> egui::IconData {
+        const SIDE: u32 = 64;
+        egui::IconData {
+            rgba: crate::icon::rgba(SIDE),
+            width: SIDE,
+            height: SIDE,
+        }
     }
 
     type ConnectMsg = Result<ViewerSession, String>;
@@ -645,7 +841,14 @@ mod ui {
         server: ServerHandle,
         internet: InternetHandle,
         device: Device,
-        relay_edit: String,
+        settings_open: bool,
+        settings_mode: ConnectionMode,
+        settings_relay_edit: String,
+        settings_auto_allow: bool,
+        settings_tray: bool,
+        settings_error: Option<String>,
+        incoming_rx: Receiver<Request>,
+        incoming_pending: Option<Request>,
         monitors: Vec<MonitorInfo>,
         monitor_sel: u32,
         port_edit: String,
@@ -665,6 +868,12 @@ mod ui {
         autoconnect_done: bool,
         started: Instant,
         finished: bool,
+        /// Значок в области уведомлений; есть, только если включена настройка.
+        tray: Option<crate::tray::Tray>,
+        /// Выбран «Выход» — закрытие окна завершает процесс, а не прячет его.
+        quitting: bool,
+        /// Окно скрыто в трей — перерисовку можно замедлить.
+        hidden: bool,
     }
 
     impl RatApp {
@@ -676,7 +885,7 @@ mod ui {
                 let statuses = statuses.clone();
                 std::thread::spawn(move || {
                     loop {
-                        let relay = crate::store::load_device().relay;
+                        let device = crate::store::load_device();
                         let list: Vec<String> = machines
                             .lock()
                             .unwrap()
@@ -684,8 +893,9 @@ mod ui {
                             .map(|m| m.addr.clone())
                             .collect();
                         for addr in list {
-                            let ok = if crate::store::is_direct_addr(&addr) {
-                                addr.to_socket_addrs()
+                            let ok = match device.mode {
+                                ConnectionMode::Lan => addr
+                                    .to_socket_addrs()
                                     .ok()
                                     .and_then(|mut it| it.next())
                                     .map(|sa| {
@@ -695,11 +905,11 @@ mod ui {
                                         )
                                         .is_ok()
                                     })
-                                    .unwrap_or(false)
-                            } else if relay.trim().is_empty() {
-                                false
-                            } else {
-                                rat_session::link::relay_who(relay.as_str(), &addr).unwrap_or(false)
+                                    .unwrap_or(false),
+                                ConnectionMode::Internet => {
+                                    rat_session::link::relay_who(device.relay.as_str(), &addr)
+                                        .unwrap_or(false)
+                                }
                             };
                             statuses.lock().unwrap().insert(addr, ok);
                         }
@@ -708,7 +918,8 @@ mod ui {
                 });
             }
             let port = args.port;
-            let mut server = ServerHandle::new();
+            let (incoming_tx, incoming_rx) = channel();
+            let mut server = ServerHandle::new(incoming_tx.clone());
             let mut toast = None;
             if let Err(e) = server.start(port) {
                 crate::note(&format!("[ui] сервер не запустился: {e}"));
@@ -724,20 +935,51 @@ mod ui {
             if let Some(id) = &args.device_id {
                 device.id = id.clone();
             }
-            if let Some(r) = &args.relay {
-                device.relay = r.clone();
+            if let Some(relay) = &args.relay {
+                device.relay = normalize_relay(relay);
+                device.mode = ConnectionMode::Internet;
             }
-            if device.id.is_empty() {
-                device.id = gen_id();
+            device.relay = normalize_relay(&device.relay);
+            if !is_valid_id(&device.id) {
+                match gen_id() {
+                    Ok(id) => device.id = id,
+                    Err(error) => {
+                        crate::note(&format!("[ui] не удалось создать ID: {error}"));
+                        device.id.clear();
+                        if toast.is_none() {
+                            toast =
+                                Some((format!("Не удалось создать ID: {error}"), Instant::now()));
+                        }
+                    }
+                }
             }
             save_device(&device);
-            let mut internet = InternetHandle::new(server.monitor.clone());
-            let relay_edit = device.relay.clone();
-            if let Some(r) = &args.relay
-                && !r.trim().is_empty()
-            {
+            let settings_mode = device.mode;
+            let settings_relay_edit = device.relay.clone();
+            let settings_auto_allow = device.auto_allow;
+            let settings_tray = device.tray;
+            crate::approval::set_auto_allow(device.auto_allow);
+            let tray = if device.tray {
+                match crate::tray::Tray::new() {
+                    Ok(tray) => Some(tray),
+                    Err(e) => {
+                        crate::note(&format!("[ui] значок в трее не создан: {e}"));
+                        if toast.is_none() {
+                            toast = Some((
+                                format!("Не удалось создать значок в трее: {e}"),
+                                Instant::now(),
+                            ));
+                        }
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let mut internet = InternetHandle::new(server.monitor.clone(), incoming_tx);
+            if device.mode == ConnectionMode::Internet && is_valid_id(&device.id) {
                 let name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "rat-pc".into());
-                internet.start(r.clone(), device.id.clone(), name);
+                internet.start(device.relay.clone(), device.id.clone(), name);
             }
             Self {
                 machines,
@@ -745,7 +987,14 @@ mod ui {
                 server,
                 internet,
                 device,
-                relay_edit,
+                settings_open: false,
+                settings_mode,
+                settings_relay_edit,
+                settings_auto_allow,
+                settings_tray,
+                settings_error: None,
+                incoming_rx,
+                incoming_pending: None,
                 monitors,
                 monitor_sel,
                 port_edit: port.to_string(),
@@ -765,6 +1014,9 @@ mod ui {
                 autoconnect_done: false,
                 started: Instant::now(),
                 finished: false,
+                tray,
+                quitting: false,
+                hidden: false,
                 args,
             }
         }
@@ -783,8 +1035,8 @@ mod ui {
             let name_conn = name.clone();
             let switch_after = self.args.switch_after;
             let relay_conn = self.device.relay.clone();
+            let internet = self.device.mode == ConnectionMode::Internet;
             std::thread::spawn(move || {
-                let internet = !crate::store::is_direct_addr(&addr_conn);
                 let mut connected = None;
                 let mut last_err = String::new();
                 for attempt in 0..10 {
@@ -913,20 +1165,31 @@ mod ui {
                         ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
                     ui.painter()
                         .circle_filled(rect.center(), 5.0, if running { ON } else { OFF });
-                    ui.label(if running {
-                        "принимаю подключения"
+                    // Одна кнопка на оба состояния: надпись меняется по факту.
+                    if running {
+                        if ui.button("Остановить сервер").clicked() {
+                            self.server.stop();
+                        }
                     } else {
-                        "сервер остановлен"
-                    });
+                        ui.label("Порт:");
+                        ui.add(egui::TextEdit::singleline(&mut self.port_edit).desired_width(56.0));
+                        if ui.button("Запустить сервер").clicked() {
+                            match self.port_edit.trim().parse::<u16>() {
+                                Ok(p) => {
+                                    if let Err(e) = self.server.start(p) {
+                                        self.toast(format!("Сервер не запустился: {e}"));
+                                    }
+                                }
+                                Err(_) => self.toast("Некорректный порт"),
+                            }
+                        }
+                    }
                     ui.separator();
                     if self.my_name.is_empty() {
-                        ui.label(format!(
-                            "Этот компьютер: {}:{}",
-                            self.my_ip, self.server.port
-                        ));
+                        ui.label(format!("{}:{}", self.my_ip, self.server.port));
                     } else {
                         ui.label(format!(
-                            "Этот компьютер: {} ({}:{})",
+                            "{} ({}:{})",
                             self.my_name, self.my_ip, self.server.port
                         ));
                     }
@@ -949,26 +1212,6 @@ mod ui {
                             self.toast("Сменил монитор — применится к следующему подключению");
                         }
                     }
-                    if running {
-                        let stop_clicked = ui.button("Остановить сервер").clicked();
-                        if stop_clicked {
-                            self.server.stop();
-                        }
-                    } else {
-                        ui.label("Порт:");
-                        ui.add(egui::TextEdit::singleline(&mut self.port_edit).desired_width(56.0));
-                        if ui.button("Запустить сервер").clicked() {
-                            match self.port_edit.trim().parse::<u16>() {
-                                Ok(p) => {
-                                    if let Err(e) = self.server.start(p) {
-                                        self.toast(format!("Сервер не запустился: {e}"));
-                                    }
-                                }
-                                Err(_) => self.toast("Некорректный порт"),
-                            }
-                        }
-                    }
-                    ui.separator();
                     ui.label(format!(
                         "сессий: {}",
                         self.server.sessions.load(Ordering::Relaxed)
@@ -980,52 +1223,25 @@ mod ui {
                 });
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    let running = self.internet.is_running();
-                    let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                    ui.painter()
-                        .circle_filled(rect.center(), 5.0, if running { ON } else { OFF });
-                    ui.label("Интернет-режим:");
-                    ui.label("сервер:");
-                    ui.add(egui::TextEdit::singleline(&mut self.relay_edit).desired_width(170.0));
-                    if running {
-                        let stop_clicked = ui.button("Отключить").clicked();
-                        if stop_clicked {
-                            self.internet.stop();
-                        }
-                    } else {
-                        let connect_clicked = ui.button("Подключиться").clicked();
-                        if connect_clicked {
-                            let addr = self.relay_edit.trim().to_string();
-                            if addr.is_empty() {
-                                self.toast("Укажите адрес сервера (host:порт)");
-                            } else {
-                                self.device.relay = addr.clone();
-                                save_device(&self.device);
-                                let name = if self.my_name.is_empty() {
-                                    "rat-pc".to_string()
-                                } else {
-                                    self.my_name.clone()
-                                };
-                                self.internet.start(addr, self.device.id.clone(), name);
-                            }
-                        }
-                    }
-                    ui.separator();
-                    ui.label("Мой ID:");
-                    ui.label(egui::RichText::new(self.device.id.clone()).strong());
-                    let copy_clicked = ui.button("копировать").clicked();
-                    if copy_clicked {
+                    ui.label(egui::RichText::new("Мой ID").color(DIM));
+                    ui.label(
+                        egui::RichText::new(self.device.id.clone())
+                            .size(26.0)
+                            .strong()
+                            .color(ID_COLOR),
+                    );
+                    if ui.button("копировать").clicked() {
                         ui.ctx().copy_text(self.device.id.clone());
                     }
                     ui.separator();
-                    let s = self.internet.status.lock().unwrap().clone();
-                    ui.label(s);
-                    ui.separator();
-                    ui.label(format!(
-                        "сессий: {}",
-                        self.internet.sessions.load(Ordering::Relaxed)
-                    ));
+                    if ui.button("Настройки").clicked() {
+                        self.settings_mode = self.device.mode;
+                        self.settings_relay_edit = self.device.relay.clone();
+                        self.settings_auto_allow = self.device.auto_allow;
+                        self.settings_tray = self.device.tray;
+                        self.settings_error = None;
+                        self.settings_open = true;
+                    }
                 });
                 ui.add_space(6.0);
             });
@@ -1046,6 +1262,24 @@ mod ui {
                     {
                         ui.separator();
                         ui.colored_label(egui::Color32::from_rgb(255, 200, 80), msg);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let mode_label = match self.device.mode {
+                        ConnectionMode::Internet => "Интернет",
+                        ConnectionMode::Lan => "локальная сеть",
+                    };
+                    ui.label(format!("Режим: {mode_label}"));
+                    if self.device.mode == ConnectionMode::Internet {
+                        let running = self.internet.is_running();
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                        ui.painter().circle_filled(
+                            rect.center(),
+                            5.0,
+                            if running { ON } else { OFF },
+                        );
+                        ui.label(self.internet.status.lock().unwrap().clone());
                     }
                 });
                 ui.add_space(6.0);
@@ -1133,6 +1367,176 @@ mod ui {
         }
 
         fn dialogs(&mut self, ctx: &egui::Context) {
+            if self.incoming_pending.is_none()
+                && let Ok(request) = self.incoming_rx.try_recv()
+            {
+                self.incoming_pending = Some(request);
+            }
+            let request_expired = self
+                .incoming_pending
+                .as_ref()
+                .is_some_and(|request| request.expires_at <= Instant::now());
+            if request_expired && let Some(request) = self.incoming_pending.take() {
+                let _ = request.reply.send(false);
+            }
+
+            let mut approval_decision = None;
+            if let Some(request) = self.incoming_pending.as_ref() {
+                let mut open = true;
+                egui::Window::new("Подтверждение подключения")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .open(&mut open)
+                    .show(ctx, |ui| {
+                        let source = match request.source {
+                            Source::Lan => "локальной сети",
+                            Source::Internet => "Интернета через relay",
+                        };
+                        ui.label(format!("Запрос на подключение из {source}."));
+                        ui.label("Будет открыт удалённый просмотр экрана и управление.");
+                        ui.label("Разрешить эту сессию?");
+                        ui.horizontal(|ui| {
+                            if ui.button("Разрешить").clicked() {
+                                approval_decision = Some(true);
+                            }
+                            if ui.button("Отклонить").clicked() {
+                                approval_decision = Some(false);
+                            }
+                        });
+                    });
+                if !open && approval_decision.is_none() {
+                    approval_decision = Some(false);
+                }
+            }
+            if let Some(allowed) = approval_decision
+                && let Some(request) = self.incoming_pending.take()
+            {
+                let _ = request.reply.send(allowed);
+            }
+
+            if self.settings_open {
+                let mut open = true;
+                let mut apply = false;
+                let mut cancel = false;
+                egui::Window::new("Настройки подключения")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .open(&mut open)
+                    .show(ctx, |ui| {
+                        ui.label("Режим подключения:");
+                        ui.radio_value(
+                            &mut self.settings_mode,
+                            ConnectionMode::Internet,
+                            "Интернет через relay",
+                        );
+                        ui.radio_value(
+                            &mut self.settings_mode,
+                            ConnectionMode::Lan,
+                            "Локальная сеть (IP:порт)",
+                        );
+                        if self.settings_mode == ConnectionMode::Internet {
+                            ui.separator();
+                            ui.label("Адрес relay (host:порт):");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.settings_relay_edit)
+                                    .desired_width(280.0),
+                            );
+                        }
+                        ui.separator();
+                        ui.checkbox(
+                            &mut self.settings_auto_allow,
+                            "Подключать без подтверждения",
+                        );
+                        ui.label(
+                            egui::RichText::new(
+                                "Подключения принимаются сразу — и в локальной сети, и через relay",
+                            )
+                            .small()
+                            .color(egui::Color32::from_gray(150)),
+                        );
+                        ui.checkbox(&mut self.settings_tray, "Сворачивать в трей");
+                        if let Some(error) = &self.settings_error {
+                            ui.colored_label(OFF, error);
+                        }
+                        ui.horizontal(|ui| {
+                            if ui.button("Сохранить").clicked() {
+                                apply = true;
+                            }
+                            if ui.button("Отмена").clicked() {
+                                cancel = true;
+                            }
+                        });
+                    });
+                if apply {
+                    let relay = normalize_relay(&self.settings_relay_edit);
+                    let valid_relay = relay.rsplit_once(':').is_some_and(|(host, port)| {
+                        !host.trim().is_empty()
+                            && port.parse::<u16>().is_ok_and(|parsed| parsed > 0)
+                    });
+                    if self.settings_mode == ConnectionMode::Internet && !valid_relay {
+                        self.settings_error = Some(
+                            "Укажите адрес relay в формате host:порт, например 194.37.254.233:8889"
+                                .to_string(),
+                        );
+                    } else {
+                        let old_mode = self.device.mode;
+                        let old_relay = self.device.relay.clone();
+                        let restart = old_mode != self.settings_mode
+                            || old_relay != relay
+                            || !self.internet.is_running();
+                        self.device.mode = self.settings_mode;
+                        self.device.relay = relay;
+                        self.device.auto_allow = self.settings_auto_allow;
+                        crate::approval::set_auto_allow(self.settings_auto_allow);
+                        if self.settings_tray != self.device.tray {
+                            if self.settings_tray {
+                                match crate::tray::Tray::new() {
+                                    Ok(tray) => {
+                                        self.tray = Some(tray);
+                                        self.device.tray = true;
+                                    }
+                                    Err(e) => {
+                                        self.settings_tray = false;
+                                        self.device.tray = false;
+                                        self.toast(format!("Значок в трее недоступен: {e}"));
+                                    }
+                                }
+                            } else {
+                                self.tray = None;
+                                self.device.tray = false;
+                            }
+                        }
+                        save_device(&self.device);
+                        self.settings_open = false;
+                        self.settings_error = None;
+                        if restart {
+                            self.internet.stop();
+                        }
+                        if self.device.mode == ConnectionMode::Internet && restart {
+                            if is_valid_id(&self.device.id) {
+                                let name = if self.my_name.is_empty() {
+                                    "rat-pc".to_string()
+                                } else {
+                                    self.my_name.clone()
+                                };
+                                self.internet.start(
+                                    self.device.relay.clone(),
+                                    self.device.id.clone(),
+                                    name,
+                                );
+                            } else {
+                                self.toast("Не удалось создать шестизначный ID");
+                            }
+                        }
+                    }
+                } else if cancel || !open {
+                    self.settings_open = false;
+                    self.settings_error = None;
+                }
+            }
+
             if self.add_open {
                 let mut open = self.add_open;
                 egui::Window::new("Добавить машину")
@@ -1143,25 +1547,37 @@ mod ui {
                     .show(ctx, |ui| {
                         ui.label("Имя машины:");
                         ui.add(egui::TextEdit::singleline(&mut self.add_name).desired_width(280.0));
-                        ui.label("Адрес (IP:порт) или ID (интернет-режим):");
+                        let address_hint = match self.device.mode {
+                            ConnectionMode::Internet => "ID устройства (6 цифр):",
+                            ConnectionMode::Lan => "Адрес машины (IP:порт):",
+                        };
+                        ui.label(address_hint);
                         ui.add(egui::TextEdit::singleline(&mut self.add_addr).desired_width(280.0));
                         if let Some(e) = &self.add_err {
                             ui.colored_label(OFF, e);
                         }
                         ui.horizontal(|ui| {
                             if ui.button("Добавить").clicked() {
-                                let addr = normalize_addr(&self.add_addr);
-                                let ok = if is_direct_addr(&addr) {
-                                    let (host, port) = split_addr(&addr);
-                                    !host.is_empty() && port.is_some()
-                                } else {
-                                    addr.chars().count() >= 4
+                                let addr = match self.device.mode {
+                                    ConnectionMode::Internet => self.add_addr.trim().to_string(),
+                                    ConnectionMode::Lan => normalize_addr(&self.add_addr),
+                                };
+                                let ok = match self.device.mode {
+                                    ConnectionMode::Internet => is_valid_id(&addr),
+                                    ConnectionMode::Lan => {
+                                        let (host, port) = split_addr(&addr);
+                                        !host.is_empty() && port.is_some_and(|value| value > 0)
+                                    }
                                 };
                                 if !ok {
-                                    self.add_err = Some(
-                                        "Введите «IP:порт» или ID устройства (мин. 4 символа)"
-                                            .into(),
-                                    );
+                                    self.add_err = Some(match self.device.mode {
+                                        ConnectionMode::Internet => {
+                                            "Введите ID ровно из 6 цифр".into()
+                                        }
+                                        ConnectionMode::Lan => {
+                                            "Введите адрес машины в формате IP:порт".into()
+                                        }
+                                    });
                                 } else {
                                     let mut list = self.machines.lock().unwrap();
                                     if list.iter().any(|m| m.addr == addr) {
@@ -1728,13 +2144,57 @@ mod ui {
         })
     }
 
+    impl RatApp {
+        /// Крестик окна прячет приложение в трей, сессии продолжают работать.
+        fn handle_close(&mut self, ctx: &egui::Context) {
+            if self.quitting || self.tray.is_none() {
+                return;
+            }
+            if ctx.input(|i| i.viewport().close_requested()) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                self.hidden = true;
+            }
+        }
+
+        /// Команды меню значка: «Показать окно» и «Выход».
+        fn poll_tray(&mut self, ctx: &egui::Context) {
+            let Some(cmd) = self.tray.as_ref().and_then(|t| t.poll()) else {
+                return;
+            };
+            match cmd {
+                crate::tray::Cmd::Show => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    self.hidden = false;
+                }
+                crate::tray::Cmd::Quit => {
+                    self.quitting = true;
+                    self.internet.stop();
+                    self.server.stop();
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+    }
+
     impl eframe::App for RatApp {
         fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+            let ctx = ui.ctx().clone();
+            self.poll_tray(&ctx);
+            self.handle_close(&ctx);
             if !self.autoconnect_done {
                 self.autoconnect_done = true;
-                if let Some(a) = self.args.autoconnect.clone() {
-                    let a = normalize_addr(&a);
-                    self.start_connect(a.clone(), a);
+                if let Some(raw_addr) = self.args.autoconnect.clone() {
+                    let addr = match self.device.mode {
+                        ConnectionMode::Internet => raw_addr.trim().to_string(),
+                        ConnectionMode::Lan => normalize_addr(&raw_addr),
+                    };
+                    if self.device.mode == ConnectionMode::Internet && !is_valid_id(&addr) {
+                        self.toast("Для интернет-подключения нужен ID из 6 цифр");
+                    } else {
+                        self.start_connect(addr.clone(), addr);
+                    }
                 }
             }
             self.poll_connect();
@@ -1755,9 +2215,12 @@ mod ui {
                 crate::note("APP_DONE");
             }
             if self.finished {
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else if self.hidden {
+                // Окно в трее: сессии продолжают работать, UI просыпается редко.
+                ctx.request_repaint_after(Duration::from_millis(250));
             } else {
-                ui.ctx().request_repaint_after(Duration::from_millis(10));
+                ctx.request_repaint_after(Duration::from_millis(10));
             }
         }
     }

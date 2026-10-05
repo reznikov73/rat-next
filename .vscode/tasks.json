@@ -184,9 +184,16 @@
     },
     {
       "label": "build: rat app (release)",
-      "type": "shell",
+      "type": "process",
       "command": "powershell",
       "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\scripts\\vsc-task.ps1", "-Dir", ".", "-Cmd", "build --release -p rat --features rat/ffmpeg"],
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "build: rat-relay (release)",
+      "type": "process",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\scripts\\vsc-task.ps1", "-Dir", ".", "-Cmd", "build --release -p rat-relay"],
       "problemMatcher": ["$rustc"]
     },
     {
