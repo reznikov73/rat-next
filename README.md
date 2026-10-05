@@ -39,3 +39,18 @@ CI: `.github/workflows/ci.yml` (заработает после публикац
   `ice_str0m`, `encode_qsv`) — см. `spikes/README.md`; UI-кит: egui (`spikes/UI_KIT_DECISION.md`).
 - **P1 работает**: локальный видео-луп «экран → QSV H.264 → декод → показ» — 1080p, ~29 fps,
   e2e ~70 мс; см. `spikes/video_loop/REPORT.md`.
+
+
+## Установщик (setup.exe)
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build-installer.ps1
+```
+
+Собирает `dist\rat-next-setup-<дата>.exe` (нужен Inno Setup 6: `winget install JRSoftware.InnoSetup`).
+
+- Ставится без прав администратора — в профиль пользователя (`%LocalAppData%\Programs\Rat Next`);
+  при запуске от администратора мастер предложит установку для всех пользователей.
+- В мастере: ярлык в меню «Пуск» (+ значок на рабочий стол по желанию), опция
+  «Запускать при входе в Windows» (создаёт задачу Планировщика), «Запустить после установки».
+- Удаление — через «Установленные приложения»: снимает задачу автозапуска и удаляет файлы.
