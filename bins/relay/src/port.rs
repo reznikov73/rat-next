@@ -16,7 +16,7 @@ impl Owner {
 
 /// Процессы, слушающие `port` (TCP, IPv4 и IPv6).
 pub fn owners(port: u16) -> Vec<Owner> {
-    let Ok(out) = Command::new("netstat").args(["-ano", "-p", "tcp"]).output() else {
+    let Ok(out) = hidden("netstat").args(["-ano", "-p", "tcp"]).output() else {
         return Vec::new();
     };
     let text = String::from_utf8_lossy(&out.stdout);
@@ -49,12 +49,23 @@ pub fn owners(port: u16) -> Vec<Owner> {
         .collect()
 }
 
+/// Команда без мелькания консольного окна.
+fn hidden(program: &str) -> Command {
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    cmd
+}
+
 /// Завершить процесс. Свой собственный PID не трогаем.
 pub fn kill(pid: u32) -> Result<(), String> {
     if pid == std::process::id() {
         return Err("это процесс самого relay".to_string());
     }
-    let out = Command::new("taskkill")
+    let out = hidden("taskkill")
         .args(["/F", "/PID", &pid.to_string()])
         .output()
         .map_err(|e| format!("taskkill: {e}"))?;
@@ -71,7 +82,7 @@ pub fn kill(pid: u32) -> Result<(), String> {
 }
 
 fn name_of(pid: u32) -> String {
-    let out = Command::new("tasklist")
+    let out = hidden("tasklist")
         .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
         .output();
     let Ok(out) = out else {

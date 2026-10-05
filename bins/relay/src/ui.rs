@@ -109,6 +109,7 @@ pub struct RelayApp {
     quitting: bool,
     start_hidden: bool,
     hidden_once: bool,
+    autostart_checked: bool,
     started_at: Option<Instant>,
     relay_starts: u32,
 }
@@ -170,6 +171,7 @@ impl RelayApp {
             quitting: false,
             start_hidden,
             hidden_once: false,
+            autostart_checked: false,
             started_at: None,
             relay_starts: 0,
         };
@@ -314,6 +316,7 @@ impl RelayApp {
         self.edit_public = self.settings.public_addr.clone();
         self.edit_listen = self.settings.listen_addr.clone();
         self.settings_error = None;
+        self.autostart_checked = crate::autostart::is_installed();
         self.settings_open = true;
     }
 
@@ -606,7 +609,7 @@ impl RelayApp {
                 ui.add(egui::TextEdit::singleline(&mut self.edit_listen).desired_width(320.0));
                 ui.colored_label(DIM, format!("по умолчанию {}", settings::DEFAULT_LISTEN));
                 ui.add_space(10.0);
-                let mut autostart = crate::autostart::is_installed();
+                let mut autostart = self.autostart_checked;
                 if ui
                     .checkbox(
                         &mut autostart,
@@ -620,7 +623,10 @@ impl RelayApp {
                         crate::autostart::remove()
                     };
                     match res {
-                        Ok(()) => self.settings_error = None,
+                        Ok(()) => {
+                            self.autostart_checked = autostart;
+                            self.settings_error = None;
+                        }
                         Err(e) => self.settings_error = Some(format!("автозапуск: {e}")),
                     }
                 }

@@ -4,10 +4,21 @@
 
 const TASK: &str = "Rat Next relay";
 
+/// `schtasks` без мелькания консольного окна.
+fn schtasks() -> std::process::Command {
+    let mut cmd = std::process::Command::new("schtasks");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    cmd
+}
+
 /// Установлена ли задача автозапуска.
 #[allow(dead_code)]
 pub fn is_installed() -> bool {
-    std::process::Command::new("schtasks")
+    schtasks()
         .args(["/Query", "/TN", TASK])
         .output()
         .map(|o| o.status.success())
@@ -18,7 +29,7 @@ pub fn is_installed() -> bool {
 pub fn install() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let tr = format!("\"{}\" --tray", exe.display());
-    let out = std::process::Command::new("schtasks")
+    let out = schtasks()
         .args([
             "/Create", "/F", "/SC", "ONLOGON", "/TN", TASK, "/TR", &tr, "/RL", "LIMITED",
         ])
@@ -39,7 +50,7 @@ pub fn install() -> Result<(), String> {
 
 /// Удалить задачу автозапуска.
 pub fn remove() -> Result<(), String> {
-    let out = std::process::Command::new("schtasks")
+    let out = schtasks()
         .args(["/Delete", "/F", "/TN", TASK])
         .output()
         .map_err(|e| format!("schtasks: {e}"))?;

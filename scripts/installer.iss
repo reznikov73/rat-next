@@ -1,4 +1,4 @@
-; Rat Next — скрипт установщика (Inno Setup 6).
+﻿; Rat Next — скрипт установщика (Inno Setup 6).
 ; Сборка: scripts\build-installer.ps1
 
 #ifndef DateStamp
@@ -38,24 +38,51 @@ UninstallDisplayIcon={app}\rat.exe
 Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
+[Types]
+Name: "default"; Description: "Обычная установка (Rat Next)"
+Name: "custom"; Description: "Выборочная установка"; Flags: iscustom
+
+[Components]
+Name: "rat"; Description: "Rat Next — приложение (плитки, подключения, удалённый экран)"; Types: default
+Name: "relay"; Description: "Relay-сервер (интернет-режим; обычно только на сервере)"
+
 [Tasks]
-Name: "autostart"; Description: "Запускать Rat Next при входе в Windows (рекомендуется)"; GroupDescription: "Дополнительные параметры:"
-Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "Дополнительные параметры:"; Flags: unchecked
-Name: "relay_autostart"; Description: "Запускать relay при входе в Windows (если это сервер)"; GroupDescription: "Дополнительные параметры:"; Flags: unchecked
+Name: "autostart"; Description: "Запускать Rat Next при входе в Windows (рекомендуется)"; GroupDescription: "Дополнительные параметры:"; Components: rat
+Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "Дополнительные параметры:"; Flags: unchecked; Components: rat
+Name: "relay_autostart"; Description: "Запускать relay при входе в Windows"; GroupDescription: "Дополнительные параметры:"; Flags: unchecked; Components: relay
 
 [Files]
-Source: "{#PayloadDir}\*"; DestDir: "{app}"; Excludes: "rat-next.ico"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#PayloadDir}\rat.exe"; DestDir: "{app}"; Components: rat; Flags: ignoreversion
+Source: "{#PayloadDir}\avcodec-63.dll"; DestDir: "{app}"; Components: rat; Flags: ignoreversion
+Source: "{#PayloadDir}\avdevice-63.dll"; DestDir: "{app}"; Components: rat; Flags: ignoreversion
+Source: "{#PayloadDir}\avfilter-12.dll"; DestDir: "{app}"; Components: rat; Flags: ignoreversion
+Source: "{#PayloadDir}\avformat-63.dll"; DestDir: "{app}"; Components: rat; Flags: ignoreversion
+Source: "{#PayloadDir}\avutil-61.dll"; DestDir: "{app}"; Components: rat; Flags: ignoreversion
+Source: "{#PayloadDir}\swresample-7.dll"; DestDir: "{app}"; Components: rat; Flags: ignoreversion
+Source: "{#PayloadDir}\swscale-10.dll"; DestDir: "{app}"; Components: rat; Flags: ignoreversion
+Source: "{#PayloadDir}\README.txt"; DestDir: "{app}"; Components: rat; Flags: ignoreversion
+; relay линкует часть FFmpeg-библиотек — кладём их и в его компонент.
+Source: "{#PayloadDir}\rat-relay.exe"; DestDir: "{app}"; Components: relay; Flags: ignoreversion
+Source: "{#PayloadDir}\avcodec-63.dll"; DestDir: "{app}"; Components: relay; Flags: ignoreversion
+Source: "{#PayloadDir}\avutil-61.dll"; DestDir: "{app}"; Components: relay; Flags: ignoreversion
+Source: "{#PayloadDir}\swscale-10.dll"; DestDir: "{app}"; Components: relay; Flags: ignoreversion
+Source: "{#PayloadDir}\swresample-7.dll"; DestDir: "{app}"; Components: relay; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\Rat Next"; Filename: "{app}\rat.exe"
-Name: "{autodesktop}\Rat Next"; Filename: "{app}\rat.exe"; Tasks: desktopicon
+Name: "{group}\Rat Next"; Filename: "{app}\rat.exe"; Components: rat
+Name: "{group}\Rat Next relay"; Filename: "{app}\rat-relay.exe"; Components: relay
+Name: "{group}\{cm:UninstallProgram,Rat Next}"; Filename: "{uninstallexe}"
+Name: "{autodesktop}\Rat Next"; Filename: "{app}\rat.exe"; Tasks: desktopicon; Components: rat
 
 [Run]
-Filename: "{app}\rat.exe"; Parameters: "--install-autostart"; Tasks: autostart; Flags: runhidden; StatusMsg: "Включаю автозапуск…"
-Filename: "{app}\rat-relay.exe"; Parameters: "--install-autostart"; Tasks: relay_autostart; Flags: runhidden; StatusMsg: "Включаю автозапуск relay…"
-Filename: "{app}\rat.exe"; Description: "{cm:LaunchProgram,Rat Next}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\rat.exe"; Parameters: "--install-autostart"; Tasks: autostart; Components: rat; Flags: runhidden; StatusMsg: "Включаю автозапуск…"
+Filename: "{app}\rat-relay.exe"; Parameters: "--install-autostart"; Tasks: relay_autostart; Components: relay; Flags: runhidden; StatusMsg: "Включаю автозапуск relay…"
+Filename: "{app}\rat.exe"; Description: "{cm:LaunchProgram,Rat Next}"; Components: rat; Flags: nowait postinstall skipifsilent
+Filename: "{app}\rat-relay.exe"; Description: "Запустить relay-сервер"; Components: relay; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
+; Без Components: файла нет — команда пропускается (skipifdoesntexist),
+; поэтому логика верна для любой комбинации установленных компонентов.
 Filename: "{app}\rat.exe"; Parameters: "--remove-autostart"; Flags: runhidden skipifdoesntexist; RunOnceId: "RemoveAutostart"
 Filename: "{app}\rat-relay.exe"; Parameters: "--remove-autostart"; Flags: runhidden skipifdoesntexist; RunOnceId: "RemoveRelayAutostart"
 
