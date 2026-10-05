@@ -2076,7 +2076,8 @@ mod ui {
                             |ui| {
                                 ui.add_space(10.0);
                                 ui.horizontal(|ui| {
-                                    if ui.button("← Назад").clicked() {
+                                    if ui.button("⬅").on_hover_text("Отключиться").clicked()
+                                    {
                                         back = true;
                                     }
                                     ui.separator();
@@ -2102,7 +2103,7 @@ mod ui {
                                         .map(|s| s.active)
                                         .unwrap_or(0);
                                     if !mons.is_empty() {
-                                        ui.label("Монитор:");
+                                        ui.label("🖥").on_hover_text("Монитор — переключение");
                                         for (idx, mw, mh) in &mons {
                                             let sel = cur == *idx;
                                             if ui
@@ -2130,23 +2131,21 @@ mod ui {
                                                 .ctx()
                                                 .input(|i| i.viewport().fullscreen)
                                                 .unwrap_or(false);
-                                            let label = if is_fs {
-                                                "В окно"
+                                            let (label, hint) = if is_fs {
+                                                ("🗗", "Вернуть в окно")
                                             } else {
-                                                "Во весь экран"
+                                                ("⛶", "Во весь экран")
                                             };
-                                            if ui
-                                                .button(label)
-                                                .on_hover_text("Полноэкранный режим / обратно")
-                                                .clicked()
-                                            {
+                                            if ui.button(label).on_hover_text(hint).clicked() {
                                                 ui.ctx().send_viewport_cmd(
                                                     egui::ViewportCommand::Fullscreen(!is_fs),
                                                 );
                                             }
                                             if ui
-                                                .selectable_label(v.pinned, "Закрепить")
-                                                .on_hover_text("Не скрывать панели автоматически")
+                                                .selectable_label(v.pinned, "📌")
+                                                .on_hover_text(
+                                                    "Закрепить панели — не скрывать автоматически",
+                                                )
                                                 .clicked()
                                             {
                                                 v.pinned = !v.pinned;
@@ -2184,7 +2183,7 @@ mod ui {
                             |ui| {
                                 ui.add_space(10.0);
                                 ui.label(
-                                    "Мышь — над видео; клавиатура — когда окно в фокусе. Панели выезжают при наведении к верхнему/нижнему краю. «← Назад» — отключиться.",
+                                    "Мышь — над видео; клавиатура — когда окно в фокусе. Панели выезжают при наведении к верхнему/нижнему краю. Кнопка со стрелкой ⬅ — отключиться.",
                                 );
                             },
                         );
