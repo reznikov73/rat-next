@@ -2046,7 +2046,10 @@ mod ui {
                     *t + (target - *t).signum() * step
                 };
             }
-            let bar_fill = egui::Color32::from_rgba_unmultiplied(18, 22, 28, 235);
+            // Светлая палитра — как у остального интерфейса: тёмный текст на
+            // светлом фоне читается и поверх чёрных полей, и поверх видео.
+            let bar_fill = egui::Color32::from_rgba_unmultiplied(243, 245, 248, 240);
+            let bar_border = egui::Color32::from_rgb(196, 203, 213);
             if v.top_t > 0.01 {
                 let y = screen.top() - TOP_H * (1.0 - v.top_t);
                 egui::Area::new(egui::Id::new("vt_top"))
@@ -2059,6 +2062,14 @@ mod ui {
                             egui::vec2(screen.width(), TOP_H),
                         );
                         ui.painter().rect_filled(bg, 0.0, bar_fill);
+                        ui.painter().rect_filled(
+                            egui::Rect::from_min_max(
+                                egui::pos2(screen.left(), y + TOP_H - 1.0),
+                                egui::pos2(screen.right(), y + TOP_H),
+                            ),
+                            0.0,
+                            bar_border,
+                        );
                         ui.allocate_ui_with_layout(
                             egui::vec2(screen.width(), TOP_H),
                             egui::Layout::left_to_right(egui::Align::Center),
@@ -2159,6 +2170,14 @@ mod ui {
                             egui::vec2(screen.width(), BOT_H),
                         );
                         ui.painter().rect_filled(bg, 0.0, bar_fill);
+                        ui.painter().rect_filled(
+                            egui::Rect::from_min_max(
+                                egui::pos2(screen.left(), y),
+                                egui::pos2(screen.right(), y + 1.0),
+                            ),
+                            0.0,
+                            bar_border,
+                        );
                         ui.allocate_ui_with_layout(
                             egui::vec2(screen.width(), BOT_H),
                             egui::Layout::left_to_right(egui::Align::Center),
