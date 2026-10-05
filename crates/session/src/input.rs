@@ -21,6 +21,8 @@ pub const META_SESSION_INFO: u8 = 1;
 pub const META_SWITCH: u8 = 2;
 /// Meta-тип: список мониторов агента (agent → viewer).
 pub const META_MONITORS: u8 = 3;
+/// Meta-тип: текст буфера обмена (в обе стороны).
+pub const META_CLIP: u8 = 4;
 
 /// Прямоугольник в экранных координатах.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,6 +265,24 @@ pub fn pack_monitors(out: &mut Vec<u8>, list: &[(u16, u16, u16)]) {
     }
 }
 
+/// Упаковать текст буфера обмена (обе стороны; канал Control).
+pub fn pack_clip(out: &mut Vec<u8>, text: &str) {
+    out.push(META_MAGIC);
+    out.push(META_CLIP);
+    out.extend_from_slice(text.as_bytes());
+}
+
+/// Разобрать текст буфера обмена (не больше 128 КиБ).
+pub fn parse_clip(payload: &[u8]) -> Option<String> {
+    if payload.len() < 2 || payload[0] != META_MAGIC || payload[1] != META_CLIP {
+        return None;
+    }
+    if payload.len() > 2 + 128 * 1024 {
+        return None;
+    }
+    String::from_utf8(payload[2..].to_vec()).ok()
+}
+
 /// Разобрать список мониторов.
 pub fn parse_monitors(payload: &[u8]) -> Option<Vec<(u16, u16, u16)>> {
     if payload.len() < 3 || payload[0] != META_MAGIC || payload[1] != META_MONITORS {
@@ -496,6 +516,16 @@ mod tests {
         let (px, py) = norm_to_ui_px(nx, ny, 1280.0, 720.0);
         assert!((px - 640.0).abs() < 1.0 && (py - 360.0).abs() < 1.0);
     }
+    #[test]
+    fn clip_roundtrip() {
+        let mut buf = Vec::new();
+        pack_clip(&mut buf, "привет, мир!");
+        assert_eq!(parse_clip(&buf).unwrap(), "привет, мир!");
+        assert!(parse_clip(&[0xAA, 4, 0xFF, 0xFE]).is_none());
+        assert!(parse_clip(&[0xAA]).is_none());
+        assert!(parse_clip(&[0x0A, 4, 1]).is_none());
+    }
+
     #[test]
     fn switch_roundtrip() {
         let mut b = [0u8; 4];

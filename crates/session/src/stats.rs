@@ -38,6 +38,10 @@ pub struct SessionStats {
     pub cursor_sent: u64,
     /// Успешных переключений монитора «на лету».
     pub capture_switches: u64,
+    /// Отправок текста буфера обмена (агент → вьюер).
+    pub clip_out: u64,
+    /// Приёмов текста буфера обмена (вьюер → агент).
+    pub clip_in: u64,
     // выборки (мс)
     pub e2e_ms: Vec<f32>,
     pub rtt_ms: Vec<f32>,
@@ -74,6 +78,7 @@ impl SessionStats {
              bytes: sent={} recv={}\n\
              fps={:.1}  codec={}  control_msgs={}\n\
              input: sent={} injected={} cursor={} switches={}\n\
+             clip:  out={} in={}\n\
              e2e:   avg {:.2}ms  p50 {:.2}ms  p95 {:.2}ms\n\
              rtt:   avg {:.2}ms  p95 {:.2}ms\n\
              errors: agent={} viewer={}{}",
@@ -95,6 +100,8 @@ impl SessionStats {
             self.input_recv,
             self.cursor_sent,
             self.capture_switches,
+            self.clip_out,
+            self.clip_in,
             Self::avg(&self.e2e_ms),
             Self::pct(&self.e2e_ms, 0.5),
             Self::pct(&self.e2e_ms, 0.95),

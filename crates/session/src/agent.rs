@@ -259,6 +259,11 @@ pub fn spawn_agent(
         let mut last_cursor_t = Instant::now() - Duration::from_secs(1);
         let mut last_cursor: Option<(u16, u16, bool)> = None;
 
+        // Буфер обмена: следим за текстом и пересылаем вьюеру изменения.
+        let mut last_clip_t = Instant::now() - Duration::from_secs(1);
+        let mut clip_sent: Option<String> = None;
+        let mut clip_set_by_us: Option<String> = None;
+
         // Hello (capabilities) сразу при старте.
         let hello = control::hello(
             concat!("rat-agent-", env!("CARGO_PKG_VERSION")),
@@ -317,10 +322,15 @@ pub fn spawn_agent(
                     Ok(Some(f)) => {
                         did = true;
                         if f.channel == Channel::Control {
-                            if f.payload.first() == Some(&input::META_MAGIC)
-                                && let Some(idx) = input::parse_switch(f.payload)
-                            {
-                                *switch_b.lock().unwrap() = Some(idx as u32);
+                            if f.payload.first() == Some(&input::META_MAGIC) {
+                                if let Some(idx) = input::parse_switch(f.payload) {
+                                    *switch_b.lock().unwrap() = Some(idx as u32);
+                                } else if let Some(text) = input::parse_clip(f.payload)
+                                    && clipboard_text_set(&text)
+                                {
+                                    clip_set_by_us = Some(text);
+                                    stats_b.lock().unwrap().clip_in += 1;
+                                }
                             } else if let Some(env) = control::decode_env(f.payload) {
                                 stats_b.lock().unwrap().control_msgs += 1;
                                 if let Some(Body::Ping(p)) = env.body {
@@ -411,6 +421,22 @@ pub fn spawn_agent(
                     },
                 );
                 mux.push(Channel::Control, 0, &meta);
+            }
+
+            // 2.7) буфер обмена: изменения текста → вьюеру (~2 раза в секунду).
+            if last_clip_t.elapsed() >= Duration::from_millis(500) {
+                last_clip_t = Instant::now();
+                if let Some(text) = clipboard_text_get()
+                    && !text.is_empty()
+                    && clip_set_by_us.as_deref() != Some(text.as_str())
+                    && clip_sent.as_deref() != Some(text.as_str())
+                {
+                    let mut buf = Vec::with_capacity(text.len() + 2);
+                    input::pack_clip(&mut buf, &text);
+                    mux.push(Channel::Control, 0, &buf);
+                    clip_sent = Some(text);
+                    stats_b.lock().unwrap().clip_out += 1;
+                }
             }
 
             // 3) выгрузить накопленные mux-кадры в линк.
@@ -615,6 +641,108 @@ fn cursor_captured_norm(out: OutputGeom) -> Option<(u16, u16, bool)> {
     let visible = (ci.flags.0 & CURSOR_SHOWING.0) != 0;
     let (nx, ny) = input::screen_to_captured_norm(ci.ptScreenPos.x, ci.ptScreenPos.y, out);
     Some((nx, ny, visible))
+}
+
+// ================== буфер обмена (текст, Windows) ==================
+
+const CF_UNICODETEXT: u32 = 13;
+const GMEM_MOVEABLE: u32 = 0x0002;
+
+/// Прочитать текст из буфера обмена Windows (с повторами на занятость).
+fn clipboard_text_get() -> Option<String> {
+    unsafe {
+        let mut opened = false;
+        for _ in 0..5 {
+            if OpenClipboard(std::ptr::null_mut()) != 0 {
+                opened = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if !opened {
+            return None;
+        }
+        let result = if IsClipboardFormatAvailable(CF_UNICODETEXT) != 0 {
+            let handle = GetClipboardData(CF_UNICODETEXT);
+            if handle.is_null() {
+                None
+            } else {
+                let ptr = GlobalLock(handle) as *const u16;
+                if ptr.is_null() {
+                    None
+                } else {
+                    let mut len = 0usize;
+                    while *ptr.add(len) != 0 && len < 65536 {
+                        len += 1;
+                    }
+                    let slice = std::slice::from_raw_parts(ptr, len);
+                    let text = String::from_utf16_lossy(slice);
+                    let _ = GlobalUnlock(handle);
+                    Some(text)
+                }
+            }
+        } else {
+            None
+        };
+        let _ = CloseClipboard();
+        result
+    }
+}
+
+/// Записать текст в буфер обмена Windows.
+fn clipboard_text_set(text: &str) -> bool {
+    unsafe {
+        let mut opened = false;
+        for _ in 0..5 {
+            if OpenClipboard(std::ptr::null_mut()) != 0 {
+                opened = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if !opened {
+            return false;
+        }
+        let _ = EmptyClipboard();
+        let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+        let handle = GlobalAlloc(GMEM_MOVEABLE, wide.len() * 2);
+        if handle.is_null() {
+            let _ = CloseClipboard();
+            return false;
+        }
+        let ptr = GlobalLock(handle) as *mut u16;
+        if ptr.is_null() {
+            let _ = GlobalFree(handle);
+            let _ = CloseClipboard();
+            return false;
+        }
+        std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
+        let _ = GlobalUnlock(handle);
+        let ok = !SetClipboardData(CF_UNICODETEXT, handle).is_null();
+        if !ok {
+            let _ = GlobalFree(handle);
+        }
+        let _ = CloseClipboard();
+        ok
+    }
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GlobalAlloc(flags: u32, bytes: usize) -> *mut std::ffi::c_void;
+    fn GlobalFree(handle: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+    fn GlobalLock(handle: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+    fn GlobalUnlock(handle: *mut std::ffi::c_void) -> i32;
+}
+
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn OpenClipboard(hwnd: *mut std::ffi::c_void) -> i32;
+    fn CloseClipboard() -> i32;
+    fn EmptyClipboard() -> i32;
+    fn IsClipboardFormatAvailable(format: u32) -> i32;
+    fn GetClipboardData(format: u32) -> *mut std::ffi::c_void;
+    fn SetClipboardData(format: u32, data: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
 }
 
 fn flush(mux: &mut MuxEncoder, link: &Duplex) -> bool {

@@ -145,6 +145,8 @@ mod ui {
             let info: Arc<Mutex<Option<SessionInfo>>> = Arc::new(Mutex::new(None));
             let monitors: Arc<Mutex<Vec<(u16, u16, u16)>>> = Arc::new(Mutex::new(Vec::new()));
             let pending_switch: Arc<Mutex<Option<u16>>> = Arc::new(Mutex::new(None));
+            let clip_in: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+            let pending_paste: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
             let handle = spawn_viewer(
                 base,
                 stop.clone(),
@@ -157,6 +159,8 @@ mod ui {
                     info: info.clone(),
                     monitors: monitors.clone(),
                     pending_switch: pending_switch.clone(),
+                    clip_in: clip_in.clone(),
+                    pending_paste: pending_paste.clone(),
                 },
             );
 

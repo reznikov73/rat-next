@@ -43,6 +43,10 @@ pub struct ViewerShared {
     pub monitors: Arc<Mutex<Vec<(u16, u16, u16)>>>,
     /// Запрос на переключение монитора (последний выигрывает).
     pub pending_switch: Arc<Mutex<Option<u16>>>,
+    /// Последний текст буфера обмена от агента (забрать в локальный буфер).
+    pub clip_in: Arc<Mutex<Option<String>>>,
+    /// Текст для вставки на удалённой машине (из локального буфера).
+    pub pending_paste: Arc<Mutex<Option<String>>>,
 }
 
 /// Запустить вьюерскую половину сессии.
@@ -98,6 +102,8 @@ pub fn spawn_viewer(
                                     *shared.info.lock().unwrap() = Some(si);
                                 } else if let Some(list) = input::parse_monitors(f.payload) {
                                     *shared.monitors.lock().unwrap() = list;
+                                } else if let Some(text) = input::parse_clip(f.payload) {
+                                    *shared.clip_in.lock().unwrap() = Some(text);
                                 }
                             } else if let Some(env) = control::decode_env(f.payload) {
                                 stats.lock().unwrap().control_msgs += 1;
@@ -257,6 +263,14 @@ pub fn spawn_viewer(
                 let mut b = [0u8; 4];
                 input::pack_switch(&mut b, idx);
                 out.push(Channel::Control, 0, &b);
+            }
+            // Вставка из локального буфера: сначала текст (агент положит его в свой
+            // буфер), затем клавиши Ctrl+V — они уже в очереди ввода.
+            let paste = shared.pending_paste.lock().unwrap().take();
+            if let Some(text) = paste {
+                let mut buf = Vec::with_capacity(text.len() + 2);
+                input::pack_clip(&mut buf, &text);
+                out.push(Channel::Control, 0, &buf);
             }
             // Отправить накопленный ввод (с коалессингом движений мыши).
             let batch: Vec<InputEvent> = std::mem::take(&mut *shared.input_q.lock().unwrap());

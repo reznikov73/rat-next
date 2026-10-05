@@ -400,6 +400,25 @@ mod store {
 }
 
 #[cfg(feature = "ffmpeg")]
+mod notify {
+    //! Системные сигналы (звук) — без внешних зависимостей.
+
+    /// Короткий системный сигнал (запрос подключения).
+    pub fn beep() {
+        #[cfg(windows)]
+        unsafe {
+            MessageBeep(0x0000_0040); // MB_ICONASTERISK
+        }
+    }
+
+    #[cfg(windows)]
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn MessageBeep(u_type: u32) -> i32;
+    }
+}
+
+#[cfg(feature = "ffmpeg")]
 mod autostart {
     //! Автозапуск при входе пользователя через Планировщик задач (`schtasks`).
 
@@ -860,6 +879,8 @@ mod ui {
     const DIM2: egui::Color32 = egui::Color32::from_rgb(120, 128, 140);
     /// Свой ID — самое важное число в главном окне: его диктуют оператору.
     const ID_COLOR: egui::Color32 = egui::Color32::from_rgb(96, 176, 255);
+    /// Ещё ярче — для самого номера ID.
+    const ID_BRIGHT: egui::Color32 = egui::Color32::from_rgb(140, 205, 255);
 
     pub fn run(args: Args) -> Result<(), String> {
         if std::env::var_os("WGPU_BACKEND").is_none() {
@@ -913,6 +934,9 @@ mod ui {
         info: Arc<Mutex<Option<SessionInfo>>>,
         monitors: Arc<Mutex<Vec<(u16, u16, u16)>>>,
         pending_switch: Arc<Mutex<Option<u16>>>,
+        clip_in: Arc<Mutex<Option<String>>>,
+        pending_paste: Arc<Mutex<Option<String>>>,
+        last_clip_applied: Option<String>,
         switch_after: Option<f32>,
         switch_done: bool,
         connected_at: Instant,
@@ -1196,6 +1220,8 @@ mod ui {
                         let monitors: Arc<Mutex<Vec<(u16, u16, u16)>>> =
                             Arc::new(Mutex::new(Vec::new()));
                         let pending_switch: Arc<Mutex<Option<u16>>> = Arc::new(Mutex::new(None));
+                        let clip_in: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+                        let pending_paste: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
                         let handle = spawn_viewer(
                             base,
                             stop.clone(),
@@ -1208,6 +1234,8 @@ mod ui {
                                 info: info.clone(),
                                 monitors: monitors.clone(),
                                 pending_switch: pending_switch.clone(),
+                                clip_in: clip_in.clone(),
+                                pending_paste: pending_paste.clone(),
                             },
                         );
                         Ok(ViewerSession {
@@ -1226,6 +1254,9 @@ mod ui {
                             info,
                             monitors,
                             pending_switch,
+                            clip_in,
+                            pending_paste,
+                            last_clip_applied: None,
                             switch_after,
                             switch_done: false,
                             connected_at: Instant::now(),
@@ -1355,16 +1386,33 @@ mod ui {
                     if ui.button("копировать").clicked() {
                         ui.ctx().copy_text(self.device.id.clone());
                     }
-                    ui.separator();
-                    if ui.button("Настройки").clicked() {
-                        self.settings_mode = self.device.mode;
-                        self.settings_relay_edit = self.device.relay.clone();
-                        self.settings_auto_allow = self.device.auto_allow;
-                        self.settings_tray = self.device.tray;
-                        self.settings_autostart = crate::autostart::is_installed();
-                        self.settings_error = None;
-                        self.settings_open = true;
+                    // «Мой ID» — по центру шапки, акцентно.
+                    let reserve = 340.0;
+                    if ui.available_width() > reserve {
+                        ui.add_space((ui.available_width() - reserve) / 2.0);
                     }
+                    ui.label(egui::RichText::new("Мой ID").strong().color(ID_COLOR));
+                    ui.label(
+                        egui::RichText::new(self.device.id.clone())
+                            .size(34.0)
+                            .strong()
+                            .color(ID_BRIGHT),
+                    );
+                    if ui.button("копировать").clicked() {
+                        ui.ctx().copy_text(self.device.id.clone());
+                        self.toast("ID скопирован в буфер обмена");
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Настройки").clicked() {
+                            self.settings_mode = self.device.mode;
+                            self.settings_relay_edit = self.device.relay.clone();
+                            self.settings_auto_allow = self.device.auto_allow;
+                            self.settings_tray = self.device.tray;
+                            self.settings_autostart = crate::autostart::is_installed();
+                            self.settings_error = None;
+                            self.settings_open = true;
+                        }
+                    });
                 });
                 ui.add_space(6.0);
             });
@@ -1494,6 +1542,13 @@ mod ui {
                 && let Ok(request) = self.incoming_rx.try_recv()
             {
                 self.incoming_pending = Some(request);
+                crate::notify::beep();
+                // Если окно скрыто в трее — показать его, иначе запрос не увидеть.
+                if self.hidden {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    self.hidden = false;
+                }
             }
             let request_expired = self
                 .incoming_pending
@@ -1905,6 +1960,14 @@ mod ui {
                     crate::note(&format!("[ui] авто-переключение монитора -> {next}"));
                 }
             }
+            // Локальный буфер: текст, скопированный на удалённой машине.
+            let clip_now = v.clip_in.lock().unwrap().clone();
+            if clip_now != v.last_clip_applied {
+                if let Some(text) = &clip_now {
+                    ui.ctx().copy_text(text.clone());
+                }
+                v.last_clip_applied = clip_now;
+            }
             egui::Panel::top("vt").show(ui, |ui| {
                 ui.horizontal(|ui| {
                     if ui.button("← Назад").clicked() {
@@ -2070,6 +2133,7 @@ mod ui {
                     let mut keys: Vec<(u16, bool)> = Vec::new();
                     let mut texts: Vec<String> = Vec::new();
                     let mut specials: Vec<u8> = Vec::new();
+                    let mut paste_text: Option<String> = None;
                     ui.ctx().input(|inp| {
                         for ev in &inp.events {
                             match ev {
@@ -2080,7 +2144,8 @@ mod ui {
                                     ..
                                 } => {
                                     if let Some(vk) = vk_of_key(*key) {
-                                        let shortcut = modifiers.ctrl || modifiers.alt;
+                                        let shortcut =
+                                            modifiers.ctrl || modifiers.alt || modifiers.mac_cmd;
                                         if shortcut || !is_char_vk(vk) {
                                             keys.push((vk, *pressed));
                                         }
@@ -2089,7 +2154,10 @@ mod ui {
                                 egui::Event::Text(t) => texts.push(t.clone()),
                                 egui::Event::Copy => specials.push(1),
                                 egui::Event::Cut => specials.push(2),
-                                egui::Event::Paste(_) => specials.push(3),
+                                egui::Event::Paste(t) => {
+                                    paste_text = Some(t.clone());
+                                    specials.push(3);
+                                }
                                 _ => {}
                             }
                         }
@@ -2151,12 +2219,20 @@ mod ui {
                         locked.push(InputEvent::Key { vk, down: true });
                         locked.push(InputEvent::Key { vk, down: false });
                     }
+                    // Вставка: текст сначала отправим агенту (он положит его
+                    // в свой буфер), клавиши Ctrl+V уже в очереди ввода.
+                    if let Some(text) = paste_text
+                        && !text.is_empty()
+                    {
+                        *v.pending_paste.lock().unwrap() = Some(text);
+                    }
                     let m = ui.ctx().input(|i| i.modifiers);
                     let pm = v.prev_mods;
                     for (now_on, was_on, vk) in [
                         (m.shift, pm.shift, 0x10u16),
                         (m.ctrl, pm.ctrl, 0x11),
                         (m.alt, pm.alt, 0x12),
+                        (m.mac_cmd, pm.mac_cmd, 0x5B),
                     ] {
                         if now_on && !was_on {
                             locked.push(InputEvent::Key { vk, down: true });
@@ -2185,7 +2261,12 @@ mod ui {
                         }
                     }
                     let pm = v.prev_mods;
-                    for (was_on, vk) in [(pm.shift, 0x10u16), (pm.ctrl, 0x11), (pm.alt, 0x12)] {
+                    for (was_on, vk) in [
+                        (pm.shift, 0x10u16),
+                        (pm.ctrl, 0x11),
+                        (pm.alt, 0x12),
+                        (pm.mac_cmd, 0x5B),
+                    ] {
                         if was_on {
                             locked.push(InputEvent::Key { vk, down: false });
                         }
