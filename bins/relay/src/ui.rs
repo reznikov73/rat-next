@@ -107,11 +107,13 @@ pub struct RelayApp {
     port_window: bool,
     port_error: Option<String>,
     quitting: bool,
+    start_hidden: bool,
+    hidden_once: bool,
     started_at: Option<Instant>,
     relay_starts: u32,
 }
 
-pub fn run(initial_listen: Option<String>) -> Result<(), String> {
+pub fn run(initial_listen: Option<String>, start_hidden: bool) -> Result<(), String> {
     if std::env::var_os("WGPU_BACKEND").is_none() {
         // SAFETY: до инициализации GUI, однопоточно.
         unsafe { std::env::set_var("WGPU_BACKEND", "dx12") };
@@ -119,6 +121,7 @@ pub fn run(initial_listen: Option<String>) -> Result<(), String> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Rat Next relay")
+            .with_icon(window_icon())
             .with_inner_size([900.0, 620.0])
             .with_min_inner_size([680.0, 420.0]),
         ..Default::default()
@@ -126,13 +129,23 @@ pub fn run(initial_listen: Option<String>) -> Result<(), String> {
     eframe::run_native(
         "Rat Next relay",
         options,
-        Box::new(move |_cc| Ok(Box::new(RelayApp::new(initial_listen)))),
+        Box::new(move |_cc| Ok(Box::new(RelayApp::new(initial_listen, start_hidden)))),
     )
     .map_err(|e| e.to_string())
 }
 
+/// Иконка окна и панели задач — тот же рисунок, что у трея и у exe.
+fn window_icon() -> egui::IconData {
+    const SIDE: u32 = 64;
+    egui::IconData {
+        rgba: crate::icon::rgba(SIDE),
+        width: SIDE,
+        height: SIDE,
+    }
+}
+
 impl RelayApp {
-    fn new(initial_listen: Option<String>) -> Self {
+    fn new(initial_listen: Option<String>, start_hidden: bool) -> Self {
         let mut settings = settings::load();
         if let Some(listen) = initial_listen {
             settings.listen_addr = listen;
@@ -155,6 +168,8 @@ impl RelayApp {
             port_window: false,
             port_error: None,
             quitting: false,
+            start_hidden,
+            hidden_once: false,
             started_at: None,
             relay_starts: 0,
         };
@@ -347,6 +362,11 @@ fn ago(from: Instant) -> String {
 impl eframe::App for RelayApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+
+        if self.start_hidden && !self.hidden_once {
+            self.hidden_once = true;
+            hide_window(&ctx);
+        }
 
         self.pump_events();
         self.poll_stopping();
@@ -585,6 +605,25 @@ impl RelayApp {
                 ui.label("Адрес прослушивания:");
                 ui.add(egui::TextEdit::singleline(&mut self.edit_listen).desired_width(320.0));
                 ui.colored_label(DIM, format!("по умолчанию {}", settings::DEFAULT_LISTEN));
+                ui.add_space(10.0);
+                let mut autostart = crate::autostart::is_installed();
+                if ui
+                    .checkbox(
+                        &mut autostart,
+                        "Запускать при входе в Windows (сразу в трей)",
+                    )
+                    .changed()
+                {
+                    let res = if autostart {
+                        crate::autostart::install()
+                    } else {
+                        crate::autostart::remove()
+                    };
+                    match res {
+                        Ok(()) => self.settings_error = None,
+                        Err(e) => self.settings_error = Some(format!("автозапуск: {e}")),
+                    }
+                }
                 ui.add_space(10.0);
                 if let Some(err) = &self.settings_error {
                     ui.colored_label(OFF, err);

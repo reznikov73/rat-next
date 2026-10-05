@@ -1,19 +1,19 @@
-// Иконка приложения Rat Next: тёмный скруглённый квадрат, голубой «экран»
-// с белым курсором и зелёная точка активной сессии.
+// Иконка приложения Rat Next: синяя «плитка» с крупным белым курсором и
+// зелёной точкой активной сессии. Крупные формы — читается даже в трее 16×16.
 //
 // Один и тот же код рисует иконку окна, иконку трея и `.ico` для exe: файл
 // подключается как модуль приложения (`mod icon;`) и через `include!` в
 // `build.rs`. Поэтому здесь нет внешних зависимостей и inner-атрибутов.
 
-/// Фон: градиент сверху вниз.
-const BG_TOP: (u8, u8, u8) = (44, 52, 66);
-const BG_BOTTOM: (u8, u8, u8) = (21, 25, 32);
-/// Рамка «экрана».
-const SCREEN: (u8, u8, u8) = (76, 140, 255);
-/// Курсор внутри экрана.
+/// Плитка: градиент сверху вниз.
+const TILE_TOP: (u8, u8, u8) = (90, 152, 255);
+const TILE_BOTTOM: (u8, u8, u8) = (38, 88, 216);
+/// Курсор.
 const CURSOR: (u8, u8, u8) = (255, 255, 255);
 /// Индикатор активной сессии.
 const LIVE: (u8, u8, u8) = (76, 175, 80);
+/// Тёмная окантовка точки сессии, чтобы не сливалась с плиткой.
+const LIVE_RING: (u8, u8, u8) = (28, 62, 140);
 
 /// Иконка `size`×`size` в RGBA8.
 ///
@@ -32,7 +32,7 @@ pub fn rgba(size: u32) -> Vec<u8> {
 fn paint(buf: &mut [u8], n: u32) {
     let f = n as f32;
 
-    // Фон со скруглёнными углами.
+    // Плитка: скруглённый квадрат с синим градиентом.
     for y in 0..n {
         for x in 0..n {
             let px = x as f32 + 0.5;
@@ -48,44 +48,11 @@ fn paint(buf: &mut [u8], n: u32) {
             ) {
                 continue;
             }
-            put(buf, n, x, y, mix(BG_TOP, BG_BOTTOM, py / f));
+            put(buf, n, x, y, mix(TILE_TOP, TILE_BOTTOM, py / f));
         }
     }
 
-    // Монитор: рамка, ножка, подставка.
-    let (scx, scy) = (f * 0.5, f * 0.40);
-    let (hw, hh) = (f * 0.31, f * 0.22);
-    let border = f * 0.06;
-    let round = f * 0.07;
-    for y in 0..n {
-        for x in 0..n {
-            let px = x as f32 + 0.5;
-            let py = y as f32 + 0.5;
-            let outer = rounded(px, py, scx, scy, hw, hh, round);
-            let inner = rounded(
-                px,
-                py,
-                scx,
-                scy,
-                hw - border,
-                hh - border,
-                (round - border).max(0.0),
-            );
-            if outer && !inner {
-                put(buf, n, x, y, SCREEN);
-                continue;
-            }
-            let stem =
-                py >= scy + hh - 0.5 && py <= scy + hh + f * 0.075 && (px - scx).abs() <= f * 0.05;
-            let base =
-                (py - (scy + hh + f * 0.075)).abs() <= f * 0.025 && (px - scx).abs() <= f * 0.16;
-            if stem || base {
-                put(buf, n, x, y, SCREEN);
-            }
-        }
-    }
-
-    // Курсор внутри экрана.
+    // Крупный белый курсор — главный элемент, читается в любом размере.
     let cursor = [
         (0.00_f32, 0.00_f32),
         (0.00, 0.94),
@@ -95,8 +62,8 @@ fn paint(buf: &mut [u8], n: u32) {
         (0.35, 0.68),
         (0.58, 0.64),
     ];
-    let scale = f * 0.34;
-    let (ox, oy) = (scx - hw * 0.52, scy - hh * 0.62);
+    let scale = f * 0.60;
+    let (ox, oy) = (f * 0.24, f * 0.16);
     for y in 0..n {
         for x in 0..n {
             let px = x as f32 + 0.5;
@@ -110,18 +77,19 @@ fn paint(buf: &mut [u8], n: u32) {
         }
     }
 
-    // Точка сессии — только на крупных размерах, иначе сливается в пятно.
-    if f >= 24.0 {
+    // Точка сессии — только от 24 логических px (hi = size × 4), иначе
+    // на мелких значках сливается в пятно.
+    if f >= 96.0 {
+        let (cx, cy, rad) = (f * 0.84, f * 0.84, f * 0.12);
         for y in 0..n {
             for x in 0..n {
                 let px = x as f32 + 0.5;
                 let py = y as f32 + 0.5;
-                let d = ((px - f * 0.735).powi(2) + (py - f * 0.73).powi(2)).sqrt();
-                if d <= f * 0.135 {
-                    put(buf, n, x, y, BG_BOTTOM);
-                }
-                if d <= f * 0.10 {
+                let d = ((px - cx).powi(2) + (py - cy).powi(2)).sqrt();
+                if d <= rad {
                     put(buf, n, x, y, LIVE);
+                } else if d <= rad + f * 0.03 {
+                    put(buf, n, x, y, LIVE_RING);
                 }
             }
         }

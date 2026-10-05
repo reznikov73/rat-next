@@ -119,30 +119,8 @@ fn tooltip(listen: &str, running: bool) -> String {
     format!("Rat Next relay — {state} ({listen})")
 }
 
-/// Кружок в трее: зелёный — работает, серый — остановлен.
+/// Иконка relay в трее: зелёный «хаб» — работает, серый — остановлен.
 fn state_icon(running: bool) -> Result<Icon, String> {
-    const SIZE: usize = 32;
-    let (r, g, b) = if running {
-        (76u8, 175u8, 80u8)
-    } else {
-        (140u8, 146u8, 156u8)
-    };
-    let mut rgba = vec![0u8; SIZE * SIZE * 4];
-    let center = (SIZE as f32 - 1.0) / 2.0;
-    let radius = SIZE as f32 / 2.0 - 1.0;
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            let dx = x as f32 - center;
-            let dy = y as f32 - center;
-            if (dx * dx + dy * dy).sqrt() > radius {
-                continue;
-            }
-            let i = (y * SIZE + x) * 4;
-            rgba[i] = r;
-            rgba[i + 1] = g;
-            rgba[i + 2] = b;
-            rgba[i + 3] = 255;
-        }
-    }
-    Icon::from_rgba(rgba, SIZE as u32, SIZE as u32).map_err(|e| e.to_string())
+    const SIZE: u32 = 32;
+    Icon::from_rgba(crate::icon::rgba_state(SIZE, running), SIZE, SIZE).map_err(|e| e.to_string())
 }

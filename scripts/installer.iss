@@ -1,4 +1,4 @@
-﻿; Rat Next — скрипт установщика (Inno Setup 6).
+; Rat Next — скрипт установщика (Inno Setup 6).
 ; Сборка: scripts\build-installer.ps1
 
 #ifndef DateStamp
@@ -41,6 +41,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [Tasks]
 Name: "autostart"; Description: "Запускать Rat Next при входе в Windows (рекомендуется)"; GroupDescription: "Дополнительные параметры:"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "Дополнительные параметры:"; Flags: unchecked
+Name: "relay_autostart"; Description: "Запускать relay при входе в Windows (если это сервер)"; GroupDescription: "Дополнительные параметры:"; Flags: unchecked
 
 [Files]
 Source: "{#PayloadDir}\*"; DestDir: "{app}"; Excludes: "rat-next.ico"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -51,10 +52,12 @@ Name: "{autodesktop}\Rat Next"; Filename: "{app}\rat.exe"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\rat.exe"; Parameters: "--install-autostart"; Tasks: autostart; Flags: runhidden; StatusMsg: "Включаю автозапуск…"
+Filename: "{app}\rat-relay.exe"; Parameters: "--install-autostart"; Tasks: relay_autostart; Flags: runhidden; StatusMsg: "Включаю автозапуск relay…"
 Filename: "{app}\rat.exe"; Description: "{cm:LaunchProgram,Rat Next}"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
 Filename: "{app}\rat.exe"; Parameters: "--remove-autostart"; Flags: runhidden skipifdoesntexist; RunOnceId: "RemoveAutostart"
+Filename: "{app}\rat-relay.exe"; Parameters: "--remove-autostart"; Flags: runhidden skipifdoesntexist; RunOnceId: "RemoveRelayAutostart"
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}"
