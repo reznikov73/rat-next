@@ -296,7 +296,9 @@ fn remove_autostart_task() {
         use std::os::windows::process::CommandExt;
         let mut cmd = std::process::Command::new("schtasks");
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        let _ = cmd.args(["/Delete", "/F", "/TN", "Rat Next relay"]).output();
+        let _ = cmd
+            .args(["/Delete", "/F", "/TN", "Rat Next relay"])
+            .output();
     }
 }
 
