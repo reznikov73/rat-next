@@ -1158,6 +1158,8 @@ mod ui {
         /// Окно показали автоматически ради диалога подтверждения —
         /// после ответа его нужно вернуть в трей.
         shown_for_dialog: bool,
+        /// Запущено ли с повышенными правами (иначе действует UIPI-ограничение).
+        elevated: bool,
         /// Запрос «показать окно» от повторного запуска exe.
         show_request: Option<rat_session::single_instance::ShowListener>,
         /// Контекст egui для слушателя повторного запуска (будит перерисовку).
@@ -1315,6 +1317,7 @@ mod ui {
                 hidden: false,
                 tray_hide_done: false,
                 shown_for_dialog: false,
+                elevated: rat_session::elevation::is_elevated(),
                 show_request,
                 repaint_slot,
                 args,
@@ -1568,6 +1571,24 @@ mod ui {
                         }
                     });
                 });
+                if !self.elevated && !self.args.service_helper {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(OFF, "⚠");
+                        ui.label(
+                            egui::RichText::new(
+                                "нет прав администратора — управление окнами программ, \
+                                 запущенных от администратора, недоступно",
+                            )
+                            .size(12.0)
+                            .color(egui::Color32::from_rgb(180, 83, 9)),
+                        )
+                        .on_hover_text(
+                            "Перезапустите от имени администратора, включите автозапуск \
+                             (задача с повышенными правами) или установите службу — \
+                             тогда мышь и клавиатура работают в любых окнах.",
+                        );
+                    });
+                }
                 ui.add_space(6.0);
             });
             egui::Panel::bottom("bottom").show(ui, |ui| {
@@ -2195,7 +2216,16 @@ mod ui {
                             |ui| {
                                 ui.add_space(10.0);
                                 ui.horizontal(|ui| {
-                                    if ui.button("⬅").on_hover_text("Отключиться").clicked()
+                                    let disconnect = egui::Button::new(
+                                        egui::RichText::new("⬅")
+                                            .size(24.0)
+                                            .color(egui::Color32::from_rgb(219, 56, 52)),
+                                    )
+                                    .fill(egui::Color32::from_rgb(255, 236, 234));
+                                    if ui
+                                        .add(disconnect)
+                                        .on_hover_text("Отключиться от удалённого ПК")
+                                        .clicked()
                                     {
                                         back = true;
                                     }
@@ -2302,7 +2332,7 @@ mod ui {
                             |ui| {
                                 ui.add_space(10.0);
                                 ui.label(
-                                    "Мышь — над видео; клавиатура — когда окно в фокусе. Панели выезжают при наведении к верхнему/нижнему краю. Кнопка со стрелкой ⬅ — отключиться.",
+                                    "Мышь — над видео; клавиатура — когда окно в фокусе. Панели выезжают при наведении к верхнему/нижнему краю. Кнопка со стрелкой ⬅ или крестик окна — отключиться.",
                                 );
                             },
                         );
@@ -2586,10 +2616,7 @@ mod ui {
             }
 
             if back {
-                if let Some(mut s) = self.viewer.take() {
-                    s.shutdown();
-                }
-                self.screen = Screen::Home;
+                self.close_viewer();
             }
         }
     }
@@ -2671,18 +2698,36 @@ mod ui {
     }
 
     impl RatApp {
+        /// Отключиться от удалённого ПК и вернуться к списку машин.
+        fn close_viewer(&mut self) {
+            if let Some(mut s) = self.viewer.take() {
+                s.shutdown();
+            }
+            self.screen = Screen::Home;
+        }
+
         /// Крестик окна прячет приложение в трей, сессии продолжают работать.
         fn handle_close(&mut self, ctx: &egui::Context) {
             if self.quitting {
                 return;
             }
-            // В режиме агента (--tray) закрытие окна только прячет его: агент
-            // продолжает работать, иначе служба перезапускала бы его по кругу,
-            // а активная сессия оператора рвалась бы.
-            if self.tray.is_none() && !self.args.tray {
-                return;
-            }
             if ctx.input(|i| i.viewport().close_requested()) {
+                // Крестик при активной сессии = отключиться и вернуться к
+                // списку машин (окно остаётся; повторный крестик — как обычно).
+                if self.viewer.is_some() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    if ctx.input(|i| i.viewport().fullscreen).unwrap_or(false) {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                    }
+                    self.close_viewer();
+                    return;
+                }
+                // В режиме агента (--tray) закрытие окна только прячет его: агент
+                // продолжает работать, иначе служба перезапускала бы его по кругу,
+                // а активная сессия оператора рвалась бы.
+                if self.tray.is_none() && !self.args.tray {
+                    return;
+                }
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                 self.hidden = true;

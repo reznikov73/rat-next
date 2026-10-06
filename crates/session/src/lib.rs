@@ -5,6 +5,7 @@
 //! `spikes/session_loopback` (P2). Агент и вьюер — тонкие обёртки в `bins/`.
 
 pub mod control;
+pub mod elevation;
 pub mod frame;
 pub mod input;
 pub mod link;
