@@ -2970,14 +2970,13 @@ mod ui {
                 }
                 drop(locked);
 
-                // Удалённый курсор поверх видео.
+                // Удалённый курсор поверх видео — формой, как на удалённой машине.
                 let cs = *cursor_arc.lock().unwrap();
                 if cs.visible {
                     let (px, py) = input::norm_to_ui_px(cs.x, cs.y, draw.width(), draw.height());
                     let pos = egui::pos2(draw.min.x + px, draw.min.y + py);
-                    ui.painter()
-                        .circle_filled(pos, 5.0, egui::Color32::from_black_alpha(180));
-                    ui.painter().circle_filled(pos, 2.5, egui::Color32::WHITE);
+                    let s = (draw.height() / 720.0).clamp(0.6, 3.0);
+                    rat_cursor_ui::paint_cursor(ui.painter(), pos, s, cs.kind);
                 }
             }
 

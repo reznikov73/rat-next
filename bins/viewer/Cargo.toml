@@ -7,8 +7,9 @@ publish = false
 
 [features]
 default = []
-ffmpeg = ["rat-session/ffmpeg", "dep:eframe"]
+ffmpeg = ["rat-session/ffmpeg", "dep:eframe", "dep:rat-cursor-ui"]
 
 [dependencies]
 rat-session = { path = "../../crates/session" }
+rat-cursor-ui = { path = "../../crates/cursor-ui", optional = true }
 eframe = { version = "0.36", optional = true }

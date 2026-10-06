@@ -376,7 +376,7 @@ pub fn spawn_agent(
 
         // Курсор: отправляем не чаще ~30 Гц и только при изменении.
         let mut last_cursor_t = Instant::now() - Duration::from_secs(1);
-        let mut last_cursor: Option<(u16, u16, bool)> = None;
+        let mut last_cursor: Option<(u16, u16, bool, u8)> = None;
 
         // Буфер обмена: следим за текстом и пересылаем вьюеру изменения.
         let mut last_clip_t = Instant::now() - Duration::from_secs(1);
@@ -537,13 +537,13 @@ pub fn spawn_agent(
             if last_cursor_t.elapsed() >= Duration::from_millis(33) {
                 last_cursor_t = Instant::now();
                 let g = *geom_b.lock().unwrap();
-                if let Some((cx, cy, vis)) = cursor_captured_norm(g)
-                    && last_cursor != Some((cx, cy, vis))
+                if let Some((cx, cy, vis, kind)) = cursor_captured_norm(g)
+                    && last_cursor != Some((cx, cy, vis, kind))
                 {
-                    let mut cb = [0u8; 5];
-                    input::pack_cursor(&mut cb, cx, cy, vis);
+                    let mut cb = [0u8; 6];
+                    input::pack_cursor(&mut cb, cx, cy, vis, kind);
                     mux.push(Channel::Cursor, flags::DROPPABLE, &cb);
-                    last_cursor = Some((cx, cy, vis));
+                    last_cursor = Some((cx, cy, vis, kind));
                     stats_b.lock().unwrap().cursor_sent += 1;
                 }
             }
@@ -770,8 +770,8 @@ fn is_extended_key(vk: u16) -> bool {
     matches!(vk, 0x21..=0x28 | 0x2D | 0x2E | 0x5B..=0x5D | 0x6F)
 }
 
-/// Текущий курсор агента в нормализованных координатах области захвата.
-fn cursor_captured_norm(out: OutputGeom) -> Option<(u16, u16, bool)> {
+/// Текущий курсор агента в нормализованных координатах области захвата: (x, y, видим, вид).
+fn cursor_captured_norm(out: OutputGeom) -> Option<(u16, u16, bool, u8)> {
     use windows::Win32::UI::WindowsAndMessaging::{CURSOR_SHOWING, CURSORINFO, GetCursorInfo};
     let mut ci = CURSORINFO {
         cbSize: std::mem::size_of::<CURSORINFO>() as u32,
@@ -780,7 +780,49 @@ fn cursor_captured_norm(out: OutputGeom) -> Option<(u16, u16, bool)> {
     unsafe { GetCursorInfo(&mut ci) }.ok()?;
     let visible = (ci.flags.0 & CURSOR_SHOWING.0) != 0;
     let (nx, ny) = input::screen_to_captured_norm(ci.ptScreenPos.x, ci.ptScreenPos.y, out);
-    Some((nx, ny, visible))
+    Some((nx, ny, visible, cursor_kind(ci.hCursor)))
+}
+
+/// Вид курсора по хендлу: сравнение с системными (IDC_*). Кастомный курсор — стрелка.
+fn cursor_kind(h: windows::Win32::UI::WindowsAndMessaging::HCURSOR) -> u8 {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        IDC_APPSTARTING, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_HELP, IDC_IBEAM, IDC_NO, IDC_SIZEALL,
+        IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, IDC_UPARROW, IDC_WAIT, LoadCursorW,
+    };
+
+    // Системные курсоры в рамках процесса неизменны — грузим хендлы один раз.
+    // Храним адреса (usize): сам HCURSOR не Send/Sync, а в статике это обязательно.
+    static STD: std::sync::OnceLock<[(usize, u8); 14]> = std::sync::OnceLock::new();
+    let std = STD.get_or_init(|| {
+        [
+            (IDC_ARROW, input::CURSOR_ARROW),
+            (IDC_IBEAM, input::CURSOR_IBEAM),
+            (IDC_HAND, input::CURSOR_HAND),
+            (IDC_CROSS, input::CURSOR_CROSS),
+            (IDC_WAIT, input::CURSOR_WAIT),
+            (IDC_APPSTARTING, input::CURSOR_APPSTARTING),
+            (IDC_NO, input::CURSOR_NO),
+            (IDC_HELP, input::CURSOR_HELP),
+            (IDC_SIZENS, input::CURSOR_SIZE_NS),
+            (IDC_SIZEWE, input::CURSOR_SIZE_WE),
+            (IDC_SIZENWSE, input::CURSOR_SIZE_NWSE),
+            (IDC_SIZENESW, input::CURSOR_SIZE_NESW),
+            (IDC_SIZEALL, input::CURSOR_SIZE_ALL),
+            (IDC_UPARROW, input::CURSOR_UPARROW),
+        ]
+        .map(|(id, kind)| {
+            let h = unsafe { LoadCursorW(None, id) }.unwrap_or_default();
+            (h.0 as usize, kind)
+        })
+    });
+
+    let handle = h.0 as usize;
+    for (addr, kind) in std {
+        if *addr != 0 && *addr == handle {
+            return *kind;
+        }
+    }
+    input::CURSOR_ARROW
 }
 
 // ================== буфер обмена (текст, Windows) ==================

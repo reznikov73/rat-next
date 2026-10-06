@@ -7,7 +7,8 @@
 //! - `3 Wheel`  — `[dx i16][dy i16][x u16][y u16]`;
 //! - `4 Key`    — `[vk u16][down u8]`.
 //!
-//! Канал Cursor (droppable): `[x u16][y u16][visible u8]` — «последний выигрывает».
+//! Канал Cursor (droppable): `[x u16][y u16][visible u8][kind u8]` — «последний выигрывает».
+//! Байт `kind` добавлен позже: приёмник принимает и 5-байтовый пакет (тогда вид — стрелка).
 //!
 //! Meta-сообщения в канале Control: `[0xAA][type u8][...]` — служебная информация без
 //! расширения protobuf v0. type 1 = SessionInfo:
@@ -51,12 +52,30 @@ pub struct SessionInfo {
     pub active: u16,
 }
 
+/// Типы курсора (поле `kind` в канале Cursor). Неизвестное значение = обычная стрелка.
+pub const CURSOR_ARROW: u8 = 0;
+pub const CURSOR_IBEAM: u8 = 1;
+pub const CURSOR_HAND: u8 = 2;
+pub const CURSOR_CROSS: u8 = 3;
+pub const CURSOR_WAIT: u8 = 4;
+pub const CURSOR_APPSTARTING: u8 = 5;
+pub const CURSOR_NO: u8 = 6;
+pub const CURSOR_HELP: u8 = 7;
+pub const CURSOR_SIZE_NS: u8 = 8;
+pub const CURSOR_SIZE_WE: u8 = 9;
+pub const CURSOR_SIZE_NWSE: u8 = 10;
+pub const CURSOR_SIZE_NESW: u8 = 11;
+pub const CURSOR_SIZE_ALL: u8 = 12;
+pub const CURSOR_UPARROW: u8 = 13;
+
 /// Состояние курсора агента (нормализованные координаты области захвата).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CursorState {
     pub x: u16,
     pub y: u16,
     pub visible: bool,
+    /// Вид курсора, один из `CURSOR_*`; 0 (Default) — стрелка.
+    pub kind: u8,
 }
 
 /// События ввода (координаты — нормализованные 0..=65535 по области захвата).
@@ -171,13 +190,14 @@ pub fn coalesce_moves(events: Vec<InputEvent>) -> Vec<InputEvent> {
 }
 
 /// Упаковать состояние курсора (канал Cursor).
-pub fn pack_cursor(out: &mut [u8; 5], x: u16, y: u16, visible: bool) {
+pub fn pack_cursor(out: &mut [u8; 6], x: u16, y: u16, visible: bool, kind: u8) {
     out[0..2].copy_from_slice(&x.to_be_bytes());
     out[2..4].copy_from_slice(&y.to_be_bytes());
     out[4] = u8::from(visible);
+    out[5] = kind;
 }
 
-/// Разобрать состояние курсора.
+/// Разобрать состояние курсора. Пакет без байта вида (старый агент) — стрелка.
 pub fn parse_cursor(payload: &[u8]) -> Option<CursorState> {
     if payload.len() < 5 {
         return None;
@@ -186,6 +206,7 @@ pub fn parse_cursor(payload: &[u8]) -> Option<CursorState> {
         x: u16::from_be_bytes([payload[0], payload[1]]),
         y: u16::from_be_bytes([payload[2], payload[3]]),
         visible: payload[4] != 0,
+        kind: payload.get(5).copied().unwrap_or(CURSOR_ARROW),
     })
 }
 
@@ -437,17 +458,20 @@ mod tests {
 
     #[test]
     fn cursor_roundtrip() {
-        let mut buf = [0u8; 5];
-        pack_cursor(&mut buf, 64000, 32, true);
+        let mut buf = [0u8; 6];
+        pack_cursor(&mut buf, 64000, 32, true, CURSOR_IBEAM);
         assert_eq!(
             parse_cursor(&buf).unwrap(),
             CursorState {
                 x: 64000,
                 y: 32,
-                visible: true
+                visible: true,
+                kind: CURSOR_IBEAM,
             }
         );
         assert!(parse_cursor(&buf[..4]).is_none());
+        // Пакет старого агента (5 байт) читается как обычная стрелка.
+        assert_eq!(parse_cursor(&buf[..5]).unwrap().kind, CURSOR_ARROW);
     }
 
     #[test]

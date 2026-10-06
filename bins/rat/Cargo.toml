@@ -8,10 +8,11 @@ publish = false
 [features]
 default = []
 # Пилотный кодек-путь и GUI (локальная сборка FFmpeg; см. README).
-ffmpeg = ["rat-session/ffmpeg", "dep:eframe", "dep:tray-icon"]
+ffmpeg = ["rat-session/ffmpeg", "dep:eframe", "dep:tray-icon", "dep:rat-cursor-ui"]
 
 [dependencies]
 rat-session = { path = "../../crates/session" }
+rat-cursor-ui = { path = "../../crates/cursor-ui", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 eframe = { version = "0.36", optional = true }

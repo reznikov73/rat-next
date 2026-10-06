@@ -3191,6 +3191,7 @@ name = "rat"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "rat-cursor-ui",
  "rat-session",
  "serde",
  "serde_json",
@@ -3216,6 +3217,14 @@ version = "0.1.0"
 [[package]]
 name = "rat-crypto"
 version = "0.1.0"
+
+[[package]]
+name = "rat-cursor-ui"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "rat-session",
+]
 
 [[package]]
 name = "rat-elevate"
@@ -3270,6 +3279,7 @@ name = "rat-viewer"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "rat-cursor-ui",
  "rat-session",
 ]
 

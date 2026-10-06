@@ -1,0 +1,10 @@
+[package]
+name = "rat-cursor-ui"
+description = "Rat Next: отрисовка удалённого курсора в окне просмотра (общая для rat и rat-viewer)"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+rat-session = { path = "../session" }
+egui = "0.36"
