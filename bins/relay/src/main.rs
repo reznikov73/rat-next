@@ -11,12 +11,16 @@
 //! rat-relay.exe --tray                    # старт сразу свёрнутым в трей
 //! rat-relay.exe --install-service         # поставить службу (автозапуск при загрузке Windows)
 //! rat-relay.exe --uninstall-service       # снять службу
+//! rat-relay.exe --start-service           # запустить службу (использует интерфейс)
+//! rat-relay.exe --stop-service            # остановить службу (использует интерфейс)
+//! rat-relay.exe --service-helper          # хелпер службы (запускает сама служба)
 //! ```
 
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
 mod autostart;
 mod core;
+mod elevate;
 mod icon;
 mod port;
 mod service;
@@ -35,6 +39,9 @@ fn main() {
     let mut start_hidden = false;
     let mut install_service = false;
     let mut uninstall_service = false;
+    let mut start_service = false;
+    let mut stop_service = false;
+    let mut service_helper = false;
     let mut service_mode = false;
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -62,6 +69,18 @@ fn main() {
             }
             "--uninstall-service" => {
                 uninstall_service = true;
+                i += 1;
+            }
+            "--start-service" => {
+                start_service = true;
+                i += 1;
+            }
+            "--stop-service" => {
+                stop_service = true;
+                i += 1;
+            }
+            "--service-helper" => {
+                service_helper = true;
                 i += 1;
             }
             "--service" => {
@@ -95,6 +114,30 @@ fn main() {
             }
         }
     }
+    if start_service {
+        match service::start() {
+            Ok(()) => {
+                println!("Служба relay запущена.");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("service: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if stop_service {
+        match service::stop() {
+            Ok(()) => {
+                println!("Служба relay остановлена.");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("service: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
     if service_mode {
         // У службы отдельный экземплярный мьютекс: GUI-версия и служба не считаются
         // «двойным запуском» (конфликт порта, если что, виден в интерфейсе).
@@ -103,6 +146,19 @@ fn main() {
         }
         if let Err(e) = service::run_service() {
             eprintln!("service: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if service_helper {
+        // Хелпер службы: GUI-процесс в пользовательской сессии. Собственный
+        // цикл relay не поднимает (порт держит служба): показывает окно и
+        // значок; повторный запуск rat-relay.exe открывает это окно.
+        if !rat_session::single_instance::try_acquire("relay") {
+            std::process::exit(2);
+        }
+        if let Err(e) = ui::run(listen, true, ui::UiMode::Helper) {
+            eprintln!("relay: {e}");
             std::process::exit(1);
         }
         return;
@@ -126,6 +182,11 @@ fn main() {
     }
     if !rat_session::single_instance::try_acquire("relay") {
         if smoke.is_none() {
+            // Повторный запуск — просим работающий экземпляр показать окно
+            // (то же, что клик по значку в трее; работает и когда значка нет).
+            if rat_session::single_instance::show_signal("relay") {
+                std::process::exit(0);
+            }
             rat_session::single_instance::warn(
                 "Rat Next relay",
                 "Relay уже запущен.\nОкно можно открыть из значка в трее.",
@@ -139,7 +200,12 @@ fn main() {
         run_headless(listen, secs);
         return;
     }
-    if let Err(e) = ui::run(listen, start_hidden) {
+    let mode = if service::status() == service::State::NotInstalled {
+        ui::UiMode::Standalone
+    } else {
+        ui::UiMode::Attach
+    };
+    if let Err(e) = ui::run(listen, start_hidden, mode) {
         eprintln!("relay: {e}");
         std::process::exit(1);
     }

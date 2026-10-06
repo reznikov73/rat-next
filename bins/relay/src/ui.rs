@@ -89,6 +89,17 @@ impl LogBuf {
     }
 }
 
+/// Режим интерфейса relay.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum UiMode {
+    /// Обычный запуск: собственный цикл relay и окно.
+    Standalone,
+    /// Служба работает: интерфейс без своего цикла, управление службой.
+    Attach,
+    /// Хелпер службы (запускается службой в сессии): окно и значок.
+    Helper,
+}
+
 pub struct RelayApp {
     settings: Settings,
     settings_open: bool,
@@ -112,9 +123,19 @@ pub struct RelayApp {
     autostart_checked: bool,
     started_at: Option<Instant>,
     relay_starts: u32,
+    /// Режим интерфейса (обычный / при службе / хелпер службы).
+    mode: UiMode,
+    /// Состояние службы «RatNextRelay» (обновляется раз в секунду).
+    svc_state: crate::service::State,
+    /// Время последнего опроса состояния службы.
+    svc_checked: Instant,
+    /// Запрос «показать окно» от повторного запуска exe.
+    show_request: Option<rat_session::single_instance::ShowListener>,
+    /// Контекст egui для слушателя повторного запуска (будит перерисовку).
+    repaint_slot: std::sync::Arc<std::sync::Mutex<Option<egui::Context>>>,
 }
 
-pub fn run(initial_listen: Option<String>, start_hidden: bool) -> Result<(), String> {
+pub fn run(initial_listen: Option<String>, start_hidden: bool, mode: UiMode) -> Result<(), String> {
     if std::env::var_os("WGPU_BACKEND").is_none() {
         // SAFETY: до инициализации GUI, однопоточно.
         unsafe { std::env::set_var("WGPU_BACKEND", "dx12") };
@@ -127,10 +148,29 @@ pub fn run(initial_listen: Option<String>, start_hidden: bool) -> Result<(), Str
             .with_min_inner_size([680.0, 420.0]),
         ..Default::default()
     };
+    // Слушатель повторного запуска: второй rat-relay.exe просит показать окно.
+    let repaint_slot: std::sync::Arc<std::sync::Mutex<Option<egui::Context>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let show_request = {
+        let slot = repaint_slot.clone();
+        rat_session::single_instance::show_listener("relay", move || {
+            if let Some(ctx) = slot.lock().ok().and_then(|c| c.clone()) {
+                ctx.request_repaint();
+            }
+        })
+    };
     eframe::run_native(
         "Rat Next relay",
         options,
-        Box::new(move |_cc| Ok(Box::new(RelayApp::new(initial_listen, start_hidden)))),
+        Box::new(move |_cc| {
+            Ok(Box::new(RelayApp::new(
+                initial_listen,
+                start_hidden,
+                mode,
+                show_request,
+                repaint_slot,
+            )))
+        }),
     )
     .map_err(|e| e.to_string())
 }
@@ -146,11 +186,18 @@ fn window_icon() -> egui::IconData {
 }
 
 impl RelayApp {
-    fn new(initial_listen: Option<String>, start_hidden: bool) -> Self {
+    fn new(
+        initial_listen: Option<String>,
+        start_hidden: bool,
+        mode: UiMode,
+        show_request: Option<rat_session::single_instance::ShowListener>,
+        repaint_slot: std::sync::Arc<std::sync::Mutex<Option<egui::Context>>>,
+    ) -> Self {
         let mut settings = settings::load();
         if let Some(listen) = initial_listen {
             settings.listen_addr = listen;
         }
+        let svc_state = crate::service::status();
         let mut app = Self {
             settings_open: false,
             edit_public: settings.public_addr.clone(),
@@ -174,15 +221,36 @@ impl RelayApp {
             autostart_checked: false,
             started_at: None,
             relay_starts: 0,
+            mode,
+            svc_state,
+            svc_checked: Instant::now(),
+            show_request,
+            repaint_slot,
         };
         app.log_line("Rat Next relay запущен");
         app.log_line(format!("адрес для клиентов: {}", app.settings.public_addr));
-        match Tray::new(&app.settings.listen_addr, false) {
+        let tray_running =
+            mode != UiMode::Standalone && svc_state == crate::service::State::Running;
+        match Tray::new(
+            &app.settings.listen_addr,
+            tray_running,
+            mode != UiMode::Helper,
+        ) {
             Ok(tray) => app.tray = Some(tray),
             Err(e) => app.log_line(format!("трей недоступен: {e}")),
         }
-        app.start();
+        if app.service_mode() {
+            app.log_line("режим службы: relay работает как служба «RatNextRelay»");
+            app.log_line("собственный цикл relay не запускается — порт держит служба");
+            app.sync_tray();
+        } else {
+            app.start();
+        }
         app
+    }
+
+    fn service_mode(&self) -> bool {
+        self.mode != UiMode::Standalone
     }
 
     fn running(&self) -> bool {
@@ -195,6 +263,10 @@ impl RelayApp {
     }
 
     fn start(&mut self) {
+        if self.service_mode() {
+            self.log_line("режим службы: собственный цикл relay не запускается");
+            return;
+        }
         if self.handle.is_some() || self.stopping.is_some() {
             return;
         }
@@ -258,8 +330,13 @@ impl RelayApp {
     }
 
     fn sync_tray(&mut self) {
+        let running = if self.service_mode() {
+            self.svc_state == crate::service::State::Running
+        } else {
+            self.running()
+        };
         if let Some(tray) = &self.tray {
-            tray.set_state(&self.settings.listen_addr, self.running());
+            tray.set_state(&self.settings.listen_addr, running);
         }
     }
 
@@ -320,6 +397,55 @@ impl RelayApp {
         self.settings_open = true;
     }
 
+    /// Операция со службой из интерфейса: сразу или через запрос UAC.
+    fn svc_action(&mut self, op: crate::service::Op) {
+        let (flag, name): (&str, &str) = match op {
+            crate::service::Op::Install => ("--install-service", "Установка службы"),
+            crate::service::Op::Uninstall => ("--uninstall-service", "Удаление службы"),
+            crate::service::Op::Start => ("--start-service", "Запуск службы"),
+            crate::service::Op::Stop => ("--stop-service", "Остановка службы"),
+        };
+        let result = match op {
+            crate::service::Op::Install => crate::service::install(),
+            crate::service::Op::Uninstall => crate::service::uninstall(),
+            crate::service::Op::Start => crate::service::start(),
+            crate::service::Op::Stop => crate::service::stop(),
+        };
+        match result {
+            Ok(()) => {
+                self.svc_state = crate::service::status();
+                self.svc_checked = Instant::now();
+                self.log_line(format!("{name}: выполнено"));
+                self.sync_tray();
+            }
+            Err(e) => {
+                if e.contains("ошибка 5") {
+                    match crate::elevate::relaunch(flag) {
+                        Ok(()) => {
+                            self.svc_state = crate::service::State::Pending;
+                            self.svc_checked = Instant::now();
+                            self.log_line(format!(
+                                "{name}: подтвердите запрос прав администратора"
+                            ));
+                        }
+                        Err(e2) => self.log_line(format!("{name}: {e2}")),
+                    }
+                } else {
+                    self.log_line(format!("{name}: {e}"));
+                }
+            }
+        }
+    }
+
+    /// Переключить службу (пункт трея «Остановить/Запустить relay»).
+    fn svc_toggle(&mut self) {
+        if self.svc_state == crate::service::State::Running {
+            self.svc_action(crate::service::Op::Stop);
+        } else {
+            self.svc_action(crate::service::Op::Start);
+        }
+    }
+
     fn quit(&mut self, ctx: &egui::Context) {
         self.quitting = true;
         if let Some(handle) = self.handle.take() {
@@ -369,6 +495,26 @@ impl eframe::App for RelayApp {
         if self.start_hidden && !self.hidden_once {
             self.hidden_once = true;
             hide_window(&ctx);
+        }
+        // Первый кадр: контекст egui для слушателя повторного запуска.
+        if let Ok(mut slot) = self.repaint_slot.lock()
+            && slot.is_none()
+        {
+            *slot = Some(ctx.clone());
+        }
+        // Повторный запуск: показать окно (как клик по значку в трее).
+        if self.show_request.as_ref().is_some_and(|s| s.take()) {
+            self.hidden_once = true;
+            show_window(&ctx);
+        }
+        // Раз в секунду обновляем состояние службы (для значка и интерфейса).
+        if self.svc_checked.elapsed() > Duration::from_secs(1) {
+            let before = self.svc_state;
+            self.svc_checked = Instant::now();
+            self.svc_state = crate::service::status();
+            if self.service_mode() && self.svc_state != before {
+                self.sync_tray();
+            }
         }
 
         self.pump_events();
@@ -420,7 +566,9 @@ impl RelayApp {
         match cmd {
             Cmd::Show => show_window(ctx),
             Cmd::Toggle => {
-                if self.running() {
+                if self.service_mode() {
+                    self.svc_toggle();
+                } else if self.running() {
                     self.stop(false);
                 } else {
                     self.start();
@@ -436,7 +584,14 @@ impl RelayApp {
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let (mark, state, color) = if self.running() {
+            let (mark, state, color) = if self.service_mode() {
+                match self.svc_state {
+                    crate::service::State::Running => ("●", "работает (служба)", ON),
+                    crate::service::State::Stopped => ("○", "служба остановлена", OFF),
+                    crate::service::State::NotInstalled => ("○", "служба не установлена", OFF),
+                    crate::service::State::Pending => ("●", "служба меняется…", DIM),
+                }
+            } else if self.running() {
                 ("●", "работает", ON)
             } else if self.stopping.is_some() {
                 ("●", "останавливается…", DIM)
@@ -453,7 +608,24 @@ impl RelayApp {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             let busy = self.stopping.is_some();
-            if self.running() {
+            if self.service_mode() {
+                let running = self.svc_state == crate::service::State::Running;
+                let pending = self.svc_state != crate::service::State::Running
+                    && self.svc_state != crate::service::State::Stopped;
+                if running {
+                    if ui
+                        .add_enabled(!pending, egui::Button::new("Остановить службу"))
+                        .clicked()
+                    {
+                        self.svc_action(crate::service::Op::Stop);
+                    }
+                } else if ui
+                    .add_enabled(!pending, egui::Button::new("Запустить службу"))
+                    .clicked()
+                {
+                    self.svc_action(crate::service::Op::Start);
+                }
+            } else if self.running() {
                 if ui
                     .add_enabled(!busy, egui::Button::new("Остановить relay"))
                     .clicked()
@@ -631,6 +803,60 @@ impl RelayApp {
                     }
                 }
                 ui.add_space(10.0);
+                ui.separator();
+                ui.label("Служба Windows — relay доступен сразу после загрузки системы:");
+                let (state_txt, state_col) = match self.svc_state {
+                    crate::service::State::NotInstalled => {
+                        ("не установлена", egui::Color32::from_gray(130))
+                    }
+                    crate::service::State::Stopped => {
+                        ("остановлена", egui::Color32::from_rgb(230, 120, 30))
+                    }
+                    crate::service::State::Running => ("работает", ON),
+                    crate::service::State::Pending => {
+                        ("меняется…", egui::Color32::from_rgb(150, 150, 60))
+                    }
+                };
+                ui.horizontal(|ui| {
+                    ui.label("Состояние:");
+                    ui.colored_label(state_col, state_txt);
+                });
+                let not_installed = self.svc_state == crate::service::State::NotInstalled;
+                let running = self.svc_state == crate::service::State::Running;
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(not_installed, egui::Button::new("Установить"))
+                        .clicked()
+                    {
+                        self.svc_action(crate::service::Op::Install);
+                    }
+                    if ui
+                        .add_enabled(!not_installed && !running, egui::Button::new("Запустить"))
+                        .clicked()
+                    {
+                        self.svc_action(crate::service::Op::Start);
+                    }
+                    if ui
+                        .add_enabled(!not_installed && running, egui::Button::new("Остановить"))
+                        .clicked()
+                    {
+                        self.svc_action(crate::service::Op::Stop);
+                    }
+                    if ui
+                        .add_enabled(!not_installed, egui::Button::new("Удалить"))
+                        .clicked()
+                    {
+                        self.svc_action(crate::service::Op::Uninstall);
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "Для установки, удаления и остановки Windows запросит права администратора.",
+                    )
+                    .small()
+                    .color(egui::Color32::from_gray(150)),
+                );
+                ui.add_space(10.0);
                 if let Some(err) = &self.settings_error {
                     ui.colored_label(OFF, err);
                     ui.add_space(6.0);
@@ -681,7 +907,9 @@ impl RelayApp {
         if listen_changed {
             let listen = self.settings.listen_addr.clone();
             self.log_line(format!("адрес прослушивания изменён: {listen}"));
-            if self.running() {
+            if self.service_mode() {
+                self.log_line("режим службы: перезапустите службу, чтобы применить адрес");
+            } else if self.running() {
                 self.stop(true);
             } else {
                 self.start();

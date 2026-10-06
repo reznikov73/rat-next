@@ -22,24 +22,33 @@ pub struct Tray {
 }
 
 impl Tray {
-    pub fn new(listen: &str, running: bool) -> Result<Self, String> {
+    /// `quit_enabled = false` — хелпер службы: «Выход» в меню нет, завершать
+    /// его через трей нельзя (служба сразу поднимет его снова).
+    pub fn new(listen: &str, running: bool, quit_enabled: bool) -> Result<Self, String> {
         let item_state = MenuItem::new(format!("Адрес: {listen}"), false, None);
         let item_show = MenuItem::new("Показать окно", true, None);
         let item_toggle = MenuItem::new(toggle_text(running), true, None);
         let item_settings = MenuItem::new("Настройки…", true, None);
         let item_quit = MenuItem::new("Выход", true, None);
 
+        let sep1 = PredefinedMenuItem::separator();
+        let sep2 = PredefinedMenuItem::separator();
         let menu = Menu::new();
-        menu.append_items(&[
-            &item_state,
-            &PredefinedMenuItem::separator(),
-            &item_show,
-            &item_toggle,
-            &item_settings,
-            &PredefinedMenuItem::separator(),
-            &item_quit,
-        ])
-        .map_err(|e| e.to_string())?;
+        if quit_enabled {
+            menu.append_items(&[
+                &item_state,
+                &sep1,
+                &item_show,
+                &item_toggle,
+                &item_settings,
+                &sep2,
+                &item_quit,
+            ])
+            .map_err(|e| e.to_string())?;
+        } else {
+            menu.append_items(&[&item_state, &sep1, &item_show, &item_toggle, &item_settings])
+                .map_err(|e| e.to_string())?;
+        }
 
         let icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu))

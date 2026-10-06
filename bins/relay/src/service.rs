@@ -23,6 +23,8 @@ const DESCRIPTION: &str =
 static STOP: AtomicBool = AtomicBool::new(false);
 static STATUS_HANDLE: AtomicIsize = AtomicIsize::new(0);
 static CUR_STATE: AtomicU32 = AtomicU32::new(SERVICE_START_PENDING);
+static HELPER_PID: AtomicU32 = AtomicU32::new(0);
+static HELPER_SESSION: AtomicU32 = AtomicU32::new(u32::MAX);
 
 const SERVICE_WIN32_OWN_PROCESS: u32 = 0x0000_0010;
 const SERVICE_AUTO_START: u32 = 0x0000_0002;
@@ -43,6 +45,14 @@ const SC_ACTION_RESTART: u32 = 1;
 const ERROR_SERVICE_EXISTS: u32 = 1073;
 const ERROR_SERVICE_ALREADY_RUNNING: u32 = 1056;
 const ERROR_SERVICE_DOES_NOT_EXIST: u32 = 1060;
+
+const SC_MANAGER_CONNECT: u32 = 0x0001;
+const SERVICE_QUERY_STATUS: u32 = 0x0004;
+const SERVICE_START: u32 = 0x0010;
+const SERVICE_STOP: u32 = 0x0020;
+const ERROR_SERVICE_NOT_ACTIVE: u32 = 1062;
+const TOKEN_ALL_ACCESS: u32 = 0x000F_01FF;
+const WAIT_TIMEOUT: i32 = 0x0000_0102;
 
 #[repr(C)]
 struct ServiceStatus {
@@ -80,6 +90,36 @@ struct ServiceFailureActionsW {
     command: *mut u16,
     actions_count: u32,
     actions: *const ScAction,
+}
+
+#[repr(C)]
+struct StartupInfoW {
+    cb: u32,
+    lp_reserved: *mut u16,
+    lp_desktop: *mut u16,
+    lp_title: *mut u16,
+    dw_x: u32,
+    dw_y: u32,
+    dw_x_size: u32,
+    dw_y_size: u32,
+    dw_x_count_chars: u32,
+    dw_y_count_chars: u32,
+    dw_fill_attribute: u32,
+    dw_flags: u32,
+    w_show_window: u16,
+    cb_reserved_2: u16,
+    lp_reserved_2: *mut u8,
+    h_std_input: *mut c_void,
+    h_std_output: *mut c_void,
+    h_std_error: *mut c_void,
+}
+
+#[repr(C)]
+struct ProcessInformationW {
+    h_process: *mut c_void,
+    h_thread: *mut c_void,
+    dw_process_id: u32,
+    dw_thread_id: u32,
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -166,10 +206,14 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
     report(SERVICE_STOPPED, 0, 0);
 }
 
-/// Основной цикл службы: журналируем события и ждём команду «стоп».
+/// Основной цикл службы: журналируем события, держим хелпер в сессии и ждём
+/// команду «стоп».
 fn run_loop(handle: crate::core::Handle) {
     let stop = handle.stop.clone();
+    let mut last_spawn: Option<std::time::Instant> = None;
+    let mut retry_at: Option<std::time::Instant> = None;
     while !STOP.load(Ordering::Relaxed) && !handle.is_finished() {
+        supervise_step(&mut last_spawn, &mut retry_at);
         match handle.events.recv_timeout(Duration::from_millis(200)) {
             Ok(crate::core::Event::Log(line)) => log_line(&line),
             Ok(_) => {}
@@ -177,9 +221,151 @@ fn run_loop(handle: crate::core::Handle) {
             Err(_) => break,
         }
     }
+    kill_helper();
     stop.store(true, Ordering::Relaxed);
     handle.join();
     log_line("служба остановлена");
+}
+
+/// Шаг слежения за хелпером: держим окно и значок relay в активной сессии.
+fn supervise_step(
+    last_spawn: &mut Option<std::time::Instant>,
+    retry_at: &mut Option<std::time::Instant>,
+) {
+    let session = unsafe { WTSGetActiveConsoleSessionId() };
+    if session == u32::MAX {
+        if HELPER_PID.load(Ordering::Relaxed) != 0 {
+            log_line("активной сессии нет — хелпер остановлен");
+            kill_helper();
+        }
+        return;
+    }
+    let pid = HELPER_PID.load(Ordering::Relaxed);
+    let alive = pid != 0 && process_alive(pid);
+    let session_changed = HELPER_SESSION.load(Ordering::Relaxed) != session;
+    if alive && !session_changed {
+        return;
+    }
+    if pid != 0 && !alive {
+        log_line(&format!("хелпер завершился: pid={pid}"));
+    }
+    if pid != 0 {
+        kill_helper();
+    }
+    // После мгновенной смерти хелпера (например, уже работает другой
+    // экземпляр приложения) выдерживаем паузу — без цикла перезапусков.
+    let now = std::time::Instant::now();
+    if let Some(t) = *last_spawn
+        && t.elapsed() < Duration::from_secs(3)
+    {
+        *retry_at = Some(now + Duration::from_secs(8));
+    }
+    if let Some(t) = *retry_at {
+        if now < t {
+            return;
+        }
+        *retry_at = None;
+    }
+    match spawn_helper(session) {
+        Ok(pid) => {
+            HELPER_PID.store(pid, Ordering::Relaxed);
+            HELPER_SESSION.store(session, Ordering::Relaxed);
+            *last_spawn = Some(std::time::Instant::now());
+            log_line(&format!("хелпер запущен: pid={pid}, сессия={session}"));
+        }
+        Err(e) => {
+            *last_spawn = Some(std::time::Instant::now());
+            log_line(&format!("хелпер не запустился: {e}"));
+        }
+    }
+}
+
+fn process_alive(pid: u32) -> bool {
+    unsafe {
+        // SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION
+        let handle = OpenProcess(0x0010_0000 | 0x0000_1000, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let result = WaitForSingleObject(handle, 0);
+        CloseHandle(handle);
+        result == WAIT_TIMEOUT
+    }
+}
+
+fn kill_helper() {
+    let pid = HELPER_PID.swap(0, Ordering::Relaxed);
+    HELPER_SESSION.store(u32::MAX, Ordering::Relaxed);
+    if pid != 0 {
+        unsafe {
+            let handle = OpenProcess(0x0000_0001, 0, pid); // PROCESS_TERMINATE
+            if !handle.is_null() {
+                TerminateProcess(handle, 0);
+                CloseHandle(handle);
+            }
+        }
+        log_line(&format!("хелпер остановлен: pid={pid}"));
+    }
+}
+
+/// Запустить хелпер в сессии `session` с системным токеном.
+fn spawn_helper(session: u32) -> Result<u32, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let cmd = format!("\"{}\" --service-helper --tray", exe.display());
+    unsafe {
+        let mut token: *mut c_void = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &mut token) == 0 {
+            return Err(format!("OpenProcessToken: ошибка {}", GetLastError()));
+        }
+        let mut dup: *mut c_void = std::ptr::null_mut();
+        let ok = DuplicateTokenEx(
+            token,
+            TOKEN_ALL_ACCESS,
+            std::ptr::null_mut(),
+            2, // SecurityImpersonation
+            1, // TokenPrimary
+            &mut dup,
+        );
+        CloseHandle(token);
+        if ok == 0 {
+            return Err(format!("DuplicateTokenEx: ошибка {}", GetLastError()));
+        }
+        let sid: u32 = session;
+        if SetTokenInformation(dup, 12, &sid as *const u32 as *const c_void, 4) == 0 {
+            let err = GetLastError();
+            CloseHandle(dup);
+            return Err(format!("SetTokenInformation: ошибка {err}"));
+        }
+        let desktop = wide("winsta0\\default");
+        let mut si: StartupInfoW = std::mem::zeroed();
+        si.cb = std::mem::size_of::<StartupInfoW>() as u32;
+        si.lp_desktop = desktop.as_ptr() as *mut u16;
+        si.dw_flags = 0x0000_0001; // STARTF_USESHOWWINDOW
+        si.w_show_window = 1; // SW_SHOWNORMAL
+        let mut pi: ProcessInformationW = std::mem::zeroed();
+        let mut cmd_w = wide(&cmd);
+        let created = CreateProcessAsUserW(
+            dup,
+            std::ptr::null(),
+            cmd_w.as_mut_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+            &si,
+            &mut pi,
+        );
+        let err = GetLastError();
+        CloseHandle(dup);
+        if created == 0 {
+            return Err(format!("CreateProcessAsUser: ошибка {err}"));
+        }
+        CloseHandle(pi.h_thread);
+        CloseHandle(pi.h_process);
+        Ok(pi.dw_process_id)
+    }
 }
 
 /// Точка входа службы: отдаём управление SCM.
@@ -356,6 +542,151 @@ pub fn uninstall() -> Result<(), String> {
     Ok(())
 }
 
+/// Состояние службы для интерфейса.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum State {
+    /// Служба не зарегистрирована.
+    NotInstalled,
+    /// Зарегистрирована, но остановлена.
+    Stopped,
+    /// Работает.
+    Running,
+    /// Запускается или останавливается.
+    Pending,
+}
+
+/// Операция со службой из интерфейса.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Op {
+    Install,
+    Start,
+    Stop,
+    Uninstall,
+}
+
+/// Узнать состояние службы (только чтение, прав администратора не требует).
+pub fn status() -> State {
+    unsafe {
+        let scm = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT);
+        if scm.is_null() {
+            return State::NotInstalled;
+        }
+        let name = wide(SERVICE_NAME);
+        let service = OpenServiceW(scm, name.as_ptr(), SERVICE_QUERY_STATUS);
+        if service.is_null() {
+            CloseServiceHandle(scm);
+            return State::NotInstalled;
+        }
+        let mut st = ServiceStatus {
+            service_type: 0,
+            current_state: 0,
+            controls_accepted: 0,
+            win32_exit_code: 0,
+            service_specific_exit_code: 0,
+            checkpoint: 0,
+            wait_hint: 0,
+        };
+        let ok = QueryServiceStatus(service, &mut st);
+        CloseServiceHandle(service);
+        CloseServiceHandle(scm);
+        if ok == 0 {
+            return State::NotInstalled;
+        }
+        match st.current_state {
+            SERVICE_RUNNING => State::Running,
+            SERVICE_STOPPED => State::Stopped,
+            _ => State::Pending,
+        }
+    }
+}
+
+/// Запустить установленную службу.
+pub fn start() -> Result<(), String> {
+    unsafe {
+        let scm = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_ALL_ACCESS);
+        if scm.is_null() {
+            return Err(format!(
+                "OpenSCManager: ошибка {} (нужны права администратора)",
+                GetLastError()
+            ));
+        }
+        let name = wide(SERVICE_NAME);
+        let service = OpenServiceW(scm, name.as_ptr(), SERVICE_START | SERVICE_QUERY_STATUS);
+        if service.is_null() {
+            let err = GetLastError();
+            CloseServiceHandle(scm);
+            if err == ERROR_SERVICE_DOES_NOT_EXIST {
+                return Err("служба не установлена (сначала установите)".to_string());
+            }
+            return Err(format!("OpenService: ошибка {err}"));
+        }
+        if StartServiceW(service, 0, std::ptr::null()) == 0 {
+            let err = GetLastError();
+            CloseServiceHandle(service);
+            CloseServiceHandle(scm);
+            if err != ERROR_SERVICE_ALREADY_RUNNING {
+                return Err(format!("StartService: ошибка {err}"));
+            }
+            return Ok(());
+        }
+        CloseServiceHandle(service);
+        CloseServiceHandle(scm);
+    }
+    log_line("служба запущена (из интерфейса)");
+    Ok(())
+}
+
+/// Остановить службу.
+pub fn stop() -> Result<(), String> {
+    unsafe {
+        let scm = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_ALL_ACCESS);
+        if scm.is_null() {
+            return Err(format!(
+                "OpenSCManager: ошибка {} (нужны права администратора)",
+                GetLastError()
+            ));
+        }
+        let name = wide(SERVICE_NAME);
+        let service = OpenServiceW(scm, name.as_ptr(), SERVICE_STOP | SERVICE_QUERY_STATUS);
+        if service.is_null() {
+            let err = GetLastError();
+            CloseServiceHandle(scm);
+            if err == ERROR_SERVICE_DOES_NOT_EXIST {
+                return Err("служба не установлена".to_string());
+            }
+            return Err(format!("OpenService: ошибка {err}"));
+        }
+        let mut st = ServiceStatus {
+            service_type: 0,
+            current_state: 0,
+            controls_accepted: 0,
+            win32_exit_code: 0,
+            service_specific_exit_code: 0,
+            checkpoint: 0,
+            wait_hint: 0,
+        };
+        if ControlService(service, SERVICE_CONTROL_STOP, &mut st) == 0 {
+            let err = GetLastError();
+            CloseServiceHandle(service);
+            CloseServiceHandle(scm);
+            if err == ERROR_SERVICE_NOT_ACTIVE {
+                return Ok(());
+            }
+            return Err(format!("ControlService: ошибка {err}"));
+        }
+        for _ in 0..40 {
+            if QueryServiceStatus(service, &mut st) == 0 || st.current_state == SERVICE_STOPPED {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        CloseServiceHandle(service);
+        CloseServiceHandle(scm);
+    }
+    log_line("служба остановлена (из интерфейса)");
+    Ok(())
+}
+
 #[link(name = "advapi32")]
 unsafe extern "system" {
     fn OpenSCManagerW(machine: *const u16, database: *const u16, access: u32) -> *mut c_void;
@@ -388,9 +719,39 @@ unsafe extern "system" {
         handler: Option<unsafe extern "system" fn(u32)>,
     ) -> *mut c_void;
     fn SetServiceStatus(handle: *mut c_void, status: &ServiceStatus) -> i32;
+    fn OpenProcessToken(process: *mut c_void, access: u32, token: *mut *mut c_void) -> i32;
+    fn DuplicateTokenEx(
+        existing: *mut c_void,
+        access: u32,
+        attrs: *mut c_void,
+        impersonation_level: u32,
+        token_type: u32,
+        new_token: *mut *mut c_void,
+    ) -> i32;
+    fn SetTokenInformation(token: *mut c_void, class: u32, info: *const c_void, len: u32) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn CreateProcessAsUserW(
+        token: *mut c_void,
+        app_name: *const u16,
+        command_line: *mut u16,
+        process_attrs: *mut c_void,
+        thread_attrs: *mut c_void,
+        inherit_handles: i32,
+        flags: u32,
+        environment: *const c_void,
+        current_dir: *const u16,
+        startup_info: *const StartupInfoW,
+        process_info: *mut ProcessInformationW,
+    ) -> i32;
 }
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetLastError() -> u32;
+    fn GetCurrentProcess() -> *mut c_void;
+    fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+    fn WaitForSingleObject(handle: *mut c_void, millis: u32) -> i32;
+    fn TerminateProcess(handle: *mut c_void, code: u32) -> i32;
+    fn CloseHandle(handle: *mut c_void) -> i32;
+    fn WTSGetActiveConsoleSessionId() -> u32;
 }
