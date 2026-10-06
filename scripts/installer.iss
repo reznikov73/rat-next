@@ -38,6 +38,24 @@ UninstallDisplayIcon={app}\rat.exe
 Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
+[Code]
+function IsAdminInstall: Boolean;
+begin
+  { Службы ставятся только при установке с правами администратора. }
+  Result := IsAdmin;
+end;
+
+function NoRatService: Boolean;
+begin
+  { Не предлагать «запустить сейчас», если поставлена служба — агент уже работает. }
+  Result := not WizardIsTaskSelected('service_rat');
+end;
+
+function NoRelayService: Boolean;
+begin
+  Result := not WizardIsTaskSelected('service_relay');
+end;
+
 [Types]
 Name: "default"; Description: "Обычная установка (Rat Next)"
 Name: "custom"; Description: "Выборочная установка"; Flags: iscustom
@@ -47,9 +65,11 @@ Name: "rat"; Description: "Rat Next — приложение (плитки, по
 Name: "relay"; Description: "Relay-сервер (интернет-режим; обычно только на сервере)"
 
 [Tasks]
-Name: "autostart"; Description: "Запускать Rat Next при входе в Windows (рекомендуется)"; GroupDescription: "Дополнительные параметры:"; Components: rat
+Name: "service_rat"; Description: "Служба Rat Next — доступен с загрузки Windows, без входа пользователя (рекомендуется)"; GroupDescription: "Дополнительные параметры:"; Components: rat; Check: IsAdminInstall
+Name: "autostart"; Description: "Запускать Rat Next при входе в Windows (простая схема, без службы)"; GroupDescription: "Дополнительные параметры:"; Flags: unchecked; Components: rat
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "Дополнительные параметры:"; Flags: unchecked; Components: rat
-Name: "relay_autostart"; Description: "Запускать relay при входе в Windows"; GroupDescription: "Дополнительные параметры:"; Flags: unchecked; Components: relay
+Name: "service_relay"; Description: "Служба relay — запуск с загрузки Windows (для серверных машин)"; GroupDescription: "Дополнительные параметры:"; Flags: unchecked; Components: relay; Check: IsAdminInstall
+Name: "relay_autostart"; Description: "Запускать relay при входе в Windows (простая схема, без службы)"; GroupDescription: "Дополнительные параметры:"; Flags: unchecked; Components: relay
 
 [Files]
 Source: "{#PayloadDir}\rat.exe"; DestDir: "{app}"; Components: rat; Flags: ignoreversion
@@ -75,14 +95,18 @@ Name: "{group}\{cm:UninstallProgram,Rat Next}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\Rat Next"; Filename: "{app}\rat.exe"; Tasks: desktopicon; Components: rat
 
 [Run]
+Filename: "{app}\rat.exe"; Parameters: "--install-service"; Tasks: service_rat; Components: rat; Flags: runhidden; StatusMsg: "Устанавливаю службу Rat Next…"
+Filename: "{app}\rat-relay.exe"; Parameters: "--install-service"; Tasks: service_relay; Components: relay; Flags: runhidden; StatusMsg: "Устанавливаю службу relay…"
 Filename: "{app}\rat.exe"; Parameters: "--install-autostart"; Tasks: autostart; Components: rat; Flags: runhidden; StatusMsg: "Включаю автозапуск…"
 Filename: "{app}\rat-relay.exe"; Parameters: "--install-autostart"; Tasks: relay_autostart; Components: relay; Flags: runhidden; StatusMsg: "Включаю автозапуск relay…"
-Filename: "{app}\rat.exe"; Description: "{cm:LaunchProgram,Rat Next}"; Components: rat; Flags: nowait postinstall skipifsilent
-Filename: "{app}\rat-relay.exe"; Description: "Запустить relay-сервер"; Components: relay; Flags: nowait postinstall skipifsilent
+Filename: "{app}\rat.exe"; Description: "{cm:LaunchProgram,Rat Next}"; Components: rat; Flags: nowait postinstall skipifsilent; Check: NoRatService
+Filename: "{app}\rat-relay.exe"; Description: "Запустить relay-сервер"; Components: relay; Flags: nowait postinstall skipifsilent; Check: NoRelayService
 
 [UninstallRun]
 ; Без Components: файла нет — команда пропускается (skipifdoesntexist),
 ; поэтому логика верна для любой комбинации установленных компонентов.
+Filename: "{app}\rat.exe"; Parameters: "--uninstall-service"; Flags: runhidden skipifdoesntexist; RunOnceId: "RemoveService"
+Filename: "{app}\rat-relay.exe"; Parameters: "--uninstall-service"; Flags: runhidden skipifdoesntexist; RunOnceId: "RemoveRelayService"
 Filename: "{app}\rat.exe"; Parameters: "--remove-autostart"; Flags: runhidden skipifdoesntexist; RunOnceId: "RemoveAutostart"
 Filename: "{app}\rat-relay.exe"; Parameters: "--remove-autostart"; Flags: runhidden skipifdoesntexist; RunOnceId: "RemoveRelayAutostart"
 

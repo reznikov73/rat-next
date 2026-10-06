@@ -13,6 +13,8 @@
 //! rat.exe --autoconnect 192.168.1.50:55140
 //! rat.exe --relay 91.x.x.x:55141 --device-id 123456           # интернет-режим
 //! rat.exe --tray                              # стартовать сразу в трее (без окна)
+//! rat.exe --install-service                   # служба: доступен с загрузки Windows (рекомендуется)
+//! rat.exe --uninstall-service                 # снять службу
 //! rat.exe --install-autostart                 # автозапуск при входе в Windows
 //! rat.exe --remove-autostart                  # выключить автозапуск
 //! rat.exe --smoke=15                       # авто-выход через 15 сек (тесты)
@@ -31,6 +33,10 @@ struct Args {
     tray: bool,
     install_autostart: bool,
     remove_autostart: bool,
+    install_service: bool,
+    uninstall_service: bool,
+    service: bool,
+    service_helper: bool,
 }
 
 #[cfg_attr(not(feature = "ffmpeg"), allow(dead_code))]
@@ -46,6 +52,10 @@ fn parse_args() -> Args {
         tray: false,
         install_autostart: false,
         remove_autostart: false,
+        install_service: false,
+        uninstall_service: false,
+        service: false,
+        service_helper: false,
     };
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -74,6 +84,22 @@ fn parse_args() -> Args {
             }
             "--tray" => {
                 a.tray = true;
+                i += 1;
+            }
+            "--install-service" => {
+                a.install_service = true;
+                i += 1;
+            }
+            "--uninstall-service" => {
+                a.uninstall_service = true;
+                i += 1;
+            }
+            "--service" => {
+                a.service = true;
+                i += 1;
+            }
+            "--service-helper" => {
+                a.service_helper = true;
                 i += 1;
             }
             "--relay" if i + 1 < args.len() => {
@@ -111,6 +137,41 @@ fn main() {
 #[cfg(feature = "ffmpeg")]
 fn main() {
     let args = parse_args();
+    if args.install_service {
+        match service::install() {
+            Ok(()) => {
+                note("service: установлена служба «RatNext» (задача автозапуска убрана)");
+                println!("Служба установлена: агент будет доступен с момента загрузки Windows.");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                note(&format!("service: ошибка установки: {e}"));
+                eprintln!("service: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if args.uninstall_service {
+        match service::uninstall() {
+            Ok(()) => {
+                note("service: служба удалена");
+                println!("Служба удалена.");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                note(&format!("service: ошибка удаления: {e}"));
+                eprintln!("service: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if args.service {
+        if let Err(e) = service::run_service() {
+            note(&format!("service: {e}"));
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.install_autostart {
         match autostart::install() {
             Ok(()) => {
@@ -140,7 +201,7 @@ fn main() {
         }
     }
     if !rat_session::single_instance::try_acquire("app") {
-        if args.smoke.is_none() {
+        if args.smoke.is_none() && !args.service_helper {
             rat_session::single_instance::warn(
                 "Rat Next",
                 "Rat Next уже запущен.\nОкно можно открыть из значка в трее.",
@@ -193,6 +254,9 @@ fn note(s: &str) {
 mod icon;
 
 /// Значок в области уведомлений.
+#[cfg(feature = "ffmpeg")]
+mod service;
+
 #[cfg(feature = "ffmpeg")]
 mod tray;
 

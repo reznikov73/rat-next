@@ -9,6 +9,8 @@
 //! rat-relay.exe --install-autostart       # включить автозапуск (задача «Rat Next relay», старт в трей)
 //! rat-relay.exe --remove-autostart        # выключить автозапуск
 //! rat-relay.exe --tray                    # старт сразу свёрнутым в трей
+//! rat-relay.exe --install-service         # поставить службу (автозапуск при загрузке Windows)
+//! rat-relay.exe --uninstall-service       # снять службу
 //! ```
 
 #![cfg_attr(not(test), windows_subsystem = "windows")]
@@ -17,6 +19,7 @@ mod autostart;
 mod core;
 mod icon;
 mod port;
+mod service;
 mod settings;
 mod tray;
 mod ui;
@@ -30,6 +33,9 @@ fn main() {
     let mut install_autostart = false;
     let mut remove_autostart = false;
     let mut start_hidden = false;
+    let mut install_service = false;
+    let mut uninstall_service = false;
+    let mut service_mode = false;
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < args.len() {
@@ -50,6 +56,18 @@ fn main() {
                 start_hidden = true;
                 i += 1;
             }
+            "--install-service" => {
+                install_service = true;
+                i += 1;
+            }
+            "--uninstall-service" => {
+                uninstall_service = true;
+                i += 1;
+            }
+            "--service" => {
+                service_mode = true;
+                i += 1;
+            }
             s if s.starts_with("--smoke=") => {
                 smoke = s["--smoke=".len()..].parse().ok();
                 i += 1;
@@ -59,6 +77,35 @@ fn main() {
                 i += 1;
             }
         }
+    }
+    if install_service || uninstall_service {
+        let res = if install_service {
+            service::install()
+        } else {
+            service::uninstall()
+        };
+        match res {
+            Ok(()) => {
+                println!("служба relay обновлена");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("service: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if service_mode {
+        // У службы отдельный экземплярный мьютекс: GUI-версия и служба не считаются
+        // «двойным запуском» (конфликт порта, если что, виден в интерфейсе).
+        if !rat_session::single_instance::try_acquire("relay-svc") {
+            std::process::exit(2);
+        }
+        if let Err(e) = service::run_service() {
+            eprintln!("service: {e}");
+            std::process::exit(1);
+        }
+        return;
     }
     if install_autostart || remove_autostart {
         let res = if install_autostart {
