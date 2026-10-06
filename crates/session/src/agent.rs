@@ -867,8 +867,9 @@ fn cursor_image(handle: usize) -> Option<(u16, u16, i16, i16, Vec<u8>)> {
 
 /// Прочитать HBITMAP как 32bpp BGRA сверху вниз.
 unsafe fn read_dib(hbm: windows::Win32::Graphics::Gdi::HBITMAP, w: i32, h: i32) -> Option<Vec<u8>> {
+    use windows::Win32::Foundation::HWND;
     use windows::Win32::Graphics::Gdi::{
-        BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, GetDIBits, HDC,
+        BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, GetDC, GetDIBits, ReleaseDC,
     };
     if hbm.is_invalid() || w <= 0 || h <= 0 {
         return None;
@@ -880,9 +881,14 @@ unsafe fn read_dib(hbm: windows::Win32::Graphics::Gdi::HBITMAP, w: i32, h: i32) 
     bi.bmiHeader.biPlanes = 1;
     bi.bmiHeader.biBitCount = 32;
     let mut buf = vec![0u8; (w * h * 4) as usize];
+    // Конверсия битовых форматов (в т.ч. маски 1bpp → 32bpp) требует контекст
+    // устройства: с NULL монохромная маска не читается, и весь прямоугольник
+    // курсора выходит непрозрачным («чёрный квадрат»).
+    let null = HWND(std::ptr::null_mut());
+    let hdc = unsafe { GetDC(null) };
     let lines = unsafe {
         GetDIBits(
-            HDC(std::ptr::null_mut()),
+            hdc,
             hbm,
             0,
             h as u32,
@@ -891,6 +897,7 @@ unsafe fn read_dib(hbm: windows::Win32::Graphics::Gdi::HBITMAP, w: i32, h: i32) 
             DIB_RGB_COLORS,
         )
     };
+    let _ = unsafe { ReleaseDC(null, hdc) };
     if lines == h { Some(buf) } else { None }
 }
 
@@ -1086,5 +1093,41 @@ fn set_above_normal() {
             GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
         };
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    }
+}
+
+#[cfg(test)]
+mod cursor_image_tests {
+    use super::cursor_image;
+    use windows::Win32::UI::WindowsAndMessaging::{IDC_ARROW, IDC_IBEAM, LoadCursorW};
+
+    /// Системный курсор-стрелка: картинка читается, альфа настоящая,
+    /// хотспот в кончике.
+    #[test]
+    fn system_arrow_extracts_with_alpha() {
+        let hcur = unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap();
+        let (w, h, hx, hy, rgba) = cursor_image(hcur.0 as usize).expect("картинка стрелки");
+        assert!(
+            (16..=128).contains(&w) && (16..=128).contains(&h),
+            "{w}x{h}"
+        );
+        assert_eq!(rgba.len(), w as usize * h as usize * 4);
+        let alphas: Vec<u8> = rgba.as_chunks::<4>().0.iter().map(|p| p[3]).collect();
+        assert!(alphas.contains(&0), "нет прозрачных пикселей");
+        assert!(alphas.contains(&255), "нет непрозрачных пикселей");
+        assert!(
+            hx <= 2 && hy <= 2,
+            "хотспот стрелки не в кончике: {hx},{hy}"
+        );
+    }
+
+    /// Текстовый курсор: картинка читается, хотспот внутри её области.
+    #[test]
+    fn system_ibeam_extracts() {
+        let hcur = unsafe { LoadCursorW(None, IDC_IBEAM) }.unwrap();
+        let (w, h, hx, hy, _) = cursor_image(hcur.0 as usize).expect("картинка I-beam");
+        println!("IBEAM {}x{} hotspot {hx},{hy}", w, h);
+        assert!(hx >= 0 && hx < w as i16, "hotspot x вне картинки: {hx}");
+        assert!(hy >= 0 && hy < h as i16, "hotspot y вне картинки: {hy}");
     }
 }
