@@ -35,6 +35,8 @@ struct Args {
     remove_autostart: bool,
     install_service: bool,
     uninstall_service: bool,
+    start_service: bool,
+    stop_service: bool,
     service: bool,
     service_helper: bool,
 }
@@ -54,6 +56,8 @@ fn parse_args() -> Args {
         remove_autostart: false,
         install_service: false,
         uninstall_service: false,
+        start_service: false,
+        stop_service: false,
         service: false,
         service_helper: false,
     };
@@ -92,6 +96,14 @@ fn parse_args() -> Args {
             }
             "--uninstall-service" => {
                 a.uninstall_service = true;
+                i += 1;
+            }
+            "--start-service" => {
+                a.start_service = true;
+                i += 1;
+            }
+            "--stop-service" => {
+                a.stop_service = true;
                 i += 1;
             }
             "--service" => {
@@ -160,6 +172,34 @@ fn main() {
             }
             Err(e) => {
                 note(&format!("service: ошибка удаления: {e}"));
+                eprintln!("service: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if args.start_service {
+        match service::start() {
+            Ok(()) => {
+                note("service: служба запущена (из интерфейса)");
+                println!("Служба запущена.");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                note(&format!("service: ошибка запуска: {e}"));
+                eprintln!("service: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if args.stop_service {
+        match service::stop() {
+            Ok(()) => {
+                note("service: служба остановлена (из интерфейса)");
+                println!("Служба остановлена.");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                note(&format!("service: ошибка остановки: {e}"));
                 eprintln!("service: {e}");
                 std::process::exit(1);
             }
@@ -260,6 +300,8 @@ fn note(s: &str) {
 mod icon;
 
 /// Значок в области уведомлений.
+#[cfg(feature = "ffmpeg")]
+mod elevate;
 #[cfg(feature = "ffmpeg")]
 mod service;
 
@@ -1160,6 +1202,12 @@ mod ui {
         shown_for_dialog: bool,
         /// Запущено ли с повышенными правами (иначе действует UIPI-ограничение).
         elevated: bool,
+        /// Состояние службы «RatNext» (для окна настроек).
+        #[cfg(feature = "ffmpeg")]
+        svc_state: crate::service::State,
+        /// Время последнего опроса состояния службы.
+        #[cfg(feature = "ffmpeg")]
+        svc_checked: Instant,
         /// Запрос «показать окно» от повторного запуска exe.
         show_request: Option<rat_session::single_instance::ShowListener>,
         /// Контекст egui для слушателя повторного запуска (будит перерисовку).
@@ -1318,6 +1366,10 @@ mod ui {
                 tray_hide_done: false,
                 shown_for_dialog: false,
                 elevated: rat_session::elevation::is_elevated(),
+                #[cfg(feature = "ffmpeg")]
+                svc_state: crate::service::State::NotInstalled,
+                #[cfg(feature = "ffmpeg")]
+                svc_checked: Instant::now(),
                 show_request,
                 repaint_slot,
                 args,
@@ -1776,6 +1828,12 @@ mod ui {
             }
 
             if self.settings_open {
+                // Служба: состояние опрашиваем не чаще раза в секунду.
+                #[cfg(feature = "ffmpeg")]
+                if self.svc_checked.elapsed() > std::time::Duration::from_secs(1) {
+                    self.svc_checked = Instant::now();
+                    self.svc_state = crate::service::status();
+                }
                 let mut open = true;
                 let mut apply = false;
                 let mut cancel = false;
@@ -1821,6 +1879,70 @@ mod ui {
                             &mut self.settings_autostart,
                             "Запускать при входе в Windows (сразу в трее)",
                         );
+                        #[cfg(feature = "ffmpeg")]
+                        {
+                            ui.separator();
+                            ui.label("Служба Windows — агент доступен с загрузки системы:");
+                            let (state_txt, state_col) = match self.svc_state {
+                                crate::service::State::NotInstalled => {
+                                    ("не установлена", egui::Color32::from_gray(130))
+                                }
+                                crate::service::State::Stopped => {
+                                    ("остановлена", egui::Color32::from_rgb(230, 120, 30))
+                                }
+                                crate::service::State::Running => ("работает", ON),
+                                crate::service::State::Pending => {
+                                    ("меняется…", egui::Color32::from_rgb(150, 150, 60))
+                                }
+                            };
+                            ui.horizontal(|ui| {
+                                ui.label("Состояние:");
+                                ui.colored_label(state_col, state_txt);
+                            });
+                            let not_installed =
+                                matches!(self.svc_state, crate::service::State::NotInstalled);
+                            let running = matches!(self.svc_state, crate::service::State::Running);
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add_enabled(not_installed, egui::Button::new("Установить"))
+                                    .clicked()
+                                {
+                                    self.svc_action(crate::service::Op::Install);
+                                }
+                                if ui
+                                    .add_enabled(
+                                        !not_installed && !running,
+                                        egui::Button::new("Запустить"),
+                                    )
+                                    .clicked()
+                                {
+                                    self.svc_action(crate::service::Op::Start);
+                                }
+                                if ui
+                                    .add_enabled(
+                                        !not_installed && running,
+                                        egui::Button::new("Остановить"),
+                                    )
+                                    .clicked()
+                                {
+                                    self.svc_action(crate::service::Op::Stop);
+                                }
+                                if ui
+                                    .add_enabled(!not_installed, egui::Button::new("Удалить"))
+                                    .clicked()
+                                {
+                                    self.svc_action(crate::service::Op::Uninstall);
+                                }
+                            });
+                            ui.label(
+                                egui::RichText::new(
+                                    "Для установки, удаления и остановки Windows \
+                                     запросит права администратора.",
+                                )
+                                .small()
+                                .color(egui::Color32::from_gray(150)),
+                            );
+                        }
                         if let Some(error) = &self.settings_error {
                             ui.colored_label(OFF, error);
                         }
@@ -2698,6 +2820,46 @@ mod ui {
     }
 
     impl RatApp {
+        /// Операция со службой из интерфейса: сразу или через запрос UAC.
+        #[cfg(feature = "ffmpeg")]
+        fn svc_action(&mut self, op: crate::service::Op) {
+            let (flag, name): (&str, &str) = match op {
+                crate::service::Op::Install => ("--install-service", "Установка службы"),
+                crate::service::Op::Uninstall => ("--uninstall-service", "Удаление службы"),
+                crate::service::Op::Start => ("--start-service", "Запуск службы"),
+                crate::service::Op::Stop => ("--stop-service", "Остановка службы"),
+            };
+            let result = match op {
+                crate::service::Op::Install => crate::service::install(),
+                crate::service::Op::Uninstall => crate::service::uninstall(),
+                crate::service::Op::Start => crate::service::start(),
+                crate::service::Op::Stop => crate::service::stop(),
+            };
+            match result {
+                Ok(()) => {
+                    self.svc_state = crate::service::status();
+                    self.svc_checked = Instant::now();
+                    self.toast(format!("{name}: выполнено"));
+                }
+                Err(e) => {
+                    if e.contains("ошибка 5") {
+                        match crate::elevate::relaunch(flag) {
+                            Ok(()) => {
+                                self.svc_state = crate::service::State::Pending;
+                                self.svc_checked = Instant::now();
+                                self.toast(format!(
+                                    "{name}: подтвердите запрос прав администратора"
+                                ));
+                            }
+                            Err(e2) => self.toast(format!("{name}: {e2}")),
+                        }
+                    } else {
+                        self.toast(format!("{name}: {e}"));
+                    }
+                }
+            }
+        }
+
         /// Отключиться от удалённого ПК и вернуться к списку машин.
         fn close_viewer(&mut self) {
             if let Some(mut s) = self.viewer.take() {

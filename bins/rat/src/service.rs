@@ -51,6 +51,12 @@ const ERROR_SERVICE_EXISTS: u32 = 1073;
 const ERROR_SERVICE_ALREADY_RUNNING: u32 = 1056;
 const ERROR_SERVICE_DOES_NOT_EXIST: u32 = 1060;
 
+const SC_MANAGER_CONNECT: u32 = 0x0001;
+const SERVICE_QUERY_STATUS: u32 = 0x0004;
+const SERVICE_START: u32 = 0x0010;
+const SERVICE_STOP: u32 = 0x0020;
+const ERROR_SERVICE_NOT_ACTIVE: u32 = 1062;
+
 const TOKEN_ALL_ACCESS: u32 = 0x000F_01FF;
 const WAIT_TIMEOUT: i32 = 0x0000_0102;
 
@@ -517,6 +523,151 @@ pub fn uninstall() -> Result<(), String> {
         CloseServiceHandle(scm);
     }
     log_line("служба удалена");
+    Ok(())
+}
+
+/// Состояние службы для интерфейса.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum State {
+    /// Служба не зарегистрирована.
+    NotInstalled,
+    /// Зарегистрирована, но остановлена.
+    Stopped,
+    /// Работает.
+    Running,
+    /// Запускается или останавливается.
+    Pending,
+}
+
+/// Операция со службой из интерфейса.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Op {
+    Install,
+    Start,
+    Stop,
+    Uninstall,
+}
+
+/// Узнать состояние службы (только чтение, прав администратора не требует).
+pub fn status() -> State {
+    unsafe {
+        let scm = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT);
+        if scm.is_null() {
+            return State::NotInstalled;
+        }
+        let name = wide(SERVICE_NAME);
+        let service = OpenServiceW(scm, name.as_ptr(), SERVICE_QUERY_STATUS);
+        if service.is_null() {
+            CloseServiceHandle(scm);
+            return State::NotInstalled;
+        }
+        let mut st = ServiceStatus {
+            service_type: 0,
+            current_state: 0,
+            controls_accepted: 0,
+            win32_exit_code: 0,
+            service_specific_exit_code: 0,
+            checkpoint: 0,
+            wait_hint: 0,
+        };
+        let ok = QueryServiceStatus(service, &mut st);
+        CloseServiceHandle(service);
+        CloseServiceHandle(scm);
+        if ok == 0 {
+            return State::NotInstalled;
+        }
+        match st.current_state {
+            SERVICE_RUNNING => State::Running,
+            SERVICE_STOPPED => State::Stopped,
+            _ => State::Pending,
+        }
+    }
+}
+
+/// Запустить установленную службу.
+pub fn start() -> Result<(), String> {
+    unsafe {
+        let scm = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_ALL_ACCESS);
+        if scm.is_null() {
+            return Err(format!(
+                "OpenSCManager: ошибка {} (нужны права администратора)",
+                GetLastError()
+            ));
+        }
+        let name = wide(SERVICE_NAME);
+        let service = OpenServiceW(scm, name.as_ptr(), SERVICE_START | SERVICE_QUERY_STATUS);
+        if service.is_null() {
+            let err = GetLastError();
+            CloseServiceHandle(scm);
+            if err == ERROR_SERVICE_DOES_NOT_EXIST {
+                return Err("служба не установлена (сначала установите)".to_string());
+            }
+            return Err(format!("OpenService: ошибка {err}"));
+        }
+        if StartServiceW(service, 0, std::ptr::null()) == 0 {
+            let err = GetLastError();
+            CloseServiceHandle(service);
+            CloseServiceHandle(scm);
+            if err != ERROR_SERVICE_ALREADY_RUNNING {
+                return Err(format!("StartService: ошибка {err}"));
+            }
+            return Ok(());
+        }
+        CloseServiceHandle(service);
+        CloseServiceHandle(scm);
+    }
+    log_line("служба запущена (из интерфейса)");
+    Ok(())
+}
+
+/// Остановить службу.
+pub fn stop() -> Result<(), String> {
+    unsafe {
+        let scm = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_ALL_ACCESS);
+        if scm.is_null() {
+            return Err(format!(
+                "OpenSCManager: ошибка {} (нужны права администратора)",
+                GetLastError()
+            ));
+        }
+        let name = wide(SERVICE_NAME);
+        let service = OpenServiceW(scm, name.as_ptr(), SERVICE_STOP | SERVICE_QUERY_STATUS);
+        if service.is_null() {
+            let err = GetLastError();
+            CloseServiceHandle(scm);
+            if err == ERROR_SERVICE_DOES_NOT_EXIST {
+                return Err("служба не установлена".to_string());
+            }
+            return Err(format!("OpenService: ошибка {err}"));
+        }
+        let mut st = ServiceStatus {
+            service_type: 0,
+            current_state: 0,
+            controls_accepted: 0,
+            win32_exit_code: 0,
+            service_specific_exit_code: 0,
+            checkpoint: 0,
+            wait_hint: 0,
+        };
+        if ControlService(service, SERVICE_CONTROL_STOP, &mut st) == 0 {
+            let err = GetLastError();
+            CloseServiceHandle(service);
+            CloseServiceHandle(scm);
+            if err == ERROR_SERVICE_NOT_ACTIVE {
+                return Ok(());
+            }
+            return Err(format!("ControlService: ошибка {err}"));
+        }
+        for _ in 0..40 {
+            if QueryServiceStatus(service, &mut st) == 0 || st.current_state == SERVICE_STOPPED {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        CloseServiceHandle(service);
+        CloseServiceHandle(scm);
+    }
+    log_line("служба остановлена (из интерфейса)");
     Ok(())
 }
 
