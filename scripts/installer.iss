@@ -39,6 +39,22 @@ Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Code]
+procedure StopOldServices;
+var
+  ResultCode: Integer;
+begin
+  { Обновление поверх работающей службы: останавливаем, чтобы можно было
+    заменить файлы; в конце установки службы запускаются заново. }
+  Exec('sc.exe', 'stop RatNext', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec('sc.exe', 'stop RatNextRelay', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssInstall then
+    StopOldServices;
+end;
+
 function IsAdminInstall: Boolean;
 begin
   { Службы ставятся только при установке с правами администратора. }

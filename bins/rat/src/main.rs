@@ -1138,6 +1138,9 @@ mod ui {
         hidden: bool,
         /// Первый кадр: при `--tray` спрятать окно.
         tray_hide_done: bool,
+        /// Окно показали автоматически ради диалога подтверждения —
+        /// после ответа его нужно вернуть в трей.
+        shown_for_dialog: bool,
     }
 
     impl RatApp {
@@ -1283,6 +1286,7 @@ mod ui {
                 quitting: false,
                 hidden: false,
                 tray_hide_done: false,
+                shown_for_dialog: false,
                 args,
             }
         }
@@ -1668,6 +1672,7 @@ mod ui {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     self.hidden = false;
+                    self.shown_for_dialog = true;
                 }
             }
             let request_expired = self
@@ -1711,6 +1716,12 @@ mod ui {
                 && let Some(request) = self.incoming_pending.take()
             {
                 let _ = request.reply.send(allowed);
+            }
+            // Если окно разбудили только ради подтверждения — вернуть его в трей.
+            if self.incoming_pending.is_none() && self.shown_for_dialog {
+                self.shown_for_dialog = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                self.hidden = true;
             }
 
             if self.settings_open {
@@ -2632,7 +2643,13 @@ mod ui {
     impl RatApp {
         /// Крестик окна прячет приложение в трей, сессии продолжают работать.
         fn handle_close(&mut self, ctx: &egui::Context) {
-            if self.quitting || self.tray.is_none() {
+            if self.quitting {
+                return;
+            }
+            // В режиме агента (--tray) закрытие окна только прячет его: агент
+            // продолжает работать, иначе служба перезапускала бы его по кругу,
+            // а активная сессия оператора рвалась бы.
+            if self.tray.is_none() && !self.args.tray {
                 return;
             }
             if ctx.input(|i| i.viewport().close_requested()) {
@@ -2670,7 +2687,9 @@ mod ui {
             self.handle_close(&ctx);
             if !self.tray_hide_done {
                 self.tray_hide_done = true;
-                if self.args.tray && self.tray.is_some() {
+                // Режим агента (--tray, служба): окно стартует скрытым даже без
+                // значка трея — на управляемой машине окно не должно висеть.
+                if self.args.tray {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                     self.hidden = true;
                 }
