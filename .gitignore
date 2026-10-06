@@ -12,6 +12,7 @@
 .autoclaw/
 .cluster/
 .opencode/
+.gigacode_vsc/
 projects/
 
 # --- Спайки: их собственные target/out ---
