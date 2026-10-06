@@ -1367,7 +1367,7 @@ mod ui {
         prev_mods: egui::Modifiers,
         buttons_down: [bool; 5],
         ui_e2e_ms: Vec<f32>,
-        cursor_img: Arc<Mutex<rat_session::viewer::CursorImage>>,
+        cursor_img: Arc<Mutex<Option<rat_session::viewer::CursorImage>>>,
         cursor_img_ver: Arc<std::sync::atomic::AtomicU64>,
         cursor_tex: Option<egui::TextureHandle>,
         cursor_tex_ver: u64,
@@ -1679,7 +1679,7 @@ mod ui {
                         let pending_switch: Arc<Mutex<Option<u16>>> = Arc::new(Mutex::new(None));
                         let clip_in: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
                         let pending_paste: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-                        let cursor_img: Arc<Mutex<rat_session::viewer::CursorImage>> =
+                        let cursor_img: Arc<Mutex<Option<rat_session::viewer::CursorImage>>> =
                             Arc::new(Mutex::new(None));
                         let cursor_img_ver = Arc::new(std::sync::atomic::AtomicU64::new(0));
                         let handle = spawn_viewer(
@@ -3002,10 +3002,10 @@ mod ui {
                     let ver = v.cursor_img_ver.load(Ordering::Relaxed);
                     if ver != v.cursor_tex_ver {
                         v.cursor_tex_ver = ver;
-                        v.cursor_tex = img.as_ref().map(|(w, h, _, _, rgba)| {
+                        v.cursor_tex = img.as_ref().map(|c| {
                             let image = egui::ColorImage::from_rgba_unmultiplied(
-                                [*w as usize, *h as usize],
-                                rgba,
+                                [c.w as usize, c.h as usize],
+                                &c.rgba,
                             );
                             ui.ctx().load_texture(
                                 "rat-cursor-img",
@@ -3014,12 +3014,19 @@ mod ui {
                             )
                         });
                     }
-                    if let (Some((w, h, hx, hy, _)), Some(tex)) = (&img, v.cursor_tex.as_ref()) {
-                        let min =
-                            egui::pos2(pos.x - *hx as f32 * scale, pos.y - *hy as f32 * scale);
+                    // Точная картинка — только если она от ТЕКУЩЕГО вида курсора;
+                    // иначе рисуем форму (стрелка/палка/рука) — лучше верная форма,
+                    // чем чужая картинка.
+                    if let (Some(c), Some(tex)) = (&img, v.cursor_tex.as_ref())
+                        && c.kind == cs.kind
+                    {
+                        let min = egui::pos2(
+                            pos.x - c.hot_x as f32 * scale,
+                            pos.y - c.hot_y as f32 * scale,
+                        );
                         let rect = egui::Rect::from_min_size(
                             min,
-                            egui::vec2(*w as f32 * scale, *h as f32 * scale),
+                            egui::vec2(c.w as f32 * scale, c.h as f32 * scale),
                         );
                         ui.painter().image(
                             tex.id(),

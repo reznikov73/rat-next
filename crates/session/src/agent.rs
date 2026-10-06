@@ -377,7 +377,7 @@ pub fn spawn_agent(
         // Курсор: отправляем не чаще ~30 Гц и только при изменении.
         let mut last_cursor_t = Instant::now() - Duration::from_secs(1);
         let mut last_cursor: Option<(u16, u16, bool, u8)> = None;
-        let mut last_cursor_handle: usize = 0;
+        let mut last_cursor_img_key: (usize, u8) = (0, 0);
 
         // Буфер обмена: следим за текстом и пересылаем вьюеру изменения.
         let mut last_clip_t = Instant::now() - Duration::from_secs(1);
@@ -546,13 +546,24 @@ pub fn spawn_agent(
                         last_cursor = Some((cx, cy, vis, kind));
                         stats_b.lock().unwrap().cursor_sent += 1;
                     }
-                    // Настоящая картинка курсора — при смене (редко).
-                    if hcur != 0 && hcur != last_cursor_handle {
-                        last_cursor_handle = hcur;
-                        if let Some((w, h, hx, hy, rgba)) = cursor_image(hcur) {
-                            let mut img = Vec::with_capacity(10 + rgba.len());
-                            input::pack_cursor_img(&mut img, w, h, hx, hy, &rgba);
-                            mux.push(Channel::Control, 0, &img);
+                    // Настоящая картинка курсора — при смене вида/хэндла; при
+                    // ошибке ключ не запоминаем, чтобы повторить на следующем
+                    // тике (хэндлы Windows переиспользуются — полагаться только
+                    // на их значение нельзя).
+                    if hcur != 0 {
+                        let key = (hcur, kind);
+                        if key != last_cursor_img_key {
+                            match cursor_image(hcur) {
+                                Ok((w, h, hx, hy, rgba)) => {
+                                    let mut img = Vec::with_capacity(11 + rgba.len());
+                                    input::pack_cursor_img(&mut img, w, h, hx, hy, kind, &rgba);
+                                    mux.push(Channel::Control, 0, &img);
+                                    last_cursor_img_key = key;
+                                }
+                                Err(e) => {
+                                    stats_b.lock().unwrap().last_error = format!("курсор: {e}");
+                                }
+                            }
                         }
                     }
                 }
@@ -843,18 +854,19 @@ fn cursor_kind(h: windows::Win32::UI::WindowsAndMessaging::HCURSOR) -> u8 {
 
 /// Настоящая картинка курсора: (w, h, hot_x, hot_y, RGBA сверху вниз).
 /// Работает и для кастомных курсоров приложений; монохромные собираются из маски.
-fn cursor_image(handle: usize) -> Option<(u16, u16, i16, i16, Vec<u8>)> {
+fn cursor_image(handle: usize) -> Result<(u16, u16, i16, i16, Vec<u8>), String> {
     use windows::Win32::Graphics::Gdi::{DeleteObject, HGDIOBJ};
     use windows::Win32::UI::WindowsAndMessaging::{GetIconInfo, HCURSOR, ICONINFO};
     if handle == 0 {
-        return None;
+        return Err("пустой хэндл курсора".to_string());
     }
     unsafe {
         let mut ii: ICONINFO = std::mem::zeroed();
         if GetIconInfo(HCURSOR(handle as *mut core::ffi::c_void), &mut ii).is_err() {
-            return None;
+            return Err("GetIconInfo: не удалось получить битмапы".to_string());
         }
-        let result = build_cursor_image(&ii);
+        let result = build_cursor_image(&ii)
+            .ok_or_else(|| "не удалось прочитать битмапы курсора".to_string());
         if !ii.hbmColor.is_invalid() {
             let _ = DeleteObject(HGDIOBJ(ii.hbmColor.0));
         }

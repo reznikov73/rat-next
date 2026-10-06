@@ -312,23 +312,34 @@ pub struct CursorImg<'a> {
     pub h: u16,
     pub hot_x: i16,
     pub hot_y: i16,
+    /// Вид курсора (CURSOR_*), к которому относится картинка.
+    pub kind: u8,
     pub rgba: &'a [u8],
 }
 
 /// Упаковать картинку курсора: `[0xAA][5][w u16][h u16][hot_x i16][hot_y i16][rgba…]`.
-pub fn pack_cursor_img(out: &mut Vec<u8>, w: u16, h: u16, hot_x: i16, hot_y: i16, rgba: &[u8]) {
+pub fn pack_cursor_img(
+    out: &mut Vec<u8>,
+    w: u16,
+    h: u16,
+    hot_x: i16,
+    hot_y: i16,
+    kind: u8,
+    rgba: &[u8],
+) {
     out.push(META_MAGIC);
     out.push(META_CURSOR_IMG);
     out.extend_from_slice(&w.to_be_bytes());
     out.extend_from_slice(&h.to_be_bytes());
     out.extend_from_slice(&hot_x.to_be_bytes());
     out.extend_from_slice(&hot_y.to_be_bytes());
+    out.push(kind);
     out.extend_from_slice(rgba);
 }
 
 /// Разобрать картинку курсора (не больше 128×128).
 pub fn parse_cursor_img(payload: &[u8]) -> Option<CursorImg<'_>> {
-    if payload.len() < 10 || payload[0] != META_MAGIC || payload[1] != META_CURSOR_IMG {
+    if payload.len() < 11 || payload[0] != META_MAGIC || payload[1] != META_CURSOR_IMG {
         return None;
     }
     let w = u16::from_be_bytes([payload[2], payload[3]]);
@@ -337,7 +348,7 @@ pub fn parse_cursor_img(payload: &[u8]) -> Option<CursorImg<'_>> {
         return None;
     }
     let need = w as usize * h as usize * 4;
-    if payload.len() < 10 + need {
+    if payload.len() < 11 + need {
         return None;
     }
     Some(CursorImg {
@@ -345,7 +356,8 @@ pub fn parse_cursor_img(payload: &[u8]) -> Option<CursorImg<'_>> {
         h,
         hot_x: i16::from_be_bytes([payload[6], payload[7]]),
         hot_y: i16::from_be_bytes([payload[8], payload[9]]),
-        rgba: &payload[10..10 + need],
+        kind: payload[10],
+        rgba: &payload[11..11 + need],
     })
 }
 
@@ -599,11 +611,14 @@ mod tests {
     fn cursor_img_roundtrip() {
         let rgba = vec![7u8; 2 * 2 * 4];
         let mut buf = Vec::new();
-        pack_cursor_img(&mut buf, 2, 2, -1, 3, &rgba);
+        pack_cursor_img(&mut buf, 2, 2, -1, 3, 5, &rgba);
         let img = parse_cursor_img(&buf).unwrap();
-        assert_eq!((img.w, img.h, img.hot_x, img.hot_y), (2, 2, -1, 3));
+        assert_eq!(
+            (img.w, img.h, img.hot_x, img.hot_y, img.kind),
+            (2, 2, -1, 3, 5)
+        );
         assert_eq!(img.rgba, &rgba[..]);
-        assert!(parse_cursor_img(&buf[..9]).is_none());
+        assert!(parse_cursor_img(&buf[..10]).is_none());
         assert!(parse_cursor_img(&buf[..buf.len() - 1]).is_none());
     }
 

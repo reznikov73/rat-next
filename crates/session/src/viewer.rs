@@ -34,8 +34,17 @@ fn send_ping(out: &mut MuxEncoder, id: u64, pending: &mut HashMap<u64, Instant>)
     pending.insert(id, Instant::now());
 }
 
-/// Картинка курсора агента: (w, h, hot_x, hot_y, RGBA-пиксели).
-pub type CursorImage = Option<(u16, u16, i16, i16, Vec<u8>)>;
+/// Картинка курсора агента: размеры, хотспот, вид и RGBA-пиксели.
+#[derive(Clone)]
+pub struct CursorImage {
+    pub w: u16,
+    pub h: u16,
+    pub hot_x: i16,
+    pub hot_y: i16,
+    /// Вид курсора (CURSOR_*), к которому относится картинка.
+    pub kind: u8,
+    pub rgba: Vec<u8>,
+}
 
 /// Общее состояние вьюерской стороны: очередь ввода из UI, курсор и геометрия от агента.
 pub struct ViewerShared {
@@ -51,7 +60,7 @@ pub struct ViewerShared {
     /// Текст для вставки на удалённой машине (из локального буфера).
     pub pending_paste: Arc<Mutex<Option<String>>>,
     /// Картинка системного курсора агента (см. [`CursorImage`]).
-    pub cursor_img: Arc<Mutex<CursorImage>>,
+    pub cursor_img: Arc<Mutex<Option<CursorImage>>>,
     /// Версия картинки курсора (меняется при каждом обновлении).
     pub cursor_img_ver: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -112,13 +121,14 @@ pub fn spawn_viewer(
                                 } else if let Some(text) = input::parse_clip(f.payload) {
                                     *shared.clip_in.lock().unwrap() = Some(text);
                                 } else if let Some(img) = input::parse_cursor_img(f.payload) {
-                                    *shared.cursor_img.lock().unwrap() = Some((
-                                        img.w,
-                                        img.h,
-                                        img.hot_x,
-                                        img.hot_y,
-                                        img.rgba.to_vec(),
-                                    ));
+                                    *shared.cursor_img.lock().unwrap() = Some(CursorImage {
+                                        w: img.w,
+                                        h: img.h,
+                                        hot_x: img.hot_x,
+                                        hot_y: img.hot_y,
+                                        kind: img.kind,
+                                        rgba: img.rgba.to_vec(),
+                                    });
                                     shared
                                         .cursor_img_ver
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
