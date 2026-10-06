@@ -1367,6 +1367,10 @@ mod ui {
         prev_mods: egui::Modifiers,
         buttons_down: [bool; 5],
         ui_e2e_ms: Vec<f32>,
+        cursor_img: Arc<Mutex<rat_session::viewer::CursorImage>>,
+        cursor_img_ver: Arc<std::sync::atomic::AtomicU64>,
+        cursor_tex: Option<egui::TextureHandle>,
+        cursor_tex_ver: u64,
     }
 
     impl ViewerSession {
@@ -1675,6 +1679,9 @@ mod ui {
                         let pending_switch: Arc<Mutex<Option<u16>>> = Arc::new(Mutex::new(None));
                         let clip_in: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
                         let pending_paste: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+                        let cursor_img: Arc<Mutex<rat_session::viewer::CursorImage>> =
+                            Arc::new(Mutex::new(None));
+                        let cursor_img_ver = Arc::new(std::sync::atomic::AtomicU64::new(0));
                         let handle = spawn_viewer(
                             base,
                             stop.clone(),
@@ -1689,6 +1696,8 @@ mod ui {
                                 pending_switch: pending_switch.clone(),
                                 clip_in: clip_in.clone(),
                                 pending_paste: pending_paste.clone(),
+                                cursor_img: cursor_img.clone(),
+                                cursor_img_ver: cursor_img_ver.clone(),
                             },
                         );
                         Ok(ViewerSession {
@@ -1722,6 +1731,10 @@ mod ui {
                             prev_mods: egui::Modifiers::default(),
                             buttons_down: [false; 5],
                             ui_e2e_ms: Vec::new(),
+                            cursor_img,
+                            cursor_img_ver,
+                            cursor_tex: None,
+                            cursor_tex_ver: u64::MAX,
                         })
                     }
                     None => Err(format!("не удалось подключиться к {addr_conn}: {last_err}")),
@@ -2970,13 +2983,53 @@ mod ui {
                 }
                 drop(locked);
 
-                // Удалённый курсор поверх видео — формой, как на удалённой машине.
+                // Удалённый курсор поверх видео — настоящей картинкой, как на
+                // удалённой машине; пока картинки нет — векторная форма.
                 let cs = *cursor_arc.lock().unwrap();
                 if cs.visible {
                     let (px, py) = input::norm_to_ui_px(cs.x, cs.y, draw.width(), draw.height());
                     let pos = egui::pos2(draw.min.x + px, draw.min.y + py);
-                    let s = (draw.height() / 720.0).clamp(0.6, 3.0);
-                    rat_cursor_ui::paint_cursor(ui.painter(), pos, s, cs.kind);
+                    let remote_h = v
+                        .info
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .map(|s| s.out.height as f32)
+                        .unwrap_or(720.0)
+                        .max(1.0);
+                    let scale = (draw.height() / remote_h).clamp(0.2, 4.0);
+                    let img = v.cursor_img.lock().unwrap().clone();
+                    let ver = v.cursor_img_ver.load(Ordering::Relaxed);
+                    if ver != v.cursor_tex_ver {
+                        v.cursor_tex_ver = ver;
+                        v.cursor_tex = img.as_ref().map(|(w, h, _, _, rgba)| {
+                            let image = egui::ColorImage::from_rgba_unmultiplied(
+                                [*w as usize, *h as usize],
+                                rgba,
+                            );
+                            ui.ctx().load_texture(
+                                "rat-cursor-img",
+                                image,
+                                egui::TextureOptions::NEAREST,
+                            )
+                        });
+                    }
+                    if let (Some((w, h, hx, hy, _)), Some(tex)) = (&img, v.cursor_tex.as_ref()) {
+                        let min =
+                            egui::pos2(pos.x - *hx as f32 * scale, pos.y - *hy as f32 * scale);
+                        let rect = egui::Rect::from_min_size(
+                            min,
+                            egui::vec2(*w as f32 * scale, *h as f32 * scale),
+                        );
+                        ui.painter().image(
+                            tex.id(),
+                            rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                    } else {
+                        rat_cursor_ui::paint_cursor(ui.painter(), pos, scale, cs.kind);
+                    }
                 }
             }
 

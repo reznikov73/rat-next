@@ -377,6 +377,7 @@ pub fn spawn_agent(
         // Курсор: отправляем не чаще ~30 Гц и только при изменении.
         let mut last_cursor_t = Instant::now() - Duration::from_secs(1);
         let mut last_cursor: Option<(u16, u16, bool, u8)> = None;
+        let mut last_cursor_handle: usize = 0;
 
         // Буфер обмена: следим за текстом и пересылаем вьюеру изменения.
         let mut last_clip_t = Instant::now() - Duration::from_secs(1);
@@ -537,14 +538,23 @@ pub fn spawn_agent(
             if last_cursor_t.elapsed() >= Duration::from_millis(33) {
                 last_cursor_t = Instant::now();
                 let g = *geom_b.lock().unwrap();
-                if let Some((cx, cy, vis, kind)) = cursor_captured_norm(g)
-                    && last_cursor != Some((cx, cy, vis, kind))
-                {
-                    let mut cb = [0u8; 6];
-                    input::pack_cursor(&mut cb, cx, cy, vis, kind);
-                    mux.push(Channel::Cursor, flags::DROPPABLE, &cb);
-                    last_cursor = Some((cx, cy, vis, kind));
-                    stats_b.lock().unwrap().cursor_sent += 1;
+                if let Some((cx, cy, vis, kind, hcur)) = cursor_captured_norm(g) {
+                    if last_cursor != Some((cx, cy, vis, kind)) {
+                        let mut cb = [0u8; 6];
+                        input::pack_cursor(&mut cb, cx, cy, vis, kind);
+                        mux.push(Channel::Cursor, flags::DROPPABLE, &cb);
+                        last_cursor = Some((cx, cy, vis, kind));
+                        stats_b.lock().unwrap().cursor_sent += 1;
+                    }
+                    // Настоящая картинка курсора — при смене (редко).
+                    if hcur != 0 && hcur != last_cursor_handle {
+                        last_cursor_handle = hcur;
+                        if let Some((w, h, hx, hy, rgba)) = cursor_image(hcur) {
+                            let mut img = Vec::with_capacity(10 + rgba.len());
+                            input::pack_cursor_img(&mut img, w, h, hx, hy, &rgba);
+                            mux.push(Channel::Control, 0, &img);
+                        }
+                    }
                 }
             }
 
@@ -771,7 +781,7 @@ fn is_extended_key(vk: u16) -> bool {
 }
 
 /// Текущий курсор агента в нормализованных координатах области захвата: (x, y, видим, вид).
-fn cursor_captured_norm(out: OutputGeom) -> Option<(u16, u16, bool, u8)> {
+fn cursor_captured_norm(out: OutputGeom) -> Option<(u16, u16, bool, u8, usize)> {
     use windows::Win32::UI::WindowsAndMessaging::{CURSOR_SHOWING, CURSORINFO, GetCursorInfo};
     let mut ci = CURSORINFO {
         cbSize: std::mem::size_of::<CURSORINFO>() as u32,
@@ -780,7 +790,13 @@ fn cursor_captured_norm(out: OutputGeom) -> Option<(u16, u16, bool, u8)> {
     unsafe { GetCursorInfo(&mut ci) }.ok()?;
     let visible = (ci.flags.0 & CURSOR_SHOWING.0) != 0;
     let (nx, ny) = input::screen_to_captured_norm(ci.ptScreenPos.x, ci.ptScreenPos.y, out);
-    Some((nx, ny, visible, cursor_kind(ci.hCursor)))
+    Some((
+        nx,
+        ny,
+        visible,
+        cursor_kind(ci.hCursor),
+        ci.hCursor.0 as usize,
+    ))
 }
 
 /// Вид курсора по хендлу: сравнение с системными (IDC_*). Кастомный курсор — стрелка.
@@ -823,6 +839,136 @@ fn cursor_kind(h: windows::Win32::UI::WindowsAndMessaging::HCURSOR) -> u8 {
         }
     }
     input::CURSOR_ARROW
+}
+
+/// Настоящая картинка курсора: (w, h, hot_x, hot_y, RGBA сверху вниз).
+/// Работает и для кастомных курсоров приложений; монохромные собираются из маски.
+fn cursor_image(handle: usize) -> Option<(u16, u16, i16, i16, Vec<u8>)> {
+    use windows::Win32::Graphics::Gdi::{DeleteObject, HGDIOBJ};
+    use windows::Win32::UI::WindowsAndMessaging::{GetIconInfo, HCURSOR, ICONINFO};
+    if handle == 0 {
+        return None;
+    }
+    unsafe {
+        let mut ii: ICONINFO = std::mem::zeroed();
+        if GetIconInfo(HCURSOR(handle as *mut core::ffi::c_void), &mut ii).is_err() {
+            return None;
+        }
+        let result = build_cursor_image(&ii);
+        if !ii.hbmColor.is_invalid() {
+            let _ = DeleteObject(HGDIOBJ(ii.hbmColor.0));
+        }
+        if !ii.hbmMask.is_invalid() {
+            let _ = DeleteObject(HGDIOBJ(ii.hbmMask.0));
+        }
+        result
+    }
+}
+
+/// Прочитать HBITMAP как 32bpp BGRA сверху вниз.
+unsafe fn read_dib(hbm: windows::Win32::Graphics::Gdi::HBITMAP, w: i32, h: i32) -> Option<Vec<u8>> {
+    use windows::Win32::Graphics::Gdi::{
+        BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, GetDIBits, HDC,
+    };
+    if hbm.is_invalid() || w <= 0 || h <= 0 {
+        return None;
+    }
+    let mut bi: BITMAPINFO = unsafe { std::mem::zeroed() };
+    bi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h; // сверху вниз
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    let mut buf = vec![0u8; (w * h * 4) as usize];
+    let lines = unsafe {
+        GetDIBits(
+            HDC(std::ptr::null_mut()),
+            hbm,
+            0,
+            h as u32,
+            Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
+            &mut bi,
+            DIB_RGB_COLORS,
+        )
+    };
+    if lines == h { Some(buf) } else { None }
+}
+
+/// Собрать RGBA-картинку из ICONINFO (цвет + маска; поддержка монохромных).
+unsafe fn build_cursor_image(
+    ii: &windows::Win32::UI::WindowsAndMessaging::ICONINFO,
+) -> Option<(u16, u16, i16, i16, Vec<u8>)> {
+    use windows::Win32::Graphics::Gdi::{BITMAP, GetObjectW, HGDIOBJ};
+    let mask_only = ii.hbmColor.is_invalid();
+    let probe = if mask_only { ii.hbmMask } else { ii.hbmColor };
+    if probe.is_invalid() {
+        return None;
+    }
+    let mut bm: BITMAP = unsafe { std::mem::zeroed() };
+    if unsafe {
+        GetObjectW(
+            HGDIOBJ(probe.0),
+            std::mem::size_of::<BITMAP>() as i32,
+            Some(&mut bm as *mut BITMAP as *mut core::ffi::c_void),
+        )
+    } == 0
+    {
+        return None;
+    }
+    let (w, h) = if mask_only {
+        (bm.bmWidth, bm.bmHeight / 2)
+    } else {
+        (bm.bmWidth, bm.bmHeight)
+    };
+    if w <= 0 || h <= 0 || w > 128 || h > 128 {
+        return None;
+    }
+    let color = if mask_only {
+        None
+    } else {
+        unsafe { read_dib(ii.hbmColor, w, h) }
+    };
+    let mask = if ii.hbmMask.is_invalid() {
+        None
+    } else {
+        unsafe { read_dib(ii.hbmMask, w, if mask_only { h * 2 } else { h }) }
+    };
+    let has_alpha = color
+        .as_ref()
+        .is_some_and(|c| c.as_chunks::<4>().0.iter().any(|p| p[3] != 0));
+    let mut out = vec![0u8; (w * h * 4) as usize];
+    for (i, px) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+        let (r, g, b, mut a) = match &color {
+            Some(c) => (c[i * 4 + 2], c[i * 4 + 1], c[i * 4], c[i * 4 + 3]),
+            None => (0, 0, 0, 0),
+        };
+        if let Some(m) = &mask {
+            if mask_only {
+                // Монохромный курсор: маска двойной высоты (AND | XOR).
+                let row = i / w as usize;
+                let col = i % w as usize;
+                let and_v = m[row * w as usize * 4 + col * 4];
+                let xor_v = m[(row + h as usize) * w as usize * 4 + col * 4];
+                a = if and_v == 0 { 255 } else { 0 };
+                let v = if xor_v != 0 { 255u8 } else { 0 };
+                px.copy_from_slice(&[v, v, v, a]);
+                continue;
+            }
+            if !has_alpha {
+                a = if m[i * 4] == 0 { 255 } else { 0 };
+            }
+        } else if !has_alpha {
+            a = 255;
+        }
+        px.copy_from_slice(&[r, g, b, a]);
+    }
+    Some((
+        w as u16,
+        h as u16,
+        ii.xHotspot.min(i16::MAX as u32) as i16,
+        ii.yHotspot.min(i16::MAX as u32) as i16,
+        out,
+    ))
 }
 
 // ================== буфер обмена (текст, Windows) ==================

@@ -24,6 +24,8 @@ pub const META_SWITCH: u8 = 2;
 pub const META_MONITORS: u8 = 3;
 /// Meta-тип: текст буфера обмена (в обе стороны).
 pub const META_CLIP: u8 = 4;
+/// Картинка системного курсора агента (RGBA + хотспот), канал Control.
+pub const META_CURSOR_IMG: u8 = 5;
 
 /// Прямоугольник в экранных координатах.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,6 +306,49 @@ pub fn parse_clip(payload: &[u8]) -> Option<String> {
     String::from_utf8(payload[2..].to_vec()).ok()
 }
 
+/// Картинка курсора агента: RGBA (сверху вниз) и хотспот.
+pub struct CursorImg<'a> {
+    pub w: u16,
+    pub h: u16,
+    pub hot_x: i16,
+    pub hot_y: i16,
+    pub rgba: &'a [u8],
+}
+
+/// Упаковать картинку курсора: `[0xAA][5][w u16][h u16][hot_x i16][hot_y i16][rgba…]`.
+pub fn pack_cursor_img(out: &mut Vec<u8>, w: u16, h: u16, hot_x: i16, hot_y: i16, rgba: &[u8]) {
+    out.push(META_MAGIC);
+    out.push(META_CURSOR_IMG);
+    out.extend_from_slice(&w.to_be_bytes());
+    out.extend_from_slice(&h.to_be_bytes());
+    out.extend_from_slice(&hot_x.to_be_bytes());
+    out.extend_from_slice(&hot_y.to_be_bytes());
+    out.extend_from_slice(rgba);
+}
+
+/// Разобрать картинку курсора (не больше 128×128).
+pub fn parse_cursor_img(payload: &[u8]) -> Option<CursorImg<'_>> {
+    if payload.len() < 10 || payload[0] != META_MAGIC || payload[1] != META_CURSOR_IMG {
+        return None;
+    }
+    let w = u16::from_be_bytes([payload[2], payload[3]]);
+    let h = u16::from_be_bytes([payload[4], payload[5]]);
+    if w == 0 || h == 0 || w > 128 || h > 128 {
+        return None;
+    }
+    let need = w as usize * h as usize * 4;
+    if payload.len() < 10 + need {
+        return None;
+    }
+    Some(CursorImg {
+        w,
+        h,
+        hot_x: i16::from_be_bytes([payload[6], payload[7]]),
+        hot_y: i16::from_be_bytes([payload[8], payload[9]]),
+        rgba: &payload[10..10 + need],
+    })
+}
+
 /// Разобрать список мониторов.
 pub fn parse_monitors(payload: &[u8]) -> Option<Vec<(u16, u16, u16)>> {
     if payload.len() < 3 || payload[0] != META_MAGIC || payload[1] != META_MONITORS {
@@ -548,6 +593,18 @@ mod tests {
         assert!(parse_clip(&[0xAA, 4, 0xFF, 0xFE]).is_none());
         assert!(parse_clip(&[0xAA]).is_none());
         assert!(parse_clip(&[0x0A, 4, 1]).is_none());
+    }
+
+    #[test]
+    fn cursor_img_roundtrip() {
+        let rgba = vec![7u8; 2 * 2 * 4];
+        let mut buf = Vec::new();
+        pack_cursor_img(&mut buf, 2, 2, -1, 3, &rgba);
+        let img = parse_cursor_img(&buf).unwrap();
+        assert_eq!((img.w, img.h, img.hot_x, img.hot_y), (2, 2, -1, 3));
+        assert_eq!(img.rgba, &rgba[..]);
+        assert!(parse_cursor_img(&buf[..9]).is_none());
+        assert!(parse_cursor_img(&buf[..buf.len() - 1]).is_none());
     }
 
     #[test]
