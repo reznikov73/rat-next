@@ -952,34 +952,48 @@ unsafe fn build_cursor_image(
     } else {
         unsafe { read_dib(ii.hbmMask, w, if mask_only { h * 2 } else { h }) }
     };
-    let has_alpha = color
-        .as_ref()
-        .is_some_and(|c| c.as_chunks::<4>().0.iter().any(|p| p[3] != 0));
     let mut out = vec![0u8; (w * h * 4) as usize];
     for (i, px) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-        let (r, g, b, mut a) = match &color {
+        let (r, g, b, ca) = match &color {
             Some(c) => (c[i * 4 + 2], c[i * 4 + 1], c[i * 4], c[i * 4 + 3]),
             None => (0, 0, 0, 0),
         };
         if let Some(m) = &mask {
             if mask_only {
-                // Монохромный курсор: маска двойной высоты (AND | XOR).
+                // Монохромный курсор: маска двойной высоты (AND сверху, XOR снизу).
+                // AND=0 — непрозрачная область, цвет берём из XOR (белый/чёрный);
+                // AND=1 и XOR=1 — «инверсия фона» (у палки блокнота так задана
+                // форма): на типичном светлом фоне выглядит чёрным;
+                // иначе — прозрачно.
                 let row = i / w as usize;
                 let col = i % w as usize;
                 let and_v = m[row * w as usize * 4 + col * 4];
                 let xor_v = m[(row + h as usize) * w as usize * 4 + col * 4];
-                a = if and_v == 0 { 255 } else { 0 };
-                let v = if xor_v != 0 { 255u8 } else { 0 };
-                px.copy_from_slice(&[v, v, v, a]);
+                if and_v == 0 {
+                    let v = if xor_v != 0 { 255u8 } else { 0 };
+                    px.copy_from_slice(&[v, v, v, 255]);
+                } else if xor_v != 0 {
+                    px.copy_from_slice(&[0, 0, 0, 255]);
+                } else {
+                    px.copy_from_slice(&[0, 0, 0, 0]);
+                }
                 continue;
             }
-            if !has_alpha {
-                a = if m[i * 4] == 0 { 255 } else { 0 };
-            }
-        } else if !has_alpha {
-            a = 255;
+            // Смешанный случай: где у цвета есть альфа — берём её, где нет —
+            // маску. У системных курсоров альфа бывает пустой или частичной,
+            // и полагаться только на неё нельзя (иначе курсор «невидимка»).
+            let a = if ca != 0 {
+                ca
+            } else if m[i * 4] == 0 {
+                255
+            } else {
+                0
+            };
+            px.copy_from_slice(&[r, g, b, a]);
+        } else {
+            let a = if ca != 0 { ca } else { 255 };
+            px.copy_from_slice(&[r, g, b, a]);
         }
-        px.copy_from_slice(&[r, g, b, a]);
     }
     Some((
         w as u16,
@@ -1131,6 +1145,124 @@ mod cursor_image_tests {
             hx <= 2 && hy <= 2,
             "хотспот стрелки не в кончике: {hx},{hy}"
         );
+    }
+
+    /// Диагностический дамп сырых битмапов I-beam (для отладки извлечения).
+    #[test]
+    fn debug_ibeam_dump() {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::Graphics::Gdi::{
+            BITMAP, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, GetDC, GetDIBits, GetObjectW,
+            HGDIOBJ, ReleaseDC,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetIconInfo, ICONINFO, IDC_IBEAM, LoadCursorW,
+        };
+        let hcur = unsafe { LoadCursorW(None, IDC_IBEAM) }.unwrap();
+        unsafe {
+            let mut ii: ICONINFO = std::mem::zeroed();
+            assert!(GetIconInfo(hcur, &mut ii).is_ok());
+            println!(
+                "color null={} mask null={} hotspot {},{}, fIcon={}",
+                ii.hbmColor.is_invalid(),
+                ii.hbmMask.is_invalid(),
+                ii.xHotspot,
+                ii.yHotspot,
+                ii.fIcon.0
+            );
+            for (name, hbm) in [("color", ii.hbmColor), ("mask", ii.hbmMask)] {
+                if hbm.is_invalid() {
+                    continue;
+                }
+                let mut bm: BITMAP = std::mem::zeroed();
+                let got = GetObjectW(
+                    HGDIOBJ(hbm.0),
+                    std::mem::size_of::<BITMAP>() as i32,
+                    Some(&mut bm as *mut BITMAP as *mut _),
+                );
+                println!(
+                    "{name}: GetObject={got} {}x{} bpp={}",
+                    bm.bmWidth, bm.bmHeight, bm.bmBitsPixel
+                );
+                let (w, h) = (bm.bmWidth, bm.bmHeight);
+                let mut bi: BITMAPINFO = std::mem::zeroed();
+                bi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+                bi.bmiHeader.biWidth = w;
+                bi.bmiHeader.biHeight = -h;
+                bi.bmiHeader.biPlanes = 1;
+                bi.bmiHeader.biBitCount = 32;
+                let mut buf = vec![0u8; (w * h * 4) as usize];
+                let null = HWND(std::ptr::null_mut());
+                let dc = GetDC(null);
+                let lines = GetDIBits(
+                    dc,
+                    hbm,
+                    0,
+                    h as u32,
+                    Some(buf.as_mut_ptr() as *mut _),
+                    &mut bi,
+                    DIB_RGB_COLORS,
+                );
+                let _ = ReleaseDC(null, dc);
+                let ch = buf.as_chunks::<4>().0;
+                let a0 = ch.iter().filter(|p| p[3] == 0).count();
+                let am = ch.iter().filter(|p| p[3] > 0 && p[3] < 128).count();
+                let ah = ch.iter().filter(|p| p[3] >= 128).count();
+                let blk = ch
+                    .iter()
+                    .filter(|p| p[0] == 0 && p[1] == 0 && p[2] == 0)
+                    .count();
+                let wht = ch
+                    .iter()
+                    .filter(|p| p[0] == 255 && p[1] == 255 && p[2] == 255)
+                    .count();
+                println!(
+                    "{name}: lines={lines}; alpha0={a0} mid={am} hi={ah}; black={blk} white={wht}"
+                );
+                if name == "mask" {
+                    for row in 0..h {
+                        let mut line = String::new();
+                        for col in 0..w {
+                            let p = ((row * w + col) * 4) as usize;
+                            line.push(if buf[p] == 0 { '#' } else { '.' });
+                        }
+                        println!("{row:02} {line}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Все распространённые системные курсоры извлекаются с видимыми пикселями
+    /// (ловит и цветные, и монохромные/инверсные форматы — как «палка» блокнота).
+    #[test]
+    fn system_cursors_all_visible() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_HELP, IDC_IBEAM, IDC_NO, IDC_SIZEALL, IDC_SIZENS,
+            IDC_WAIT,
+        };
+        for (name, id) in [
+            ("arrow", IDC_ARROW),
+            ("ibeam", IDC_IBEAM),
+            ("cross", IDC_CROSS),
+            ("hand", IDC_HAND),
+            ("wait", IDC_WAIT),
+            ("no", IDC_NO),
+            ("sizeall", IDC_SIZEALL),
+            ("sizens", IDC_SIZENS),
+            ("help", IDC_HELP),
+        ] {
+            let hcur = unsafe { LoadCursorW(None, id) }.unwrap();
+            let (w, h, _, _, rgba) = cursor_image(hcur.0 as usize).expect(name);
+            let visible = rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|p| p[3] >= 128)
+                .count();
+            println!("{name}: {w}x{h}, видимых пикселей {visible}");
+            assert!(visible >= 4, "{name}: нет видимых пикселей ({visible})");
+        }
     }
 
     /// Текстовый курсор: картинка читается, хотспот внутри её области.
