@@ -15,6 +15,9 @@ pub mod stats;
 #[cfg(windows)]
 pub mod capture;
 
+#[cfg(windows)]
+pub mod secure;
+
 #[cfg(all(windows, feature = "ffmpeg"))]
 pub mod agent;
 #[cfg(all(windows, feature = "ffmpeg"))]

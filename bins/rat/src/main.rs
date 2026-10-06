@@ -39,6 +39,7 @@ struct Args {
     stop_service: bool,
     service: bool,
     service_helper: bool,
+    probe_secure: bool,
 }
 
 #[cfg_attr(not(feature = "ffmpeg"), allow(dead_code))]
@@ -60,6 +61,7 @@ fn parse_args() -> Args {
         stop_service: false,
         service: false,
         service_helper: false,
+        probe_secure: false,
     };
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -108,6 +110,10 @@ fn parse_args() -> Args {
             }
             "--service" => {
                 a.service = true;
+                i += 1;
+            }
+            "--probe-secure" => {
+                a.probe_secure = true;
                 i += 1;
             }
             "--service-helper" => {
@@ -205,6 +211,30 @@ fn main() {
             }
         }
     }
+    if args.probe_secure {
+        // Диагностика защищённого стола: имя активного стола + пробный снимок.
+        let name = rat_session::secure::active_desktop_name();
+        note(&format!("probe-secure: активный стол = {name:?}"));
+        match rat_session::secure::SecureCapture::attach() {
+            Ok(mut sc) => {
+                let (w, h) = sc.size();
+                let mut frame: Vec<u8> = Vec::new();
+                let res = sc.capture(|bgra, _pitch| {
+                    frame = bgra.to_vec();
+                });
+                note(&format!("probe-secure: захват {w}x{h}: {res:?}"));
+                if matches!(res, Ok(true))
+                    && let Ok(exe) = std::env::current_exe()
+                {
+                    let bmp = exe.with_file_name("probe-secure.bmp");
+                    write_bmp(&bmp, w, h, &frame);
+                    note(&format!("probe-secure: снимок сохранён: {}", bmp.display()));
+                }
+            }
+            Err(e) => note(&format!("probe-secure: ошибка: {e}")),
+        }
+        std::process::exit(0);
+    }
     if args.service {
         if let Err(e) = service::run_service() {
             note(&format!("service: {e}"));
@@ -263,6 +293,39 @@ fn main() {
 }
 
 // ================== журнал ==================
+
+/// Сохранить снимок BGRA (сверху вниз) в BMP-файл (для диагностики).
+#[cfg(feature = "ffmpeg")]
+fn write_bmp(path: &std::path::Path, w: u32, h: u32, bgra: &[u8]) {
+    use std::io::Write as _;
+    let row = (w as usize) * 4;
+    if bgra.len() < row * (h as usize) {
+        return;
+    }
+    let data_size = row * (h as usize);
+    let mut hdr = Vec::with_capacity(54);
+    hdr.extend_from_slice(b"BM");
+    hdr.extend_from_slice(&((54 + data_size) as u32).to_le_bytes());
+    hdr.extend_from_slice(&[0u8; 4]);
+    hdr.extend_from_slice(&54u32.to_le_bytes());
+    hdr.extend_from_slice(&40u32.to_le_bytes());
+    hdr.extend_from_slice(&(w as i32).to_le_bytes());
+    hdr.extend_from_slice(&(h as i32).to_le_bytes());
+    hdr.extend_from_slice(&1u16.to_le_bytes());
+    hdr.extend_from_slice(&32u16.to_le_bytes());
+    hdr.extend_from_slice(&0u32.to_le_bytes());
+    hdr.extend_from_slice(&(data_size as u32).to_le_bytes());
+    hdr.extend_from_slice(&2835u32.to_le_bytes());
+    hdr.extend_from_slice(&2835u32.to_le_bytes());
+    hdr.extend_from_slice(&0u32.to_le_bytes());
+    hdr.extend_from_slice(&0u32.to_le_bytes());
+    if let Ok(mut f) = std::fs::File::create(path) {
+        let _ = f.write_all(&hdr);
+        for y in (0..h as usize).rev() {
+            let _ = f.write_all(&bgra[y * row..(y + 1) * row]);
+        }
+    }
+}
 
 /// Записать строку в `rat.log` рядом с exe (переживает отсутствие консоли).
 #[cfg(feature = "ffmpeg")]

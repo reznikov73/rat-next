@@ -69,15 +69,37 @@ pub fn spawn_agent(
     link: Duplex,
     cfg: AgentConfig,
 ) -> Result<Vec<std::thread::JoinHandle<()>>, String> {
-    let cap = Capture::new_with_output(cfg.monitor)?;
-    let (cw, ch) = (cap.width, cap.height);
+    // Обычно захват — DXGI; если на машине активен защищённый стол (экран
+    // входа/UAC/блокировка), DXGI может быть недоступен — тогда начинаем
+    // сразу с GDI-захвата защищённого стола.
+    let cap0 = Capture::new_with_output(cfg.monitor).ok();
+    let mut secure0 = None;
+    let (cw, ch, origin0, virt) = match cap0.as_ref() {
+        Some(c) => (c.width, c.height, c.origin, c.virt),
+        None => {
+            let sc = crate::secure::SecureCapture::attach()
+                .map_err(|e| format!("захват экрана недоступен: {e}"))?;
+            let (w, h) = sc.size();
+            secure0 = Some(sc);
+            (
+                w as usize,
+                h as usize,
+                (0, 0),
+                RectI {
+                    x: 0,
+                    y: 0,
+                    w: w as i32,
+                    h: h as i32,
+                },
+            )
+        }
+    };
     let out_geom = OutputGeom {
-        origin_x: cap.origin.0,
-        origin_y: cap.origin.1,
+        origin_x: origin0.0,
+        origin_y: origin0.1,
         width: cw as i32,
         height: ch as i32,
     };
-    let virt = cap.virt;
 
     // Общее состояние для переключения монитора «на лету».
     let sh_geom: Arc<Mutex<OutputGeom>> = Arc::new(Mutex::new(out_geom));
@@ -105,7 +127,8 @@ pub fn spawn_agent(
     let fps = cfg.fps.max(1);
     let thread_a = std::thread::spawn(move || {
         set_above_normal();
-        let mut cap = cap;
+        let mut cap = cap0;
+        let mut secure = secure0;
         let (mut cw, mut ch) = (cw, ch);
         let mut sws_in = sws_in;
         let mut y_buf = vec![0u8; cw * ch];
@@ -114,6 +137,7 @@ pub fn spawn_agent(
         let mut next_t = Instant::now();
         let mut frame_id: u64 = 0;
         let mut consec_err: u32 = 0;
+        let mut desk_check_t = Instant::now() - Duration::from_secs(1);
 
         while !stop_a.load(Ordering::Relaxed) {
             // Переключение монитора по запросу вьюера: пересоздаём весь конвейер.
@@ -132,7 +156,8 @@ pub fn spawn_agent(
                         Ok(v) => v,
                         Err(e) => break 'sw Err(e),
                     };
-                    cap = new_cap;
+                    let (nox, noy) = new_cap.origin;
+                    cap = Some(new_cap);
                     cw = nw;
                     ch = nh;
                     sws_in = new_sws;
@@ -141,8 +166,8 @@ pub fn spawn_agent(
                     *enc_a.lock().unwrap() = new_enc;
                     inflight_a.lock().unwrap().clear();
                     *geom_a.lock().unwrap() = OutputGeom {
-                        origin_x: cap.origin.0,
-                        origin_y: cap.origin.1,
+                        origin_x: nox,
+                        origin_y: noy,
                         width: cw as i32,
                         height: ch as i32,
                     };
@@ -162,6 +187,72 @@ pub fn spawn_agent(
                 }
             }
 
+            // Защищённый стол (экран входа, UAC, блокировка): переключаемся на
+            // GDI-захват и обратно (проверка не чаще раза в 250 мс).
+            if desk_check_t.elapsed() >= Duration::from_millis(250) {
+                desk_check_t = Instant::now();
+                let secure_now = crate::secure::active_is_secure();
+                if secure_now && secure.is_none() {
+                    match crate::secure::SecureCapture::attach() {
+                        Ok(sc) => {
+                            let (nw, nh) = sc.size();
+                            let mut ready = true;
+                            if nw != cw as u32 || nh != ch as u32 {
+                                ready = false;
+                                match (
+                                    Sws::new(nw, nh, pix_fmt(0), pix_fmt(1)),
+                                    open_encoder(&cfg_a, nw, nh),
+                                ) {
+                                    (Ok(new_sws), Ok((new_enc, codec_used))) => {
+                                        sws_in = new_sws;
+                                        cw = nw as usize;
+                                        ch = nh as usize;
+                                        y_buf = vec![0u8; cw * ch];
+                                        uv_buf = vec![0u8; cw * ch / 2];
+                                        *enc_a.lock().unwrap() = new_enc;
+                                        inflight_a.lock().unwrap().clear();
+                                        {
+                                            let mut st = stats_a.lock().unwrap();
+                                            st.codec = codec_used;
+                                        }
+                                        ready = true;
+                                    }
+                                    (a, b) => {
+                                        let msg =
+                                            a.err().or_else(|| b.err()).unwrap_or_else(|| {
+                                                "не удалось пересобрать конвейер".to_string()
+                                            });
+                                        let mut st = stats_a.lock().unwrap();
+                                        st.last_error = format!("защищённый стол: {msg}");
+                                    }
+                                }
+                            }
+                            if ready {
+                                *geom_a.lock().unwrap() = OutputGeom {
+                                    origin_x: 0,
+                                    origin_y: 0,
+                                    width: cw as i32,
+                                    height: ch as i32,
+                                };
+                                dirty_a.store(true, Ordering::Relaxed);
+                                secure = Some(sc);
+                                stats_a.lock().unwrap().capture_switches += 1;
+                            }
+                        }
+                        Err(e) => {
+                            let mut st = stats_a.lock().unwrap();
+                            st.last_error = format!("защищённый стол: {e}");
+                        }
+                    }
+                } else if !secure_now && secure.is_some() {
+                    secure = None;
+                    if let Some(c) = cap.as_mut() {
+                        let _ = c.try_recreate();
+                    }
+                    stats_a.lock().unwrap().capture_switches += 1;
+                }
+            }
+
             let now = Instant::now();
             if next_t > now {
                 std::thread::sleep(next_t - now);
@@ -174,8 +265,8 @@ pub fn spawn_agent(
 
             let t0 = Instant::now();
             let sws_ptr = sws_in.ptr();
-            let got = match cap.with_frame(15, |bgra, pitch| {
-                unsafe {
+            let frame_res = if let Some(sc) = secure.as_mut() {
+                sc.capture(|bgra, pitch| unsafe {
                     sws_bgra_to_nv12(
                         sws_ptr,
                         bgra.as_ptr(),
@@ -186,12 +277,40 @@ pub fn spawn_agent(
                         cw,
                         ch,
                     );
+                })
+            } else if let Some(c) = cap.as_mut() {
+                c.with_frame(15, |bgra, pitch| {
+                    unsafe {
+                        sws_bgra_to_nv12(
+                            sws_ptr,
+                            bgra.as_ptr(),
+                            pitch,
+                            y_buf.as_mut_ptr(),
+                            cw,
+                            uv_buf.as_mut_ptr(),
+                            cw,
+                            ch,
+                        );
+                    }
+                    Ok(())
+                })
+            } else {
+                // DXGI-захват не поднялся и защищённый стол не активен — пробуем снова.
+                match Capture::new_with_output(cfg_a.monitor) {
+                    Ok(nc) => {
+                        cap = Some(nc);
+                        continue;
+                    }
+                    Err(e) => Err(e),
                 }
-                Ok(())
-            }) {
+            };
+            let got = match frame_res {
                 Ok(v) => v,
                 Err(e) => {
-                    if e.contains("ACCESS_LOST") && cap.try_recreate() {
+                    if secure.is_none()
+                        && e.contains("ACCESS_LOST")
+                        && cap.as_mut().is_some_and(|c| c.try_recreate())
+                    {
                         continue;
                     }
                     consec_err += 1;
@@ -264,6 +383,10 @@ pub fn spawn_agent(
         let mut clip_sent: Option<String> = None;
         let mut clip_set_by_us: Option<String> = None;
 
+        // Защищённый стол: поток ввода привязываем к нему при необходимости.
+        let mut secure_desk: Option<crate::secure::DesktopAttach> = None;
+        let mut desk_check_b = Instant::now() - Duration::from_secs(1);
+
         // Hello (capabilities) сразу при старте.
         let hello = control::hello(
             concat!("rat-agent-", env!("CARGO_PKG_VERSION")),
@@ -300,6 +423,23 @@ pub fn spawn_agent(
 
         while !stop_b.load(Ordering::Relaxed) {
             let mut did = false;
+
+            // Переключение потока на защищённый стол (не чаще раза в 250 мс).
+            if desk_check_b.elapsed() >= Duration::from_millis(250) {
+                desk_check_b = Instant::now();
+                let secure_now = crate::secure::active_is_secure();
+                if secure_now && secure_desk.is_none() {
+                    match crate::secure::DesktopAttach::attach_winlogon() {
+                        Ok(a) => secure_desk = Some(a),
+                        Err(e) => {
+                            stats_b.lock().unwrap().last_error =
+                                format!("ввод: защищённый стол: {e}");
+                        }
+                    }
+                } else if !secure_now && secure_desk.is_some() {
+                    secure_desk = None;
+                }
+            }
 
             // 1) входящие кадры линка (Control от вьюера).
             loop {
