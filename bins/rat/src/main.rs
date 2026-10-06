@@ -454,6 +454,16 @@ mod store {
             .and_then(|s| serde_json::from_str::<Device>(&s).ok())
             .unwrap_or_default();
         device.relay = normalize_relay(&device.relay);
+        // ID — детерминированно из отпечатка машины (не зависит от переустановок).
+        // Этап разработки: сохранённый ID приоритета не имеет — при расхождении
+        // файл обновляется. Отпечаток не собрался — оставляем как есть
+        // (существующий ID или случайный, см. место генерации ниже).
+        if let Some(id) = fingerprint_id()
+            && device.id != id
+        {
+            device.id = id;
+            save_device(&device);
+        }
         device
     }
 
@@ -461,6 +471,164 @@ mod store {
         if let Ok(s) = serde_json::to_string_pretty(d) {
             let _ = std::fs::write(device_path(), s);
         }
+    }
+
+    /// ID из отпечатка машины: MachineGuid | BIOS | том | имя → FNV-1a → 6 цифр.
+    /// `None`, если ни один источник не прочитался (тогда прежний путь генерации).
+    pub fn fingerprint_id() -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(v) = reg_string(r"SOFTWARE\Microsoft\Cryptography", "MachineGuid") {
+            parts.push(v);
+        }
+        let bios = r"HARDWARE\DESCRIPTION\System\BIOS";
+        if let Some(v) = reg_string(bios, "SystemProductName") {
+            parts.push(v);
+        }
+        if let Some(v) = reg_string(bios, "BaseBoardProduct") {
+            parts.push(v);
+        }
+        let root = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+        if let Some(v) = volume_serial(&format!("{root}\\")) {
+            parts.push(v);
+        }
+        if let Some(v) = computer_name() {
+            parts.push(v);
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        let hash = fnv1a64(parts.join("|").as_bytes());
+        Some(format!("{:06}", hash % 1_000_000))
+    }
+
+    /// Оставить только строчные латинские буквы и цифры (стабильность отпечатка).
+    fn sanitize(s: &str) -> String {
+        s.chars()
+            .filter(char::is_ascii_alphanumeric)
+            .flat_map(|c| c.to_lowercase())
+            .collect()
+    }
+
+    /// FNV-1a 64 бита — свой, фиксированный (не зависит от версии компилятора).
+    fn fnv1a64(bytes: &[u8]) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in bytes {
+            hash ^= *b as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    /// Строковое значение из реестра (только чтение, прав администратора не требует).
+    #[cfg(windows)]
+    fn reg_string(subkey: &str, value: &str) -> Option<String> {
+        unsafe {
+            let sub = to_wide(subkey);
+            let val = to_wide(value);
+            let mut buf = [0u16; 256];
+            let mut len = (buf.len() * 2) as u32;
+            let status = RegGetValueW(
+                0x8000_0002_usize as *mut std::ffi::c_void, // HKEY_LOCAL_MACHINE
+                sub.as_ptr(),
+                val.as_ptr(),
+                0x0000_0002, // RRF_RT_REG_SZ
+                std::ptr::null_mut(),
+                buf.as_mut_ptr() as *mut std::ffi::c_void,
+                &mut len,
+            );
+            if status != 0 || len < 2 {
+                return None;
+            }
+            let chars = ((len as usize) / 2).saturating_sub(1).min(buf.len());
+            let s = sanitize(&String::from_utf16_lossy(&buf[..chars]));
+            if s.is_empty() { None } else { Some(s) }
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn reg_string(_subkey: &str, _value: &str) -> Option<String> {
+        None
+    }
+
+    /// Серийный номер тома (например, системного) в нижнем hex.
+    #[cfg(windows)]
+    fn volume_serial(root: &str) -> Option<String> {
+        let root_w = to_wide(root);
+        let mut serial = 0u32;
+        let ok = unsafe {
+            GetVolumeInformationW(
+                root_w.as_ptr(),
+                std::ptr::null_mut(),
+                0,
+                &mut serial,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if ok != 0 {
+            Some(format!("{serial:08x}"))
+        } else {
+            None
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn volume_serial(_root: &str) -> Option<String> {
+        None
+    }
+
+    /// Имя машины.
+    #[cfg(windows)]
+    fn computer_name() -> Option<String> {
+        let mut buf = [0u16; 64];
+        let mut len = buf.len() as u32;
+        let ok = unsafe { GetComputerNameW(buf.as_mut_ptr(), &mut len) };
+        if ok == 0 || len == 0 {
+            return None;
+        }
+        let s = sanitize(&String::from_utf16_lossy(&buf[..len as usize]));
+        if s.is_empty() { None } else { Some(s) }
+    }
+
+    #[cfg(not(windows))]
+    fn computer_name() -> Option<String> {
+        None
+    }
+
+    fn to_wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    #[cfg(windows)]
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn RegGetValueW(
+            hkey: *mut std::ffi::c_void,
+            subkey: *const u16,
+            value: *const u16,
+            flags: u32,
+            value_type: *mut u32,
+            data: *mut std::ffi::c_void,
+            data_len: *mut u32,
+        ) -> i32;
+    }
+
+    #[cfg(windows)]
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetVolumeInformationW(
+            root: *const u16,
+            volume_name: *mut u16,
+            volume_name_len: u32,
+            serial: *mut u32,
+            max_component_len: *mut u32,
+            fs_flags: *mut u32,
+            fs_name: *mut u16,
+            fs_name_len: u32,
+        ) -> i32;
+        fn GetComputerNameW(buffer: *mut u16, size: *mut u32) -> i32;
     }
 
     pub fn is_valid_id(id: &str) -> bool {
@@ -562,6 +730,19 @@ mod store {
         fn generated_id_has_six_digits() {
             let id = gen_id().unwrap();
             assert!(is_valid_id(&id));
+        }
+
+        #[test]
+        fn fnv1a_known_vector() {
+            // Известное значение FNV-1a 64 для "hello".
+            assert_eq!(fnv1a64(b"hello"), 0xa430_d846_80aa_bd0b);
+        }
+
+        #[test]
+        fn fingerprint_is_six_digits_when_available() {
+            if let Some(id) = fingerprint_id() {
+                assert!(is_valid_id(&id), "некорректный ID: {id}");
+            }
         }
 
         #[test]

@@ -119,6 +119,7 @@ Name: "relay_autostart"; Description: "Запускать relay при вход�
 
 [Files]
 Source: "{#PayloadDir}\rat.exe"; DestDir: "{app}"; Components: rat; Flags: ignoreversion
+Source: "{#PayloadDir}\rat-elevate.exe"; DestDir: "{app}"; Components: rat; Flags: ignoreversion
 Source: "{#PayloadDir}\avcodec-63.dll"; DestDir: "{app}"; Components: rat; Flags: ignoreversion
 Source: "{#PayloadDir}\avdevice-63.dll"; DestDir: "{app}"; Components: rat; Flags: ignoreversion
 Source: "{#PayloadDir}\avfilter-12.dll"; DestDir: "{app}"; Components: rat; Flags: ignoreversion
@@ -135,10 +136,10 @@ Source: "{#PayloadDir}\swscale-10.dll"; DestDir: "{app}"; Components: relay; Fla
 Source: "{#PayloadDir}\swresample-7.dll"; DestDir: "{app}"; Components: relay; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\Rat Next"; Filename: "{app}\rat.exe"; Components: rat
+Name: "{group}\Rat Next"; Filename: "{app}\rat-elevate.exe"; IconFilename: "{app}\rat.exe"; Components: rat
 Name: "{group}\Rat Next relay"; Filename: "{app}\rat-relay.exe"; Components: relay
 Name: "{group}\{cm:UninstallProgram,Rat Next}"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\Rat Next"; Filename: "{app}\rat.exe"; Tasks: desktopicon; Components: rat
+Name: "{autodesktop}\Rat Next"; Filename: "{app}\rat-elevate.exe"; IconFilename: "{app}\rat.exe"; Tasks: desktopicon; Components: rat
 
 [Run]
 Filename: "{app}\rat.exe"; Parameters: "--install-autostart"; Tasks: autostart; Components: rat; Flags: runhidden; StatusMsg: "Включаю автозапуск…"

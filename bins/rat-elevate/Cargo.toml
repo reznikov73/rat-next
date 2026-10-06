@@ -1,0 +1,8 @@
+[package]
+name = "rat-elevate"
+description = "Rat Next — мини-лаунчер для ярлыков: обычный запуск при службе, иначе с повышением прав"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]

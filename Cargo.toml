@@ -10,6 +10,7 @@ members = [
     "bins/agent",
     "bins/agent-helper",
     "bins/rat",
+    "bins/rat-elevate",
     "bins/relay",
     "bins/signaling",
     "bins/viewer",

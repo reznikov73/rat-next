@@ -1,4 +1,4 @@
-﻿# Сборка установщика Rat Next (Inno Setup 6).
+# Сборка установщика Rat Next (Inno Setup 6).
 # Использование:  powershell -ExecutionPolicy Bypass -File scripts\build-installer.ps1
 # Результат:      dist\rat-next-setup-<ГГГГ-ММ-ДД>.exe
 $ErrorActionPreference = 'Stop'
@@ -9,7 +9,7 @@ Write-Host '== 1/3: сборка релиза ==' -ForegroundColor Cyan
 Push-Location $root
 try {
     . .\scripts\devshell.ps1
-    cargo build --release -p rat -p rat-relay --features rat/ffmpeg
+    cargo build --release -p rat -p rat-relay -p rat-elevate --features rat/ffmpeg
     if ($LASTEXITCODE -ne 0) { throw "cargo build завершился с кодом $LASTEXITCODE (возможно, запущенный rat.exe блокирует сборку)" }
 } finally {
     Pop-Location
@@ -20,6 +20,7 @@ $payload = Join-Path $root 'dist\payload'
 New-Item -ItemType Directory -Force -Path $payload | Out-Null
 $rel = Join-Path $root 'target\release'
 Copy-Item (Join-Path $rel 'rat.exe') $payload -Force
+Copy-Item (Join-Path $rel 'rat-elevate.exe') $payload -Force
 Copy-Item (Join-Path $rel 'rat-relay.exe') $payload -Force
 foreach ($d in 'avcodec-63.dll','avdevice-63.dll','avfilter-12.dll','avformat-63.dll','avutil-61.dll','swresample-7.dll','swscale-10.dll') {
     Copy-Item (Join-Path $rel $d) $payload -Force
