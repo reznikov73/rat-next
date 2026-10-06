@@ -1,4 +1,4 @@
-# Сборка установщика Rat Next (Inno Setup 6).
+﻿# Сборка установщика Rat Next (Inno Setup 6).
 # Использование:  powershell -ExecutionPolicy Bypass -File scripts\build-installer.ps1
 # Результат:      dist\rat-next-setup-<ГГГГ-ММ-ДД>.exe
 $ErrorActionPreference = 'Stop'
