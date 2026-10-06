@@ -202,6 +202,12 @@ fn main() {
     }
     if !rat_session::single_instance::try_acquire("app") {
         if args.smoke.is_none() && !args.service_helper {
+            // Повторный запуск — просьба к работающему экземпляру показать окно
+            // (то же, что клик по значку в трее; работает и когда значка нет).
+            if rat_session::single_instance::show_signal("app") {
+                note("rat: повторный запуск — отправлен запрос «показать окно»");
+                std::process::exit(0);
+            }
             rat_session::single_instance::warn(
                 "Rat Next",
                 "Rat Next уже запущен.\nОкно можно открыть из значка в трее.",
@@ -1004,12 +1010,23 @@ mod ui {
                 .with_icon(window_icon()),
             ..Default::default()
         };
+        // Слушатель повторного запуска: второй rat.exe просит показать окно.
+        let repaint_slot: std::sync::Arc<std::sync::Mutex<Option<egui::Context>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let show_request = {
+            let slot = repaint_slot.clone();
+            rat_session::single_instance::show_listener("app", move || {
+                if let Some(ctx) = slot.lock().ok().and_then(|c| c.clone()) {
+                    ctx.request_repaint();
+                }
+            })
+        };
         eframe::run_native(
             "Rat Next",
             options,
             Box::new(move |cc| {
                 install_ui_fonts(&cc.egui_ctx);
-                Ok(Box::new(RatApp::new(args)))
+                Ok(Box::new(RatApp::new(args, show_request, repaint_slot)))
             }),
         )
         .map_err(|e| e.to_string())
@@ -1141,10 +1158,18 @@ mod ui {
         /// Окно показали автоматически ради диалога подтверждения —
         /// после ответа его нужно вернуть в трей.
         shown_for_dialog: bool,
+        /// Запрос «показать окно» от повторного запуска exe.
+        show_request: Option<rat_session::single_instance::ShowListener>,
+        /// Контекст egui для слушателя повторного запуска (будит перерисовку).
+        repaint_slot: std::sync::Arc<std::sync::Mutex<Option<egui::Context>>>,
     }
 
     impl RatApp {
-        fn new(args: Args) -> Self {
+        fn new(
+            args: Args,
+            show_request: Option<rat_session::single_instance::ShowListener>,
+            repaint_slot: std::sync::Arc<std::sync::Mutex<Option<egui::Context>>>,
+        ) -> Self {
             let machines = Arc::new(Mutex::new(load()));
             let statuses: Arc<Mutex<HashMap<String, bool>>> = Arc::new(Mutex::new(HashMap::new()));
             {
@@ -1226,8 +1251,11 @@ mod ui {
             let settings_auto_allow = device.auto_allow;
             let settings_tray = device.tray;
             crate::approval::set_auto_allow(device.auto_allow);
-            let tray = if device.tray {
-                match crate::tray::Tray::new() {
+            // Служба («RatNext») — значок в трее создаём всегда: иначе к окну
+            // скрытого агента не добраться. Настройка действует для обычного
+            // запуска и автозапуска задачи, как раньше.
+            let tray = if device.tray || args.service_helper {
+                match crate::tray::Tray::new(!args.service_helper) {
                     Ok(tray) => Some(tray),
                     Err(e) => {
                         crate::note(&format!("[ui] значок в трее не создан: {e}"));
@@ -1287,6 +1315,8 @@ mod ui {
                 hidden: false,
                 tray_hide_done: false,
                 shown_for_dialog: false,
+                show_request,
+                repaint_slot,
                 args,
             }
         }
@@ -1805,7 +1835,7 @@ mod ui {
                         crate::approval::set_auto_allow(self.settings_auto_allow);
                         if self.settings_tray != self.device.tray {
                             if self.settings_tray {
-                                match crate::tray::Tray::new() {
+                                match crate::tray::Tray::new(true) {
                                     Ok(tray) => {
                                         self.tray = Some(tray);
                                         self.device.tray = true;
@@ -2683,6 +2713,19 @@ mod ui {
     impl eframe::App for RatApp {
         fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
             let ctx = ui.ctx().clone();
+            // Первый кадр: запомнить контекст egui — поток слушателя
+            // повторного запуска будит им перерисовку.
+            if let Ok(mut slot) = self.repaint_slot.lock()
+                && slot.is_none()
+            {
+                *slot = Some(ctx.clone());
+            }
+            // Повторный запуск: показать окно (как клик по значку в трее).
+            if self.show_request.as_ref().is_some_and(|s| s.take()) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                self.hidden = false;
+            }
             self.poll_tray(&ctx);
             self.handle_close(&ctx);
             if !self.tray_hide_done {
