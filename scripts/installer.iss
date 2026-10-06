@@ -39,37 +39,67 @@ Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Code]
+var
+  RatWasRunning: Boolean;
+  RelayWasRunning: Boolean;
+
+function ServiceIsRunning(Name: String): Boolean;
+var
+  ResultCode: Integer;
+begin
+  { Определяем, запущена ли служба (sc query + поиск строки RUNNING). }
+  Result := Exec(
+    ExpandConstant('{cmd}'),
+    '/c sc query ' + Name + ' | findstr /C:"RUNNING" >nul',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0);
+end;
+
+procedure WaitStopped(Name: String);
+var
+  I: Integer;
+begin
+  for I := 1 to 20 do
+  begin
+    if not ServiceIsRunning(Name) then
+      Break;
+    Sleep(250);
+  end;
+end;
+
 procedure StopOldServices;
 var
   ResultCode: Integer;
 begin
-  { Обновление поверх работающей службы: останавливаем, чтобы можно было
-    заменить файлы; в конце установки службы запускаются заново. }
-  Exec('sc.exe', 'stop RatNext', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  Exec('sc.exe', 'stop RatNextRelay', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  { Обновление поверх работающей службы: запоминаем состояние, останавливаем,
+    чтобы заменить файлы; после установки службы поднимаются обратно. }
+  RatWasRunning := ServiceIsRunning('RatNext');
+  RelayWasRunning := ServiceIsRunning('RatNextRelay');
+  if RatWasRunning then
+  begin
+    Exec('sc.exe', 'stop RatNext', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    WaitStopped('RatNext');
+  end;
+  if RelayWasRunning then
+  begin
+    Exec('sc.exe', 'stop RatNextRelay', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    WaitStopped('RatNextRelay');
+  end;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
+var
+  ResultCode: Integer;
 begin
   if CurStep = ssInstall then
     StopOldServices;
-end;
-
-function IsAdminInstall: Boolean;
-begin
-  { Службы ставятся только при установке с правами администратора. }
-  Result := IsAdmin;
-end;
-
-function NoRatService: Boolean;
-begin
-  { Не предлагать «запустить сейчас», если поставлена служба — агент уже работает. }
-  Result := not WizardIsTaskSelected('service_rat');
-end;
-
-function NoRelayService: Boolean;
-begin
-  Result := not WizardIsTaskSelected('service_relay');
+  if CurStep = ssPostInstall then
+  begin
+    { Службы, работавшие до обновления, поднимаем обратно. }
+    if RatWasRunning then
+      Exec('sc.exe', 'start RatNext', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    if RelayWasRunning then
+      Exec('sc.exe', 'start RatNextRelay', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  end;
 end;
 
 [Types]
@@ -81,11 +111,11 @@ Name: "rat"; Description: "Rat Next — приложение (плитки, по
 Name: "relay"; Description: "Relay-сервер (интернет-режим; обычно только на сервере)"
 
 [Tasks]
-Name: "service_rat"; Description: "Служба Rat Next — доступен с загрузки Windows, без входа пользователя (рекомендуется)"; GroupDescription: "Дополнительные параметры:"; Components: rat; Check: IsAdminInstall
-Name: "autostart"; Description: "Запускать Rat Next при входе в Windows (простая схема, без службы)"; GroupDescription: "Дополнительные параметры:"; Flags: unchecked; Components: rat
+; Службы больше не предлагаются в установщике: их можно включить в настройках
+; самого приложения (Rat Next / relay) — Windows запросит права при операции.
+Name: "autostart"; Description: "Запускать Rat Next при входе в Windows (с правами администратора, без службы)"; GroupDescription: "Дополнительные параметры:"; Flags: unchecked; Components: rat
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "Дополнительные параметры:"; Flags: unchecked; Components: rat
-Name: "service_relay"; Description: "Служба relay — запуск с загрузки Windows (для серверных машин)"; GroupDescription: "Дополнительные параметры:"; Flags: unchecked; Components: relay; Check: IsAdminInstall
-Name: "relay_autostart"; Description: "Запускать relay при входе в Windows (простая схема, без службы)"; GroupDescription: "Дополнительные параметры:"; Flags: unchecked; Components: relay
+Name: "relay_autostart"; Description: "Запускать relay при входе в Windows (с правами администратора, без службы)"; GroupDescription: "Дополнительные параметры:"; Flags: unchecked; Components: relay
 
 [Files]
 Source: "{#PayloadDir}\rat.exe"; DestDir: "{app}"; Components: rat; Flags: ignoreversion
@@ -111,12 +141,10 @@ Name: "{group}\{cm:UninstallProgram,Rat Next}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\Rat Next"; Filename: "{app}\rat.exe"; Tasks: desktopicon; Components: rat
 
 [Run]
-Filename: "{app}\rat.exe"; Parameters: "--install-service"; Tasks: service_rat; Components: rat; Flags: runhidden; StatusMsg: "Устанавливаю службу Rat Next…"
-Filename: "{app}\rat-relay.exe"; Parameters: "--install-service"; Tasks: service_relay; Components: relay; Flags: runhidden; StatusMsg: "Устанавливаю службу relay…"
 Filename: "{app}\rat.exe"; Parameters: "--install-autostart"; Tasks: autostart; Components: rat; Flags: runhidden; StatusMsg: "Включаю автозапуск…"
 Filename: "{app}\rat-relay.exe"; Parameters: "--install-autostart"; Tasks: relay_autostart; Components: relay; Flags: runhidden; StatusMsg: "Включаю автозапуск relay…"
-Filename: "{app}\rat.exe"; Description: "{cm:LaunchProgram,Rat Next}"; Components: rat; Flags: nowait postinstall skipifsilent; Check: NoRatService
-Filename: "{app}\rat-relay.exe"; Description: "Запустить relay-сервер"; Components: relay; Flags: nowait postinstall skipifsilent; Check: NoRelayService
+Filename: "{app}\rat.exe"; Description: "{cm:LaunchProgram,Rat Next}"; Components: rat; Flags: nowait postinstall skipifsilent
+Filename: "{app}\rat-relay.exe"; Description: "Запустить relay-сервер"; Components: relay; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
 ; Без Components: файла нет — команда пропускается (skipifdoesntexist),
