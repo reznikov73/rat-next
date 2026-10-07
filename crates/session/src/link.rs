@@ -139,6 +139,73 @@ fn send_proto_line(stream: &mut TcpStream, line: &str) -> io::Result<()> {
     stream.write_all(s.as_bytes())
 }
 
+/// Включить TCP keepalive на relay-соединениях: «тихая» смерть канала
+/// (без FIN/RST) замечается за ~30–60 с, после чего существующий цикл
+/// переподключения перерегистрирует устройство на relay.
+#[cfg(windows)]
+fn enable_keepalive(stream: &TcpStream) {
+    use std::os::windows::io::AsRawSocket;
+
+    #[repr(C)]
+    struct TcpKeepalive {
+        onoff: u32,
+        keepalivetime: u32,
+        keepaliveinterval: u32,
+    }
+
+    const SOL_SOCKET: i32 = 0xFFFF;
+    const SO_KEEPALIVE: i32 = 0x0008;
+    const SIO_KEEPALIVE_VALS: u32 = 0x9800_0004;
+
+    #[link(name = "Ws2_32")]
+    unsafe extern "system" {
+        fn setsockopt(s: usize, level: i32, optname: i32, optval: *const u8, optlen: i32) -> i32;
+        fn WSAIoctl(
+            s: usize,
+            code: u32,
+            inbuf: *const u8,
+            inlen: u32,
+            outbuf: *mut u8,
+            outlen: u32,
+            bytes: *mut u32,
+            overlapped: *mut u8,
+            completion: *mut u8,
+        ) -> i32;
+    }
+
+    unsafe {
+        let sock = stream.as_raw_socket() as usize;
+        let on: u32 = 1;
+        let _ = setsockopt(
+            sock,
+            SOL_SOCKET,
+            SO_KEEPALIVE,
+            &on as *const u32 as *const u8,
+            4,
+        );
+        let ka = TcpKeepalive {
+            onoff: 1,
+            keepalivetime: 30_000,
+            keepaliveinterval: 5_000,
+        };
+        let mut bytes: u32 = 0;
+        let _ = WSAIoctl(
+            sock,
+            SIO_KEEPALIVE_VALS,
+            &ka as *const TcpKeepalive as *const u8,
+            std::mem::size_of::<TcpKeepalive>() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut bytes,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn enable_keepalive(_stream: &TcpStream) {}
+
 fn connect_with_timeout(relay: impl ToSocketAddrs, ms: u64) -> io::Result<TcpStream> {
     let sa = relay.to_socket_addrs()?.next().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "relay: пустой адрес сервера")
@@ -150,6 +217,7 @@ fn connect_with_timeout(relay: impl ToSocketAddrs, ms: u64) -> io::Result<TcpStr
 pub fn relay_connect(relay: impl ToSocketAddrs, id: &str) -> io::Result<(Duplex, TcpCloser)> {
     let mut stream = connect_with_timeout(relay, 5000)?;
     stream.set_nodelay(true)?;
+    enable_keepalive(&stream);
     send_proto_line(&mut stream, &format!("CONNECT {id}"))?;
     let line = read_proto_line(&mut stream, 256)?;
     if !line.starts_with("OK") {
@@ -172,6 +240,7 @@ pub fn relay_register(
 ) -> io::Result<(TcpStream, TcpCloser)> {
     let mut stream = connect_with_timeout(relay, 5000)?;
     stream.set_nodelay(true)?;
+    enable_keepalive(&stream);
     let name = name.replace(['\n', '\r'], " ");
     send_proto_line(&mut stream, &format!("REG {id} {name}"))?;
     let line = read_proto_line(&mut stream, 256)?;
