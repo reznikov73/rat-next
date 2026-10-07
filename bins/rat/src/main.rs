@@ -725,6 +725,7 @@ mod store {
             .unwrap_or(0)
     }
 
+    #[allow(dead_code)]
     pub fn ago_text(ts: i64) -> String {
         let d = now_unix() - ts;
         if d < 60 {
@@ -1215,7 +1216,7 @@ mod ui {
     use std::time::{Duration, Instant};
 
     use eframe::egui;
-    use rat_session::capture::MonitorInfo;
+
     use rat_session::input::{self, CursorState, InputEvent, SessionInfo};
     use rat_session::link::{TcpCloser, tcp_connect};
     use rat_session::stats::{SessionStats, TimeBase};
@@ -1226,13 +1227,20 @@ mod ui {
     use super::internet::InternetHandle;
     use super::server::ServerHandle;
     use super::store::{
-        ConnectionMode, Device, Machine, ago_text, gen_id, is_valid_id, load, load_device,
-        normalize_addr, normalize_relay, now_unix, save, save_device,
+        ConnectionMode, Device, Machine, gen_id, is_valid_id, load, load_device, normalize_addr,
+        normalize_relay, now_unix, save, save_device,
     };
 
-    const CARD_BG: egui::Color32 = egui::Color32::from_rgb(34, 39, 47);
-    const CARD_BORDER: egui::Color32 = egui::Color32::from_rgb(70, 76, 88);
-    const CARD_BORDER_HOVER: egui::Color32 = egui::Color32::from_rgb(64, 140, 255);
+    /// Светлые карточки-плитки — как в согласованном макете.
+    const CARD_BG: egui::Color32 = egui::Color32::from_rgb(252, 252, 253);
+    const CARD_BORDER: egui::Color32 = egui::Color32::from_rgb(219, 223, 229);
+    const CARD_BORDER_HOVER: egui::Color32 = egui::Color32::from_rgb(59, 130, 246);
+    /// Плитка «+ Добавить машину», текст плиток и кнопка «Подключиться».
+    const ADD_CARD_BG: egui::Color32 = egui::Color32::from_rgb(248, 249, 251);
+    const TILE_TEXT: egui::Color32 = egui::Color32::from_rgb(31, 35, 40);
+    const TILE_OFF_DOT: egui::Color32 = egui::Color32::from_rgb(197, 202, 210);
+    const BTN_BLUE: egui::Color32 = egui::Color32::from_rgb(59, 130, 246);
+    const BTN_BLUE_DIM: egui::Color32 = egui::Color32::from_rgb(126, 165, 244);
     const ON: egui::Color32 = egui::Color32::from_rgb(76, 175, 80); // цвет 
     const OFF: egui::Color32 = egui::Color32::from_rgb(244, 67, 54);
     const DIM: egui::Color32 = egui::Color32::from_rgb(150, 158, 170);
@@ -1389,6 +1397,7 @@ mod ui {
         Connect(usize),
         Rename(usize),
         Delete(usize),
+        Add,
     }
 
     pub struct RatApp {
@@ -1406,12 +1415,10 @@ mod ui {
         /// «Служебное»: локальный приём и его порт (применяются по «Сохранить»).
         settings_serve_local: bool,
         settings_serve_port: String,
-        /// Отдаваемый экран (индекс монитора) в настройках.
-        settings_monitor: u32,
+
         incoming_rx: Receiver<Request>,
         incoming_pending: Option<Request>,
-        monitors: Vec<MonitorInfo>,
-        monitor_sel: u32,
+
         my_ip: String,
         my_name: String,
         screen: Screen,
@@ -1519,8 +1526,8 @@ mod ui {
             } else {
                 crate::note(&format!("[ui] сервер запущен, порт {port}"));
             }
-            let monitors = rat_session::capture::list_outputs().unwrap_or_default();
-            crate::note(&format!("[ui] мониторов найдено: {}", monitors.len()));
+            let monitors_found = rat_session::capture::list_outputs().unwrap_or_default();
+            crate::note(&format!("[ui] мониторов найдено: {}", monitors_found.len()));
             let monitor_sel = args.monitor;
             server.monitor.store(monitor_sel, Ordering::Relaxed);
             let mut device = load_device();
@@ -1599,11 +1606,8 @@ mod ui {
                 settings_error: None,
                 settings_serve_local: serve_running,
                 settings_serve_port: port.to_string(),
-                settings_monitor: monitor_sel,
                 incoming_rx,
                 incoming_pending: None,
-                monitors,
-                monitor_sel,
                 my_ip: local_ip(),
                 my_name: std::env::var("COMPUTERNAME").unwrap_or_default(),
                 screen: Screen::Home,
@@ -1652,7 +1656,6 @@ mod ui {
             self.settings_auto_allow = self.device.auto_allow;
             self.settings_serve_local = self.server.is_running();
             self.settings_serve_port = self.server.port.to_string();
-            self.settings_monitor = self.monitor_sel;
             self.settings_error = None;
             self.settings_open = true;
         }
@@ -1848,7 +1851,14 @@ mod ui {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.heading("Rat Next");
-                    ui.separator();
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Настройки").clicked() {
+                            self.open_settings();
+                        }
+                    });
+                });
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
                     let (st_col, st_text) = self.status_line();
                     let (rect, _) =
                         ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
@@ -1858,35 +1868,18 @@ mod ui {
                         ui.separator();
                         ui.colored_label(OFF, format!("ошибка: {e}"));
                     }
-                });
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    // «Мой ID» слева: подпись — по высоте номера, номер — жирный.
-                    let id_font = egui::FontId::new(34.0, egui::FontFamily::Name(ID_BOLD.into()));
-                    // Резервируем высоту строки заранее — иначе подпись
-                    // центрируется по ещё «короткой» строке и уезжает вверх.
-                    let line_h = ui.ctx().fonts_mut(|f| f.row_height(&id_font));
-                    ui.set_min_height(line_h);
-                    ui.vertical(|ui| {
-                        // Подпись — по оптическому центру цифр номера
-                        // (18px выверены по пикселям; при смене кегля подстроить).
-                        ui.add_space(18.0);
-                        // Без .color(...) — цвет берётся из темы, как у ui.label("Монитор:")
-                        ui.label(egui::RichText::new("Мой ID"));
-                    });
-                    ui.label(
-                        egui::RichText::new(self.device.id.clone())
-                            .font(id_font)
-                            .color(ID_BRIGHT),
-                    );
-                    if ui.button("копировать").clicked() {
-                        ui.ctx().copy_text(self.device.id.clone());
-                        self.toast("ID скопирован в буфер обмена");
-                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Настройки").clicked() {
-                            self.open_settings();
+                        if ui.button("копировать").clicked() {
+                            ui.ctx().copy_text(self.device.id.clone());
+                            self.toast("ID скопирован в буфер обмена");
                         }
+                        let id_font =
+                            egui::FontId::new(20.0, egui::FontFamily::Name(ID_BOLD.into()));
+                        ui.label(
+                            egui::RichText::new(format!("ID: {}", self.device.id))
+                                .font(id_font)
+                                .color(ID_BRIGHT),
+                        );
                     });
                 });
                 if !self.elevated && !self.args.service_helper {
@@ -1909,45 +1902,29 @@ mod ui {
                 }
                 ui.add_space(6.0);
             });
-            egui::Panel::bottom("bottom").show(ui, |ui| {
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui.button("+ Добавить машину").clicked() {
-                        self.add_open = true;
-                        self.add_err = None;
-                    }
-                    if let Some(a) = &self.connecting_to {
-                        ui.separator();
-                        ui.spinner();
-                        ui.label(format!("Подключение к {a}…"));
-                    }
-                    if let Some((msg, at)) = &self.toast
-                        && at.elapsed().as_secs_f32() < 6.0
-                    {
-                        ui.separator();
-                        ui.colored_label(egui::Color32::from_rgb(255, 200, 80), msg);
-                    }
+            // Нижняя строка — только для временных сообщений (идёт подключение, тост).
+            let has_bottom = self.connecting_to.is_some()
+                || self
+                    .toast
+                    .as_ref()
+                    .is_some_and(|(_, at)| at.elapsed().as_secs_f32() < 6.0);
+            if has_bottom {
+                egui::Panel::bottom("bottom").show(ui, |ui| {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if let Some(a) = &self.connecting_to {
+                            ui.spinner();
+                            ui.label(format!("Подключение к {a}…"));
+                        }
+                        if let Some((msg, at)) = &self.toast
+                            && at.elapsed().as_secs_f32() < 6.0
+                        {
+                            ui.colored_label(egui::Color32::from_rgb(255, 200, 80), msg);
+                        }
+                    });
+                    ui.add_space(4.0);
                 });
-                ui.horizontal(|ui| {
-                    let mode_label = match self.device.mode {
-                        ConnectionMode::Internet => "Интернет",
-                        ConnectionMode::Lan => "локальная сеть",
-                    };
-                    ui.label(format!("Режим: {mode_label}"));
-                    if self.device.mode == ConnectionMode::Internet {
-                        let running = self.internet.is_running();
-                        let (rect, _) =
-                            ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                        ui.painter().circle_filled(
-                            rect.center(),
-                            5.0,
-                            if running { ON } else { OFF },
-                        );
-                        ui.label(self.internet.status.lock().unwrap().clone());
-                    }
-                });
-                ui.add_space(6.0);
-            });
+            }
 
             let snapshot: Vec<(usize, Machine, bool)> = {
                 let list = self.machines.lock().unwrap();
@@ -1963,7 +1940,7 @@ mod ui {
                     ui.add_space(40.0);
                     ui.vertical_centered(|ui| {
                         ui.label("Пока нет машин.");
-                        ui.label("Нажмите «+ Добавить машину» внизу, чтобы добавить первую.");
+                        ui.label("Нажмите «+ Добавить машину», чтобы добавить первую.");
                         ui.label("Подключение — по адресу IP:порт (например 192.168.1.50:55140).");
                     });
                     return;
@@ -1995,6 +1972,27 @@ mod ui {
                                 }
                             });
                         }
+                        // Плитка «+ Добавить машину» — в общем списке.
+                        let (rect, resp) =
+                            ui.allocate_exact_size(egui::vec2(225.0, 112.0), egui::Sense::click());
+                        let border = if resp.hovered() {
+                            CARD_BORDER_HOVER
+                        } else {
+                            CARD_BORDER
+                        };
+                        let painter = ui.painter();
+                        painter.rect_filled(rect, 8.0, border);
+                        painter.rect_filled(rect.shrink(1.5), 7.0, ADD_CARD_BG);
+                        painter.text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "+ Добавить машину",
+                            egui::FontId::proportional(14.0),
+                            DIM,
+                        );
+                        if resp.clicked() {
+                            actions.push(TileAction::Add);
+                        }
                     });
                 });
             });
@@ -2025,6 +2023,10 @@ mod ui {
                             list.remove(i);
                         }
                         save(&list);
+                    }
+                    TileAction::Add => {
+                        self.add_open = true;
+                        self.add_err = None;
                     }
                 }
             }
@@ -2262,22 +2264,7 @@ mod ui {
                             .small()
                             .color(egui::Color32::from_gray(150)),
                         );
-                        let mut mon_pick: Option<u32> = None;
-                        ui.horizontal(|ui| {
-                            ui.label("Отдаваемый экран (что видит оператор):");
-                            for m in &self.monitors {
-                                let sel = self.settings_monitor == m.index;
-                                if ui
-                                    .selectable_label(sel, format!("Монитор {}", m.index + 1))
-                                    .clicked()
-                                {
-                                    mon_pick = Some(m.index);
-                                }
-                            }
-                        });
-                        if let Some(idx) = mon_pick {
-                            self.settings_monitor = idx;
-                        }
+
                         if let Some(error) = &self.settings_error {
                             ui.colored_label(OFF, error);
                         }
@@ -2329,15 +2316,6 @@ mod ui {
                         } else if !want_serve && serve_running {
                             self.server.stop();
                             self.toast("Локальный приём выключен");
-                        }
-                        if self.settings_monitor != self.monitor_sel {
-                            self.monitor_sel = self.settings_monitor;
-                            self.server
-                                .monitor
-                                .store(self.settings_monitor, Ordering::Relaxed);
-                            self.toast(
-                                "Сменил отдаваемый экран — применится к следующему подключению",
-                            );
                         }
                         save_device(&self.device);
                         self.settings_open = false;
@@ -2479,7 +2457,7 @@ mod ui {
     }
 
     fn tile(ui: &mut egui::Ui, m: &Machine, online: bool) -> egui::Response {
-        let desired = egui::vec2(225.0, 102.0);
+        let desired = egui::vec2(225.0, 112.0);
         let (rect, resp) = ui.allocate_exact_size(desired, egui::Sense::click());
         let border = if resp.hovered() {
             CARD_BORDER_HOVER
@@ -2492,32 +2470,53 @@ mod ui {
         painter.circle_filled(
             egui::pos2(rect.left() + 18.0, rect.top() + 20.0),
             5.0,
-            if online { ON } else { OFF },
+            if online { ON } else { TILE_OFF_DOT },
         );
         painter.text(
-            egui::pos2(rect.left() + 32.0, rect.top() + 12.0),
+            egui::pos2(rect.left() + 32.0, rect.top() + 11.0),
             egui::Align2::LEFT_TOP,
             &m.name,
             egui::FontId::proportional(16.0),
-            egui::Color32::from_rgb(238, 240, 244),
+            TILE_TEXT,
         );
         painter.text(
-            egui::pos2(rect.left() + 18.0, rect.top() + 46.0),
+            egui::pos2(rect.left() + 18.0, rect.top() + 40.0),
             egui::Align2::LEFT_TOP,
-            &m.addr,
+            format!("ID {}", m.addr),
             egui::FontId::monospace(12.0),
             DIM,
         );
-        let last = m
-            .last_connected
-            .map(ago_text)
-            .unwrap_or_else(|| "ещё не подключались".into());
         painter.text(
-            egui::pos2(rect.left() + 18.0, rect.top() + 72.0),
+            egui::pos2(rect.left() + 18.0, rect.top() + 60.0),
             egui::Align2::LEFT_TOP,
-            &last,
-            egui::FontId::proportional(11.0),
-            DIM2,
+            if online {
+                "в сети"
+            } else {
+                "не в сети"
+            },
+            egui::FontId::proportional(12.5),
+            if online { ON } else { DIM2 },
+        );
+        // Кнопка-подсказка: клик по плитке = подключиться.
+        let btn = egui::Rect::from_min_size(
+            egui::pos2(rect.left() + 18.0, rect.bottom() - 34.0),
+            egui::vec2(112.0, 24.0),
+        );
+        painter.rect_filled(
+            btn,
+            6.0,
+            if resp.hovered() {
+                BTN_BLUE
+            } else {
+                BTN_BLUE_DIM
+            },
+        );
+        painter.text(
+            btn.center(),
+            egui::Align2::CENTER_CENTER,
+            "Подключиться",
+            egui::FontId::proportional(13.0),
+            egui::Color32::WHITE,
         );
         resp
     }
