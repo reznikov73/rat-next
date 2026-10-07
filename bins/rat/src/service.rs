@@ -207,23 +207,38 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
 /// Следим за активной сессией и держим в ней хелпер.
 fn supervise() {
     let mut last_spawn: Option<std::time::Instant> = None;
+    let mut fail_streak: u32 = 0;
     while !STOP.load(Ordering::Relaxed) {
         let session = unsafe { WTSGetActiveConsoleSessionId() };
         if session != u32::MAX {
             let pid = HELPER_PID.load(Ordering::Relaxed);
             let alive = pid != 0 && process_alive(pid);
             let session_changed = HELPER_SESSION.load(Ordering::Relaxed) != session;
+            // Помощник прожил достаточно долго — считаем проблему решённой.
+            if alive
+                && !session_changed
+                && last_spawn.is_some_and(|t| t.elapsed() >= Duration::from_secs(30))
+            {
+                fail_streak = 0;
+            }
             if !alive || session_changed {
                 if pid != 0 && !alive {
                     log_line(&format!("хелпер завершился: pid={pid}"));
                 }
                 kill_helper();
                 // Если предыдущий хелпер умер сразу (например, уже работает
-                // другой экземпляр приложения) — выдерживаем паузу.
-                if let Some(t) = last_spawn
-                    && t.elapsed() < Duration::from_secs(3)
-                {
-                    sleep_steps(Duration::from_secs(8));
+                // другой экземпляр приложения) — выдерживаем паузу, наращивая
+                // её при повторных быстрых смертях: 8с → 15с → 30с → 60с.
+                let fast_fail = last_spawn.is_some_and(|t| t.elapsed() < Duration::from_secs(3));
+                if fast_fail {
+                    fail_streak = fail_streak.saturating_add(1);
+                    let delay = match fail_streak {
+                        0 | 1 => 8,
+                        2 => 15,
+                        3 => 30,
+                        _ => 60,
+                    };
+                    sleep_steps(Duration::from_secs(delay));
                     if STOP.load(Ordering::Relaxed) {
                         break;
                     }
@@ -582,6 +597,11 @@ pub fn status() -> State {
             _ => State::Pending,
         }
     }
+}
+
+/// Установлена ли служба (для проверок автозапуска и меню значка).
+pub fn is_installed() -> bool {
+    !matches!(status(), State::NotInstalled)
 }
 
 /// Запустить установленную службу.

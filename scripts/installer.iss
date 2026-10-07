@@ -113,7 +113,7 @@ Name: "relay"; Description: "Relay-сервер (интернет-режим; о
 [Tasks]
 ; Службы больше не предлагаются в установщике: их можно включить в настройках
 ; самого приложения (Rat Next / relay) — Windows запросит права при операции.
-Name: "autostart"; Description: "Запускать Rat Next при входе в Windows (с правами администратора, без службы)"; GroupDescription: "Дополнительные параметры:"; Flags: unchecked; Components: rat
+Name: "autostart"; Description: "Запускать Rat Next при входе в Windows (с правами администратора, без службы)"; GroupDescription: "Дополнительные параметры:"; Components: rat
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "Дополнительные параметры:"; Flags: unchecked; Components: rat
 Name: "relay_autostart"; Description: "Запускать relay при входе в Windows (с правами администратора, без службы)"; GroupDescription: "Дополнительные параметры:"; Flags: unchecked; Components: relay
 

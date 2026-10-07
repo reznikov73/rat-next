@@ -243,6 +243,10 @@ fn main() {
         return;
     }
     if args.install_autostart {
+        if service::is_installed() {
+            note("autostart: служба уже установлена — задача планировщика не создаётся");
+            std::process::exit(0);
+        }
         match autostart::install() {
             Ok(()) => {
                 println!("Автозапуск включён (задача «Rat Next»).");
@@ -286,6 +290,10 @@ fn main() {
         note("rat: экземпляр уже запущен (двойной запуск заблокирован)");
         std::process::exit(2);
     }
+    note(&format!(
+        "rat: одиночный запуск: mutex создан, имя={}",
+        rat_session::single_instance::mutex_name_for_log("app")
+    ));
     if let Err(e) = ui::run(args) {
         note(&format!("rat: {e}"));
         std::process::exit(1);
@@ -802,6 +810,9 @@ mod autostart {
 
     /// Создать (или пересоздать) задачу: запуск при входе, сразу в трей.
     pub fn install() -> Result<(), String> {
+        if crate::service::is_installed() {
+            return Err("служба RatNext уже установлена — задача автозапуска не нужна".to_string());
+        }
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         let tr = format!("\"{}\" --tray", exe.display());
         let out = schtasks()
@@ -1413,7 +1424,6 @@ mod ui {
         settings_mode: ConnectionMode,
         settings_relay_edit: String,
         settings_auto_allow: bool,
-        settings_tray: bool,
         settings_autostart: bool,
         settings_error: Option<String>,
         incoming_rx: Receiver<Request>,
@@ -1437,8 +1447,19 @@ mod ui {
         autoconnect_done: bool,
         started: Instant,
         finished: bool,
-        /// Значок в области уведомлений; есть, только если включена настройка.
+        /// Значок в области уведомлений (создаётся всегда; если оболочка
+        /// ещё не готова — попытки повторяются).
         tray: Option<crate::tray::Tray>,
+        /// Осталось повторных попыток создать значок.
+        tray_retry_left: u32,
+        /// Когда повторить попытку создания значка.
+        tray_retry_at: Instant,
+        /// Перепроверка автозапуска после UAC-переключения: сколько раз ещё.
+        autostart_recheck_left: u32,
+        /// Когда перепроверить автозапуск.
+        autostart_recheck_at: Instant,
+        /// Какое состояние автозапуска ждём (true — включён).
+        autostart_recheck_want: bool,
         /// Выбран «Выход» — закрытие окна завершает процесс, а не прячет его.
         quitting: bool,
         /// Окно скрыто в трей — перерисовку можно замедлить.
@@ -1547,27 +1568,43 @@ mod ui {
             let settings_mode = device.mode;
             let settings_relay_edit = device.relay.clone();
             let settings_auto_allow = device.auto_allow;
-            let settings_tray = device.tray;
             crate::approval::set_auto_allow(device.auto_allow);
-            // Служба («RatNext») — значок в трее создаём всегда: иначе к окну
-            // скрытого агента не добраться. Настройка действует для обычного
-            // запуска и автозапуска задачи, как раньше.
-            let tray = if device.tray || args.service_helper {
-                match crate::tray::Tray::new(!args.service_helper) {
-                    Ok(tray) => Some(tray),
-                    Err(e) => {
-                        crate::note(&format!("[ui] значок в трее не создан: {e}"));
-                        if toast.is_none() {
-                            toast = Some((
-                                format!("Не удалось создать значок в трее: {e}"),
-                                Instant::now(),
-                            ));
-                        }
-                        None
-                    }
-                }
+            // Значок в трее создаём всегда — во всех вариантах: ручной запуск,
+            // агент автозапуска (--tray), помощник службы (--service-helper).
+            // Если оболочка ещё не готова (старт до входа пользователя),
+            // попытки повторяются в цикле UI.
+            let tray_kind = if args.service_helper {
+                crate::tray::Kind::Service
+            } else if args.tray {
+                crate::tray::Kind::Agent
             } else {
-                None
+                crate::tray::Kind::Manual
+            };
+            let mut tray_retry_left: u32 = 0;
+            let mut tray_retry_at = Instant::now();
+            let tray = match crate::tray::Tray::new(
+                tray_kind,
+                crate::autostart::is_installed(),
+                crate::service::is_installed(),
+            ) {
+                Ok(tray) => {
+                    crate::note("[ui] значок в трее создан");
+                    Some(tray)
+                }
+                Err(e) => {
+                    crate::note(&format!("[ui] значок в трее не создан: {e}"));
+                    if toast.is_none() {
+                        toast = Some((
+                            format!("Не удалось создать значок в трее: {e}"),
+                            Instant::now(),
+                        ));
+                    }
+                    if args.smoke.is_none() {
+                        tray_retry_left = 120;
+                        tray_retry_at = Instant::now() + Duration::from_secs(5);
+                    }
+                    None
+                }
             };
             let mut internet = InternetHandle::new(server.monitor.clone(), incoming_tx);
             if device.mode == ConnectionMode::Internet && is_valid_id(&device.id) {
@@ -1584,7 +1621,6 @@ mod ui {
                 settings_mode,
                 settings_relay_edit,
                 settings_auto_allow,
-                settings_tray,
                 settings_autostart: false,
                 settings_error: None,
                 incoming_rx,
@@ -1609,6 +1645,11 @@ mod ui {
                 started: Instant::now(),
                 finished: false,
                 tray,
+                tray_retry_left,
+                tray_retry_at,
+                autostart_recheck_left: 0,
+                autostart_recheck_at: Instant::now(),
+                autostart_recheck_want: false,
                 quitting: false,
                 hidden: false,
                 tray_hide_done: false,
@@ -1873,7 +1914,6 @@ mod ui {
                             self.settings_mode = self.device.mode;
                             self.settings_relay_edit = self.device.relay.clone();
                             self.settings_auto_allow = self.device.auto_allow;
-                            self.settings_tray = self.device.tray;
                             self.settings_autostart = crate::autostart::is_installed();
                             self.settings_error = None;
                             self.settings_open = true;
@@ -2090,6 +2130,10 @@ mod ui {
                 if self.svc_checked.elapsed() > std::time::Duration::from_secs(1) {
                     self.svc_checked = Instant::now();
                     self.svc_state = crate::service::status();
+                    if !matches!(self.svc_state, crate::service::State::NotInstalled) {
+                        // Автозапуск обеспечивает служба — галочка выключена.
+                        self.settings_autostart = false;
+                    }
                 }
                 let mut open = true;
                 let mut apply = false;
@@ -2131,15 +2175,31 @@ mod ui {
                             .small()
                             .color(egui::Color32::from_gray(150)),
                         );
-                        ui.checkbox(&mut self.settings_tray, "Сворачивать в трей");
-                        ui.checkbox(
-                            &mut self.settings_autostart,
-                            "Запускать при входе в Windows (сразу в трее)",
-                        );
+                        let svc_installed =
+                            !matches!(self.svc_state, crate::service::State::NotInstalled);
+                        ui.add_enabled(
+                            !svc_installed,
+                            egui::Checkbox::new(
+                                &mut self.settings_autostart,
+                                "Запускать при входе в Windows \
+                                 (без службы, с правами администратора)",
+                            ),
+                        )
+                        .on_disabled_hover_text("Управляется службой RatNext");
+                        if svc_installed {
+                            ui.label(
+                                egui::RichText::new("Управляется службой RatNext")
+                                    .small()
+                                    .color(egui::Color32::from_gray(150)),
+                            );
+                        }
                         #[cfg(feature = "ffmpeg")]
                         {
                             ui.separator();
-                            ui.label("Служба Windows — агент доступен с загрузки системы:");
+                            ui.label(
+                                "Служба Windows — альтернатива автозапуску: \
+                                 работает с загрузки ПК, доступен до входа пользователя:",
+                            );
                             let (state_txt, state_col) = match self.svc_state {
                                 crate::service::State::NotInstalled => {
                                     ("не установлена", egui::Color32::from_gray(130))
@@ -2233,24 +2293,6 @@ mod ui {
                         self.device.relay = relay;
                         self.device.auto_allow = self.settings_auto_allow;
                         crate::approval::set_auto_allow(self.settings_auto_allow);
-                        if self.settings_tray != self.device.tray {
-                            if self.settings_tray {
-                                match crate::tray::Tray::new(true) {
-                                    Ok(tray) => {
-                                        self.tray = Some(tray);
-                                        self.device.tray = true;
-                                    }
-                                    Err(e) => {
-                                        self.settings_tray = false;
-                                        self.device.tray = false;
-                                        self.toast(format!("Значок в трее недоступен: {e}"));
-                                    }
-                                }
-                            } else {
-                                self.tray = None;
-                                self.device.tray = false;
-                            }
-                        }
                         let autostart_now = crate::autostart::is_installed();
                         if self.settings_autostart != autostart_now {
                             let result = if self.settings_autostart {
@@ -3142,7 +3184,22 @@ mod ui {
                 Ok(()) => {
                     self.svc_state = crate::service::status();
                     self.svc_checked = Instant::now();
-                    self.toast(format!("{name}: выполнено"));
+                    if let Some(tray) = &self.tray {
+                        tray.set_autostart_text(crate::autostart::is_installed());
+                    }
+                    match op {
+                        crate::service::Op::Install => {
+                            self.settings_autostart = false;
+                            self.toast("Служба установлена — задача планировщика удалена");
+                        }
+                        crate::service::Op::Uninstall => {
+                            self.toast(
+                                "Служба удалена. При необходимости включите автозапуск галочкой",
+                            );
+                        }
+                        crate::service::Op::Start => self.toast("Запуск службы: выполнено"),
+                        crate::service::Op::Stop => self.toast("Остановка службы: выполнено"),
+                    }
                 }
                 Err(e) => {
                     if e.contains("ошибка 5") {
@@ -3173,7 +3230,8 @@ mod ui {
 
         /// Крестик окна прячет приложение в трей, сессии продолжают работать.
         fn handle_close(&mut self, ctx: &egui::Context) {
-            if self.quitting {
+            // Завершение (выход или smoke-автостоп) — закрытию не мешаем.
+            if self.quitting || self.finished {
                 return;
             }
             if ctx.input(|i| i.viewport().close_requested()) {
@@ -3187,9 +3245,9 @@ mod ui {
                     self.close_viewer();
                     return;
                 }
-                // В режиме агента (--tray) закрытие окна только прячет его: агент
-                // продолжает работать, иначе служба перезапускала бы его по кругу,
-                // а активная сессия оператора рвалась бы.
+                // Закрытие окна только прячет его: приложение и активные
+                // сессии продолжают работать; полный выход — через «Выход»
+                // в меню значка (там, где он есть).
                 if self.tray.is_none() && !self.args.tray {
                     return;
                 }
@@ -3199,7 +3257,7 @@ mod ui {
             }
         }
 
-        /// Команды меню значка: «Показать окно» и «Выход».
+        /// Команды меню значка: показать окно, настройки, автозапуск, выход.
         fn poll_tray(&mut self, ctx: &egui::Context) {
             let Some(cmd) = self.tray.as_ref().and_then(|t| t.poll()) else {
                 return;
@@ -3210,12 +3268,120 @@ mod ui {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     self.hidden = false;
                 }
+                crate::tray::Cmd::Settings => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    self.hidden = false;
+                    self.settings_mode = self.device.mode;
+                    self.settings_relay_edit = self.device.relay.clone();
+                    self.settings_auto_allow = self.device.auto_allow;
+                    self.settings_autostart = crate::autostart::is_installed();
+                    self.settings_error = None;
+                    self.settings_open = true;
+                }
+                crate::tray::Cmd::ToggleAutostart => self.toggle_autostart(),
                 crate::tray::Cmd::Quit => {
                     self.quitting = true;
                     self.internet.stop();
                     self.server.stop();
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
+            }
+        }
+
+        /// Переключить автозапуск из меню значка; при нехватке прав — через UAC.
+        fn toggle_autostart(&mut self) {
+            if crate::service::is_installed() {
+                self.toast("Автозапуск управляется службой RatNext");
+                return;
+            }
+            let installed = crate::autostart::is_installed();
+            let flag = if installed {
+                "--remove-autostart"
+            } else {
+                "--install-autostart"
+            };
+            let result = if installed {
+                crate::autostart::remove()
+            } else {
+                crate::autostart::install()
+            };
+            match result {
+                Ok(()) => {
+                    let now = crate::autostart::is_installed();
+                    if let Some(tray) = &self.tray {
+                        tray.set_autostart_text(now);
+                    }
+                    self.settings_autostart = now;
+                    self.toast(if now {
+                        "Автозапуск включён"
+                    } else {
+                        "Автозапуск выключен"
+                    });
+                }
+                Err(e) => {
+                    if !self.elevated && crate::elevate::relaunch(flag).is_ok() {
+                        self.autostart_recheck_left = 5;
+                        self.autostart_recheck_at = Instant::now() + Duration::from_secs(3);
+                        self.autostart_recheck_want = !installed;
+                        self.toast("Подтвердите запрос прав администратора");
+                    } else {
+                        self.toast(format!("Автозапуск: {e}"));
+                    }
+                }
+            }
+        }
+
+        /// Повторные попытки создать значок: оболочка может быть ещё не готова
+        /// (служба и задача стартуют раньше входа пользователя).
+        fn retry_tray(&mut self) {
+            if self.tray.is_some() || self.tray_retry_left == 0 {
+                return;
+            }
+            if Instant::now() < self.tray_retry_at {
+                return;
+            }
+            self.tray_retry_left -= 1;
+            self.tray_retry_at = Instant::now() + Duration::from_secs(5);
+            let kind = if self.args.service_helper {
+                crate::tray::Kind::Service
+            } else if self.args.tray {
+                crate::tray::Kind::Agent
+            } else {
+                crate::tray::Kind::Manual
+            };
+            match crate::tray::Tray::new(
+                kind,
+                crate::autostart::is_installed(),
+                crate::service::is_installed(),
+            ) {
+                Ok(tray) => {
+                    crate::note("[ui] значок в трее создан (повторная попытка)");
+                    self.tray = Some(tray);
+                    self.tray_retry_left = 0;
+                }
+                Err(_) => {
+                    if self.tray_retry_left == 0 {
+                        crate::note("[ui] значок в трее: попытки исчерпаны");
+                    }
+                }
+            }
+        }
+
+        /// После UAC-переключения автозапуска — обновить подпись пункта меню.
+        fn recheck_autostart(&mut self) {
+            if self.autostart_recheck_left == 0 || Instant::now() < self.autostart_recheck_at {
+                return;
+            }
+            self.autostart_recheck_left -= 1;
+            self.autostart_recheck_at = Instant::now() + Duration::from_secs(3);
+            let installed = crate::autostart::is_installed();
+            if let Some(tray) = &self.tray {
+                tray.set_autostart_text(installed);
+            }
+            self.settings_autostart = installed;
+            if installed == self.autostart_recheck_want {
+                self.autostart_recheck_left = 0;
             }
         }
     }
@@ -3238,6 +3404,8 @@ mod ui {
             }
             self.poll_tray(&ctx);
             self.handle_close(&ctx);
+            self.retry_tray();
+            self.recheck_autostart();
             if !self.tray_hide_done {
                 self.tray_hide_done = true;
                 // Режим агента (--tray, служба): окно стартует скрытым даже без

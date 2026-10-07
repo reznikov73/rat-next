@@ -28,6 +28,10 @@ foreach ($d in 'avcodec-63.dll','avdevice-63.dll','avfilter-12.dll','avformat-63
 $readme = Get-ChildItem (Join-Path $root 'dist') -Directory -ErrorAction SilentlyContinue |
     Where-Object { $_.Name -like 'rat-next-*' } | Sort-Object Name -Descending |
     ForEach-Object { Join-Path $_.FullName 'README.txt' } | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $readme) {
+    $tpl = Join-Path $root 'scripts\portable\README.txt'
+    if (Test-Path $tpl) { $readme = $tpl }
+}
 if ($readme) { Copy-Item $readme $payload -Force } else { Write-Warning 'README.txt не найден в dist' }
 $ico = Get-ChildItem (Join-Path $rel 'build') -Recurse -Filter 'rat.ico' -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTime -Descending | Select-Object -First 1

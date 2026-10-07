@@ -15,6 +15,18 @@ const LIVE: (u8, u8, u8) = (76, 175, 80);
 /// Тёмная окантовка точки сессии, чтобы не сливалась с плиткой.
 const LIVE_RING: (u8, u8, u8) = (28, 62, 140);
 
+/// Вариант значка: у режимов свой акцент (для значка в трее).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IconVariant {
+    /// Базовый — ручной запуск из ярлыка.
+    Manual,
+    /// Агент автозапуска (задача планировщика) — зелёные «часы».
+    Task,
+    /// Помощник службы — золотой «щит».
+    Service,
+}
+
 /// Иконка `size`×`size` в RGBA8.
 ///
 /// Рисуется в четырёхкратном разрешении и усредняется — так обходятся без
@@ -29,7 +41,22 @@ pub fn rgba(size: u32) -> Vec<u8> {
     downscale(&buf, hi, size, ss)
 }
 
+/// Иконка `size`×`size` с акцентом варианта (для значка в трее).
+#[allow(dead_code)]
+pub fn rgba_variant(size: u32, variant: IconVariant) -> Vec<u8> {
+    let size = size.max(8);
+    let ss = 4;
+    let hi = size * ss;
+    let mut buf = vec![0u8; (hi as usize) * (hi as usize) * 4];
+    paint_variant(&mut buf, hi, variant);
+    downscale(&buf, hi, size, ss)
+}
+
 fn paint(buf: &mut [u8], n: u32) {
+    paint_variant(buf, n, IconVariant::Manual);
+}
+
+fn paint_variant(buf: &mut [u8], n: u32, variant: IconVariant) {
     let f = n as f32;
 
     // Плитка: скруглённый квадрат с синим градиентом.
@@ -78,8 +105,8 @@ fn paint(buf: &mut [u8], n: u32) {
     }
 
     // Точка сессии — только от 24 логических px (hi = size × 4), иначе
-    // на мелких значках сливается в пятно.
-    if f >= 96.0 {
+    // на мелких значках сливается в пятно. У вариантов с бейджем угол занят.
+    if f >= 96.0 && matches!(variant, IconVariant::Manual) {
         let (cx, cy, rad) = (f * 0.84, f * 0.84, f * 0.12);
         for y in 0..n {
             for x in 0..n {
@@ -91,6 +118,70 @@ fn paint(buf: &mut [u8], n: u32) {
                 } else if d <= rad + f * 0.03 {
                     put(buf, n, x, y, LIVE_RING);
                 }
+            }
+        }
+    }
+
+    match variant {
+        IconVariant::Manual => {}
+        IconVariant::Service => paint_shield(buf, n),
+        IconVariant::Task => paint_clock(buf, n),
+    }
+}
+
+/// Золотой «щит» в правом нижнем углу — вариант «служба».
+fn paint_shield(buf: &mut [u8], n: u32) {
+    const GOLD: (u8, u8, u8) = (245, 190, 70);
+    const RING: (u8, u8, u8) = (24, 52, 118);
+    let f = n as f32;
+    let cx = 0.80_f32;
+    let shield = |k: f32| -> [(f32, f32); 5] {
+        [
+            (cx - 0.135 * k, 0.700_f32),
+            (cx + 0.135 * k, 0.700_f32),
+            (cx + 0.135 * k, 0.805_f32),
+            (cx, 0.945_f32),
+            (cx - 0.135 * k, 0.805_f32),
+        ]
+    };
+    let outer = shield(1.22);
+    let inner = shield(1.0);
+    for y in 0..n {
+        for x in 0..n {
+            let px = (x as f32 + 0.5) / f;
+            let py = (y as f32 + 0.5) / f;
+            if in_polygon(px, py, &outer) {
+                put(buf, n, x, y, RING);
+            }
+            if in_polygon(px, py, &inner) {
+                put(buf, n, x, y, GOLD);
+            }
+        }
+    }
+}
+
+/// Зелёные «часы» в правом нижнем углу — вариант «автозапуск».
+fn paint_clock(buf: &mut [u8], n: u32) {
+    const GREEN: (u8, u8, u8) = (96, 205, 100);
+    const RING: (u8, u8, u8) = (24, 52, 118);
+    let f = n as f32;
+    let (cx, cy, rad) = (0.775_f32, 0.775_f32, 0.115_f32);
+    for y in 0..n {
+        for x in 0..n {
+            let px = (x as f32 + 0.5) / f;
+            let py = (y as f32 + 0.5) / f;
+            let d = ((px - cx).powi(2) + (py - cy).powi(2)).sqrt();
+            if d <= rad + 0.03_f32 {
+                put(buf, n, x, y, RING);
+            }
+            if d <= rad {
+                put(buf, n, x, y, GREEN);
+            }
+            // Стрелки: часовая (вверх) и минутная (вправо) — белые.
+            let hour = (px - cx).abs() <= 0.024_f32 && py <= cy && py >= cy - rad * 0.62;
+            let minute = (py - cy).abs() <= 0.024_f32 && px >= cx && px <= cx + rad * 0.75;
+            if (hour || minute) && d <= rad {
+                put(buf, n, x, y, (255, 255, 255));
             }
         }
     }
@@ -165,4 +256,24 @@ fn downscale(src: &[u8], hi: u32, size: u32, ss: u32) -> Vec<u8> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn variants_differ() {
+        let side = 32;
+        let manual = rgba_variant(side, IconVariant::Manual);
+        let task = rgba_variant(side, IconVariant::Task);
+        let service = rgba_variant(side, IconVariant::Service);
+        let expect = (side * side * 4) as usize;
+        assert_eq!(manual.len(), expect);
+        assert_eq!(task.len(), expect);
+        assert_eq!(service.len(), expect);
+        assert_ne!(manual, task);
+        assert_ne!(manual, service);
+        assert_ne!(task, service);
+    }
 }

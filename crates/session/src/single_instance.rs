@@ -116,10 +116,21 @@ pub fn show_listener(tag: &str, wake: impl Fn() + Send + 'static) -> Option<Show
 
 #[cfg(windows)]
 fn exe_key() -> String {
-    std::env::current_exe()
-        .map(|p| p.to_string_lossy().to_lowercase())
-        .unwrap_or_default()
-        .replace('\\', "_")
+    let exe = std::env::current_exe().ok();
+    let raw = match exe.as_deref() {
+        Some(p) => canonical_exe_path(p).unwrap_or_else(|| p.to_string_lossy().into_owned()),
+        None => String::new(),
+    };
+    raw.to_lowercase().replace('\\', "_")
+}
+
+/// Канонический путь exe: разные способы запуска (служба, задача, ярлык) могут
+/// видеть один и тот же путь по-разному — приводим к единому виду.
+#[cfg(windows)]
+fn canonical_exe_path(p: &std::path::Path) -> Option<String> {
+    let canon = std::fs::canonicalize(p).ok()?;
+    let s = canon.to_string_lossy().into_owned();
+    Some(s.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(s))
 }
 
 #[cfg(windows)]
@@ -128,6 +139,19 @@ fn mutex_name(tag: &str) -> Vec<u16> {
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect()
+}
+
+/// Имя мьютекса строкой (для журнала).
+pub fn mutex_name_for_log(tag: &str) -> String {
+    #[cfg(windows)]
+    {
+        format!("rat-next-single-{tag}-{}", exe_key())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = tag;
+        String::new()
+    }
 }
 
 #[cfg(windows)]
