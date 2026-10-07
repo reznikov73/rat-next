@@ -1245,9 +1245,7 @@ mod ui {
     const OFF: egui::Color32 = egui::Color32::from_rgb(244, 67, 54);
     const DIM: egui::Color32 = egui::Color32::from_rgb(150, 158, 170);
     const DIM2: egui::Color32 = egui::Color32::from_rgb(120, 128, 140);
-    /// Свой ID — самое важное число в главном окне: его диктуют оператору —
-    /// ещё ярче, для самого номера ID.
-    const ID_BRIGHT: egui::Color32 = egui::Color32::from_rgb(140, 205, 255);
+
     /// Имя семейства с настоящим жирным шрифтом для номера ID.
     const ID_BOLD: &str = "id-bold";
 
@@ -1850,15 +1848,6 @@ mod ui {
             egui::Panel::top("top").show(ui, |ui| {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    ui.heading("Rat Next");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Настройки").clicked() {
-                            self.open_settings();
-                        }
-                    });
-                });
-                ui.add_space(2.0);
-                ui.horizontal(|ui| {
                     let (st_col, st_text) = self.status_line();
                     let (rect, _) =
                         ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
@@ -1869,18 +1858,31 @@ mod ui {
                         ui.colored_label(OFF, format!("ошибка: {e}"));
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("копировать").clicked() {
-                            ui.ctx().copy_text(self.device.id.clone());
-                            self.toast("ID скопирован в буфер обмена");
+                        if ui.button("Настройки").clicked() {
+                            self.open_settings();
                         }
-                        let id_font =
-                            egui::FontId::new(20.0, egui::FontFamily::Name(ID_BOLD.into()));
-                        ui.label(
-                            egui::RichText::new(format!("ID: {}", self.device.id))
-                                .font(id_font)
-                                .color(ID_BRIGHT),
-                        );
                     });
+                });
+                // «ID: <номер>» — слева, сразу под строкой состояния; копирование — иконкой.
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("ID:")
+                            .size(26.0)
+                            .color(egui::Color32::from_rgb(58, 63, 70)),
+                    );
+                    let id_font = egui::FontId::new(26.0, egui::FontFamily::Name(ID_BOLD.into()));
+                    ui.label(
+                        egui::RichText::new(self.device.id.clone())
+                            .font(id_font)
+                            .color(egui::Color32::from_rgb(31, 35, 40)),
+                    );
+                    if copy_icon_button(ui)
+                        .on_hover_text("скопировать ID")
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(self.device.id.clone());
+                        self.toast("ID скопирован в буфер обмена");
+                    }
                 });
                 if !self.elevated && !self.args.service_helper {
                     ui.horizontal(|ui| {
@@ -1937,16 +1939,37 @@ mod ui {
             let mut actions: Vec<TileAction> = Vec::new();
             egui::CentralPanel::default().show(ui, |ui| {
                 if snapshot.is_empty() {
-                    ui.add_space(40.0);
+                    ui.add_space(16.0);
                     ui.vertical_centered(|ui| {
                         ui.label("Пока нет машин.");
                         ui.label("Нажмите «+ Добавить машину», чтобы добавить первую.");
                         ui.label("Подключение — по адресу IP:порт (например 192.168.1.50:55140).");
                     });
-                    return;
+                    ui.add_space(16.0);
                 }
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
+                        // Плитка «+ Добавить машину» — всегда первая в списке.
+                        let (rect, resp) =
+                            ui.allocate_exact_size(egui::vec2(225.0, 112.0), egui::Sense::click());
+                        let border = if resp.hovered() {
+                            CARD_BORDER_HOVER
+                        } else {
+                            CARD_BORDER
+                        };
+                        let painter = ui.painter();
+                        painter.rect_filled(rect, 8.0, border);
+                        painter.rect_filled(rect.shrink(1.5), 7.0, ADD_CARD_BG);
+                        painter.text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "+ Добавить машину",
+                            egui::FontId::proportional(14.0),
+                            DIM,
+                        );
+                        if resp.clicked() {
+                            actions.push(TileAction::Add);
+                        }
                         for (i, m, online) in &snapshot {
                             let addr = m.addr.clone();
                             let resp = tile(ui, m, *online);
@@ -1971,27 +1994,6 @@ mod ui {
                                     ui.close();
                                 }
                             });
-                        }
-                        // Плитка «+ Добавить машину» — в общем списке.
-                        let (rect, resp) =
-                            ui.allocate_exact_size(egui::vec2(225.0, 112.0), egui::Sense::click());
-                        let border = if resp.hovered() {
-                            CARD_BORDER_HOVER
-                        } else {
-                            CARD_BORDER
-                        };
-                        let painter = ui.painter();
-                        painter.rect_filled(rect, 8.0, border);
-                        painter.rect_filled(rect.shrink(1.5), 7.0, ADD_CARD_BG);
-                        painter.text(
-                            rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "+ Добавить машину",
-                            egui::FontId::proportional(14.0),
-                            DIM,
-                        );
-                        if resp.clicked() {
-                            actions.push(TileAction::Add);
                         }
                     });
                 });
@@ -2454,6 +2456,28 @@ mod ui {
                 }
             }
         }
+    }
+
+    /// Кнопка-иконка «копировать» — два перекрывающихся листа, без надписи.
+    fn copy_icon_button(ui: &mut egui::Ui) -> egui::Response {
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(31.0, 28.0), egui::Sense::click());
+        let bg = if resp.hovered() {
+            egui::Color32::from_rgb(238, 241, 246)
+        } else {
+            egui::Color32::from_rgb(250, 251, 253)
+        };
+        let ink = egui::Color32::from_rgb(90, 97, 110);
+        let painter = ui.painter();
+        painter.rect_filled(rect, 6.0, CARD_BORDER);
+        painter.rect_filled(rect.shrink(1.0), 5.0, bg);
+        let c = rect.center();
+        let back = egui::Rect::from_min_size(c + egui::vec2(-1.0, -8.0), egui::vec2(10.5, 12.0));
+        let front = egui::Rect::from_min_size(c + egui::vec2(-7.5, -4.0), egui::vec2(10.5, 12.0));
+        painter.rect_filled(back, 1.8, ink);
+        painter.rect_filled(back.shrink(1.3), 1.0, bg);
+        painter.rect_filled(front, 1.8, ink);
+        painter.rect_filled(front.shrink(1.3), 1.0, bg);
+        resp
     }
 
     fn tile(ui: &mut egui::Ui, m: &Machine, online: bool) -> egui::Response {
