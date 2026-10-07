@@ -111,11 +111,11 @@ Name: "rat"; Description: "Rat Next — приложение (плитки, по
 Name: "relay"; Description: "Relay-сервер (интернет-режим; обычно только на сервере)"
 
 [Tasks]
-; Службы больше не предлагаются в установщике: их можно включить в настройках
-; самого приложения (Rat Next / relay) — Windows запросит права при операции.
-Name: "autostart"; Description: "Запускать Rat Next при входе в Windows (с правами администратора, без службы)"; GroupDescription: "Дополнительные параметры:"; Components: rat
+; Службы включаются здесь одной галочкой (по умолчанию включены); позже их
+; можно менять в настройках самого приложения (Rat Next / relay).
+Name: "service"; Description: "Включить службу Rat Next (рекомендуется: доступ с загрузки ПК)"; GroupDescription: "Дополнительные параметры:"; Components: rat
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "Дополнительные параметры:"; Flags: unchecked; Components: rat
-Name: "relay_autostart"; Description: "Запускать relay при входе в Windows (с правами администратора, без службы)"; GroupDescription: "Дополнительные параметры:"; Flags: unchecked; Components: relay
+Name: "relay_service"; Description: "Включить службу relay (рекомендуется для серверной машины)"; GroupDescription: "Дополнительные параметры:"; Components: relay
 
 [Files]
 Source: "{#PayloadDir}\rat.exe"; DestDir: "{app}"; Components: rat; Flags: ignoreversion
@@ -142,8 +142,8 @@ Name: "{group}\{cm:UninstallProgram,Rat Next}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\Rat Next"; Filename: "{app}\rat-elevate.exe"; IconFilename: "{app}\rat.exe"; Tasks: desktopicon; Components: rat
 
 [Run]
-Filename: "{app}\rat.exe"; Parameters: "--install-autostart"; Tasks: autostart; Components: rat; Flags: runhidden; StatusMsg: "Включаю автозапуск…"
-Filename: "{app}\rat-relay.exe"; Parameters: "--install-autostart"; Tasks: relay_autostart; Components: relay; Flags: runhidden; StatusMsg: "Включаю автозапуск relay…"
+Filename: "{app}\rat.exe"; Parameters: "--install-service"; Tasks: service; Components: rat; Flags: runhidden; StatusMsg: "Включаю службу Rat Next…"
+Filename: "{app}\rat-relay.exe"; Parameters: "--install-service"; Tasks: relay_service; Components: relay; Flags: runhidden; StatusMsg: "Включаю службу relay…"
 Filename: "{app}\rat.exe"; Description: "{cm:LaunchProgram,Rat Next}"; Components: rat; Flags: nowait postinstall skipifsilent
 Filename: "{app}\rat-relay.exe"; Description: "Запустить relay-сервер"; Components: relay; Flags: nowait postinstall skipifsilent
 

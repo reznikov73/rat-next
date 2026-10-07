@@ -34,7 +34,7 @@ use std::time::Duration;
 fn main() {
     let mut listen: Option<String> = None;
     let mut smoke: Option<f32> = None;
-    let mut install_autostart = false;
+
     let mut remove_autostart = false;
     let mut start_hidden = false;
     let mut install_service = false;
@@ -51,10 +51,7 @@ fn main() {
                 listen = Some(args[i + 1].clone());
                 i += 2;
             }
-            "--install-autostart" => {
-                install_autostart = true;
-                i += 1;
-            }
+
             "--remove-autostart" => {
                 remove_autostart = true;
                 i += 1;
@@ -96,6 +93,11 @@ fn main() {
                 i += 1;
             }
         }
+    }
+    // Задача-автозапуск «Rat Next relay» больше не используется — убираем
+    // устаревшую, если она осталась с прошлых версий.
+    if autostart::is_installed() {
+        let _ = autostart::remove();
     }
     if install_service || uninstall_service {
         let res = if install_service {
@@ -155,7 +157,24 @@ fn main() {
         // цикл relay не поднимает (порт держит служба): показывает окно и
         // значок; повторный запуск rat-relay.exe открывает это окно.
         if !rat_session::single_instance::try_acquire("relay") {
-            std::process::exit(2);
+            // Не выходим: ждём, пока закроется другое окно (как у rat);
+            // служба остаётся спокойной и сразу подхватывает управление.
+            let mut steps: u32 = 0;
+            loop {
+                if rat_session::single_instance::try_acquire("relay") {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(500));
+                steps += 1;
+                if steps.is_multiple_of(20)
+                    && matches!(
+                        service::status(),
+                        service::State::NotInstalled | service::State::Stopped
+                    )
+                {
+                    std::process::exit(0);
+                }
+            }
         }
         if let Err(e) = ui::run(listen, true, ui::UiMode::Helper) {
             eprintln!("relay: {e}");
@@ -163,15 +182,10 @@ fn main() {
         }
         return;
     }
-    if install_autostart || remove_autostart {
-        let res = if install_autostart {
-            autostart::install()
-        } else {
-            autostart::remove()
-        };
-        match res {
+    if remove_autostart {
+        match autostart::remove() {
             Ok(()) => {
-                println!("автозапуск relay обновлён");
+                println!("автозапуск relay удалён.");
                 std::process::exit(0);
             }
             Err(e) => {

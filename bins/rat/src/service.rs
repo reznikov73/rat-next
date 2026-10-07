@@ -198,7 +198,20 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
     report(SERVICE_RUNNING, 0, 0);
     log_line("служба запущена");
     supervise();
-    kill_helper();
+    // Если из интерфейса попросили оставить помощника (остановка/удаление из
+    // окна) — не убиваем его: окно продолжит работать как обычное приложение.
+    let keep_path = keep_helper_path();
+    let keep = keep_path.as_ref().is_some_and(|p| p.exists());
+    if keep {
+        if let Some(p) = &keep_path {
+            let _ = std::fs::remove_file(p);
+        }
+        HELPER_PID.store(0, Ordering::Relaxed);
+        HELPER_SESSION.store(u32::MAX, Ordering::Relaxed);
+        log_line("хелпер оставлен работать (передано управление)");
+    } else {
+        kill_helper();
+    }
     log_line("служба остановлена");
     STOP.store(false, Ordering::Relaxed);
     report(SERVICE_STOPPED, 0, 0);
@@ -288,6 +301,30 @@ fn process_alive(pid: u32) -> bool {
         let result = WaitForSingleObject(handle, 0);
         CloseHandle(handle);
         result == WAIT_TIMEOUT
+    }
+}
+
+/// Файл-просьба «не завершать помощника»: ставится интерфейсом при остановке
+/// или удалении службы — окно должно остаться работать.
+const KEEP_FILE: &str = "rat-keep-helper.tmp";
+
+fn keep_helper_path() -> Option<std::path::PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(KEEP_FILE)))
+}
+
+/// Поставить просьбу «оставить помощника» (вызывает интерфейс приложения).
+pub fn raise_keep_helper() {
+    if let Some(p) = keep_helper_path() {
+        let _ = std::fs::write(&p, b"1");
+    }
+}
+
+/// Снять просьбу (после завершённой операции).
+pub fn clear_keep_helper() {
+    if let Some(p) = keep_helper_path() {
+        let _ = std::fs::remove_file(&p);
     }
 }
 
@@ -597,11 +634,6 @@ pub fn status() -> State {
             _ => State::Pending,
         }
     }
-}
-
-/// Установлена ли служба (для проверок автозапуска и меню значка).
-pub fn is_installed() -> bool {
-    !matches!(status(), State::NotInstalled)
 }
 
 /// Запустить установленную службу.

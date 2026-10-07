@@ -221,7 +221,20 @@ fn run_loop(handle: crate::core::Handle) {
             Err(_) => break,
         }
     }
-    kill_helper();
+    // Если из интерфейса попросили оставить помощника (остановка/удаление из
+    // окна) — не убиваем его: окно продолжит работать отдельно.
+    let keep_path = keep_helper_path();
+    let keep = keep_path.as_ref().is_some_and(|p| p.exists());
+    if keep {
+        if let Some(p) = &keep_path {
+            let _ = std::fs::remove_file(p);
+        }
+        HELPER_PID.store(0, Ordering::Relaxed);
+        HELPER_SESSION.store(u32::MAX, Ordering::Relaxed);
+        log_line("хелпер оставлен работать (передано управление)");
+    } else {
+        kill_helper();
+    }
     stop.store(true, Ordering::Relaxed);
     handle.join();
     log_line("служба остановлена");
@@ -290,6 +303,30 @@ fn process_alive(pid: u32) -> bool {
         let result = WaitForSingleObject(handle, 0);
         CloseHandle(handle);
         result == WAIT_TIMEOUT
+    }
+}
+
+/// Файл-просьба «не завершать помощника»: ставится интерфейсом при остановке
+/// или удалении службы — окно должно остаться работать.
+const KEEP_FILE: &str = "relay-keep-helper.tmp";
+
+fn keep_helper_path() -> Option<std::path::PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(KEEP_FILE)))
+}
+
+/// Поставить просьбу «оставить помощника» (вызывает интерфейс приложения).
+pub fn raise_keep_helper() {
+    if let Some(p) = keep_helper_path() {
+        let _ = std::fs::write(&p, b"1");
+    }
+}
+
+/// Снять просьбу (после завершённой операции).
+pub fn clear_keep_helper() {
+    if let Some(p) = keep_helper_path() {
+        let _ = std::fs::remove_file(&p);
     }
 }
 

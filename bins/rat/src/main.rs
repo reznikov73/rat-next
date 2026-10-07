@@ -31,7 +31,7 @@ struct Args {
     relay: Option<String>,
     device_id: Option<String>,
     tray: bool,
-    install_autostart: bool,
+
     remove_autostart: bool,
     install_service: bool,
     uninstall_service: bool,
@@ -53,7 +53,7 @@ fn parse_args() -> Args {
         relay: None,
         device_id: None,
         tray: false,
-        install_autostart: false,
+
         remove_autostart: false,
         install_service: false,
         uninstall_service: false,
@@ -80,10 +80,7 @@ fn parse_args() -> Args {
                 a.autoconnect = Some(args[i + 1].clone());
                 i += 2;
             }
-            "--install-autostart" => {
-                a.install_autostart = true;
-                i += 1;
-            }
+
             "--remove-autostart" => {
                 a.remove_autostart = true;
                 i += 1;
@@ -242,23 +239,11 @@ fn main() {
         }
         return;
     }
-    if args.install_autostart {
-        if service::is_installed() {
-            note("autostart: служба уже установлена — задача планировщика не создаётся");
-            std::process::exit(0);
-        }
-        match autostart::install() {
-            Ok(()) => {
-                println!("Автозапуск включён (задача «Rat Next»).");
-                note("autostart: установлен");
-                std::process::exit(0);
-            }
-            Err(e) => {
-                eprintln!("autostart: {e}");
-                note(&format!("autostart: ошибка установки: {e}"));
-                std::process::exit(1);
-            }
-        }
+    // Задача-автозапуск «Rat Next» больше не используется — убираем устаревшую,
+    // если она осталась с прошлых версий.
+    if autostart::is_installed() {
+        let _ = autostart::remove();
+        note("autostart: устаревшая задача «Rat Next» удалена");
     }
     if args.remove_autostart {
         match autostart::remove() {
@@ -275,20 +260,43 @@ fn main() {
         }
     }
     if !rat_session::single_instance::try_acquire("app") {
-        if args.smoke.is_none() && !args.service_helper {
-            // Повторный запуск — просьба к работающему экземпляру показать окно
-            // (то же, что клик по значку в трее; работает и когда значка нет).
-            if rat_session::single_instance::show_signal("app") {
-                note("rat: повторный запуск — отправлен запрос «показать окно»");
-                std::process::exit(0);
+        if args.service_helper {
+            // Помощник службы не выходит, а ждёт, пока закроется чужое окно:
+            // служба остаётся спокойной и сразу подхватывает управление.
+            note("rat: хелпер: жду освобождения (уже работает другое окно)");
+            let mut steps: u32 = 0;
+            loop {
+                if rat_session::single_instance::try_acquire("app") {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                steps += 1;
+                if steps.is_multiple_of(20)
+                    && matches!(
+                        service::status(),
+                        service::State::NotInstalled | service::State::Stopped
+                    )
+                {
+                    note("rat: хелпер: служба остановлена — завершаюсь");
+                    std::process::exit(0);
+                }
             }
-            rat_session::single_instance::warn(
-                "Rat Next",
-                "Rat Next уже запущен.\nОкно можно открыть из значка в трее.",
-            );
+        } else {
+            if args.smoke.is_none() {
+                // Повторный запуск — просьба к работающему экземпляру показать окно
+                // (то же, что клик по значку в трее; работает и когда значка нет).
+                if rat_session::single_instance::show_signal("app") {
+                    note("rat: повторный запуск — отправлен запрос «показать окно»");
+                    std::process::exit(0);
+                }
+                rat_session::single_instance::warn(
+                    "Rat Next",
+                    "Rat Next уже запущен.\nОкно можно открыть из значка в трее.",
+                );
+            }
+            note("rat: экземпляр уже запущен (двойной запуск заблокирован)");
+            std::process::exit(2);
         }
-        note("rat: экземпляр уже запущен (двойной запуск заблокирован)");
-        std::process::exit(2);
     }
     note(&format!(
         "rat: одиночный запуск: mutex создан, имя={}",
@@ -808,35 +816,6 @@ mod autostart {
             .unwrap_or(false)
     }
 
-    /// Создать (или пересоздать) задачу: запуск при входе, сразу в трей.
-    pub fn install() -> Result<(), String> {
-        if crate::service::is_installed() {
-            return Err("служба RatNext уже установлена — задача автозапуска не нужна".to_string());
-        }
-        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        let tr = format!("\"{}\" --tray", exe.display());
-        let out = schtasks()
-            .args([
-                // HIGHEST: агент должен работать с повышенными правами, иначе Windows
-                // (UIPI) не пропускает ввод в окна администраторских процессов —
-                // «мышь работает только в самом окне rat».
-                "/Create", "/F", "/SC", "ONLOGON", "/TN", TASK, "/TR", &tr, "/RL", "HIGHEST",
-            ])
-            .output()
-            .map_err(|e| format!("schtasks: {e}"))?;
-        if out.status.success() {
-            Ok(())
-        } else {
-            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            let err = if err.is_empty() {
-                String::from_utf8_lossy(&out.stdout).trim().to_string()
-            } else {
-                err
-            };
-            Err(err)
-        }
-    }
-
     /// Удалить задачу автозапуска.
     pub fn remove() -> Result<(), String> {
         let out = schtasks()
@@ -1254,13 +1233,12 @@ mod ui {
     const CARD_BG: egui::Color32 = egui::Color32::from_rgb(34, 39, 47);
     const CARD_BORDER: egui::Color32 = egui::Color32::from_rgb(70, 76, 88);
     const CARD_BORDER_HOVER: egui::Color32 = egui::Color32::from_rgb(64, 140, 255);
-    const ON: egui::Color32 = egui::Color32::from_rgb(76, 175, 80);
+    const ON: egui::Color32 = egui::Color32::from_rgb(76, 175, 80); // цвет 
     const OFF: egui::Color32 = egui::Color32::from_rgb(244, 67, 54);
     const DIM: egui::Color32 = egui::Color32::from_rgb(150, 158, 170);
     const DIM2: egui::Color32 = egui::Color32::from_rgb(120, 128, 140);
-    /// Свой ID — самое важное число в главном окне: его диктуют оператору.
-    const ID_COLOR: egui::Color32 = egui::Color32::from_rgb(96, 176, 255);
-    /// Ещё ярче — для самого номера ID.
+    /// Свой ID — самое важное число в главном окне: его диктуют оператору —
+    /// ещё ярче, для самого номера ID.
     const ID_BRIGHT: egui::Color32 = egui::Color32::from_rgb(140, 205, 255);
     /// Имя семейства с настоящим жирным шрифтом для номера ID.
     const ID_BOLD: &str = "id-bold";
@@ -1424,13 +1402,16 @@ mod ui {
         settings_mode: ConnectionMode,
         settings_relay_edit: String,
         settings_auto_allow: bool,
-        settings_autostart: bool,
         settings_error: Option<String>,
+        /// «Служебное»: локальный приём и его порт (применяются по «Сохранить»).
+        settings_serve_local: bool,
+        settings_serve_port: String,
+        /// Отдаваемый экран (индекс монитора) в настройках.
+        settings_monitor: u32,
         incoming_rx: Receiver<Request>,
         incoming_pending: Option<Request>,
         monitors: Vec<MonitorInfo>,
         monitor_sel: u32,
-        port_edit: String,
         my_ip: String,
         my_name: String,
         screen: Screen,
@@ -1454,12 +1435,12 @@ mod ui {
         tray_retry_left: u32,
         /// Когда повторить попытку создания значка.
         tray_retry_at: Instant,
-        /// Перепроверка автозапуска после UAC-переключения: сколько раз ещё.
-        autostart_recheck_left: u32,
-        /// Когда перепроверить автозапуск.
-        autostart_recheck_at: Instant,
-        /// Какое состояние автозапуска ждём (true — включён).
-        autostart_recheck_want: bool,
+        /// Помощник службы, переведённый в обычный режим (служба остановлена).
+        svc_detached: bool,
+        /// Время последней проверки «служба ещё работает?» для помощника.
+        svc_probe_checked: Instant,
+        /// Когда закрыть окно после передачи управления службе (установка).
+        quit_at: Option<Instant>,
         /// Выбран «Выход» — закрытие окна завершает процесс, а не прячет его.
         quitting: bool,
         /// Окно скрыто в трей — перерисовку можно замедлить.
@@ -1569,24 +1550,18 @@ mod ui {
             let settings_relay_edit = device.relay.clone();
             let settings_auto_allow = device.auto_allow;
             crate::approval::set_auto_allow(device.auto_allow);
-            // Значок в трее создаём всегда — во всех вариантах: ручной запуск,
-            // агент автозапуска (--tray), помощник службы (--service-helper).
-            // Если оболочка ещё не готова (старт до входа пользователя),
-            // попытки повторяются в цикле UI.
+            // Значок в трее создаём всегда — в двух вариантах: помощник службы
+            // и обычный (ручной) запуск. Если оболочка ещё не готова (старт до
+            // входа пользователя), попытки повторяются в цикле UI.
             let tray_kind = if args.service_helper {
                 crate::tray::Kind::Service
-            } else if args.tray {
-                crate::tray::Kind::Agent
             } else {
                 crate::tray::Kind::Manual
             };
+            let serve_running = server.is_running();
             let mut tray_retry_left: u32 = 0;
             let mut tray_retry_at = Instant::now();
-            let tray = match crate::tray::Tray::new(
-                tray_kind,
-                crate::autostart::is_installed(),
-                crate::service::is_installed(),
-            ) {
+            let tray = match crate::tray::Tray::new(tray_kind) {
                 Ok(tray) => {
                     crate::note("[ui] значок в трее создан");
                     Some(tray)
@@ -1621,13 +1596,14 @@ mod ui {
                 settings_mode,
                 settings_relay_edit,
                 settings_auto_allow,
-                settings_autostart: false,
                 settings_error: None,
+                settings_serve_local: serve_running,
+                settings_serve_port: port.to_string(),
+                settings_monitor: monitor_sel,
                 incoming_rx,
                 incoming_pending: None,
                 monitors,
                 monitor_sel,
-                port_edit: port.to_string(),
                 my_ip: local_ip(),
                 my_name: std::env::var("COMPUTERNAME").unwrap_or_default(),
                 screen: Screen::Home,
@@ -1647,9 +1623,9 @@ mod ui {
                 tray,
                 tray_retry_left,
                 tray_retry_at,
-                autostart_recheck_left: 0,
-                autostart_recheck_at: Instant::now(),
-                autostart_recheck_want: false,
+                svc_detached: false,
+                svc_probe_checked: Instant::now(),
+                quit_at: None,
                 quitting: false,
                 hidden: false,
                 tray_hide_done: false,
@@ -1667,6 +1643,54 @@ mod ui {
 
         fn toast(&mut self, s: impl Into<String>) {
             self.toast = Some((s.into(), Instant::now()));
+        }
+
+        /// Открыть окно настроек (поля синхронизируются с фактическим состоянием).
+        fn open_settings(&mut self) {
+            self.settings_mode = self.device.mode;
+            self.settings_relay_edit = self.device.relay.clone();
+            self.settings_auto_allow = self.device.auto_allow;
+            self.settings_serve_local = self.server.is_running();
+            self.settings_serve_port = self.server.port.to_string();
+            self.settings_monitor = self.monitor_sel;
+            self.settings_error = None;
+            self.settings_open = true;
+        }
+
+        /// Строка состояния главного окна: (цвет точки, текст).
+        fn status_line(&self) -> (egui::Color32, String) {
+            if self.device.mode == ConnectionMode::Internet {
+                let st = self
+                    .internet
+                    .status
+                    .lock()
+                    .map(|s| s.clone())
+                    .unwrap_or_default();
+                if !self.internet.is_running() {
+                    (OFF, "Интернет (relay) выключен".to_string())
+                } else if st.starts_with("ошибка") {
+                    (OFF, format!("Нет связи с relay: {st}"))
+                } else if st.starts_with("подключаюсь") || st.starts_with("соединение закрыто")
+                {
+                    (DIM2, "Подключаюсь к relay…".to_string())
+                } else if st.starts_with("сессия") {
+                    (ON, "Сеанс с оператором (через relay)".to_string())
+                } else if st.starts_with("ожидаю") {
+                    (
+                        ON,
+                        "На связи через интернет (relay) — жду подключения".to_string(),
+                    )
+                } else {
+                    (DIM2, format!("Интернет (relay): {st}"))
+                }
+            } else if self.server.is_running() {
+                (
+                    ON,
+                    format!("Локальная сеть — приём на порту {}", self.server.port),
+                )
+            } else {
+                (DIM2, "Локальная сеть — приём выключен".to_string())
+            }
         }
 
         fn start_connect(&mut self, name: String, addr: String) {
@@ -1825,62 +1849,11 @@ mod ui {
                 ui.horizontal(|ui| {
                     ui.heading("Rat Next");
                     ui.separator();
-                    let running = self.server.is_running();
+                    let (st_col, st_text) = self.status_line();
                     let (rect, _) =
                         ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                    ui.painter()
-                        .circle_filled(rect.center(), 5.0, if running { ON } else { OFF });
-                    // Одна кнопка на оба состояния: надпись меняется по факту.
-                    if running {
-                        if ui.button("Остановить сервер").clicked() {
-                            self.server.stop();
-                        }
-                    } else {
-                        ui.label("Порт:");
-                        ui.add(egui::TextEdit::singleline(&mut self.port_edit).desired_width(56.0));
-                        if ui.button("Запустить сервер").clicked() {
-                            match self.port_edit.trim().parse::<u16>() {
-                                Ok(p) => {
-                                    if let Err(e) = self.server.start(p) {
-                                        self.toast(format!("Сервер не запустился: {e}"));
-                                    }
-                                }
-                                Err(_) => self.toast("Некорректный порт"),
-                            }
-                        }
-                    }
-                    ui.separator();
-                    if self.my_name.is_empty() {
-                        ui.label(format!("{}:{}", self.my_ip, self.server.port));
-                    } else {
-                        ui.label(format!(
-                            "{} ({}:{})",
-                            self.my_name, self.my_ip, self.server.port
-                        ));
-                    }
-                    ui.separator();
-                    if !self.monitors.is_empty() {
-                        ui.label("Монитор:");
-                        let mut pick: Option<u32> = None;
-                        for m in &self.monitors {
-                            let selected = self.monitor_sel == m.index;
-                            let txt = format!("{} ({}×{})", m.index + 1, m.width, m.height);
-                            if ui.selectable_label(selected, txt).clicked() {
-                                pick = Some(m.index);
-                            }
-                        }
-                        if let Some(idx) = pick
-                            && idx != self.monitor_sel
-                        {
-                            self.monitor_sel = idx;
-                            self.server.monitor.store(idx, Ordering::Relaxed);
-                            self.toast("Сменил монитор — применится к следующему подключению");
-                        }
-                    }
-                    ui.label(format!(
-                        "сессий: {}",
-                        self.server.sessions.load(Ordering::Relaxed)
-                    ));
+                    ui.painter().circle_filled(rect.center(), 5.0, st_col);
+                    ui.label(st_text);
                     if let Some(e) = self.server.last_err.lock().unwrap().clone() {
                         ui.separator();
                         ui.colored_label(OFF, format!("ошибка: {e}"));
@@ -1898,7 +1871,8 @@ mod ui {
                         // Подпись — по оптическому центру цифр номера
                         // (18px выверены по пикселям; при смене кегля подстроить).
                         ui.add_space(18.0);
-                        ui.label(egui::RichText::new("Мой ID").color(ID_COLOR));
+                        // Без .color(...) — цвет берётся из темы, как у ui.label("Монитор:")
+                        ui.label(egui::RichText::new("Мой ID"));
                     });
                     ui.label(
                         egui::RichText::new(self.device.id.clone())
@@ -1911,12 +1885,7 @@ mod ui {
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("Настройки").clicked() {
-                            self.settings_mode = self.device.mode;
-                            self.settings_relay_edit = self.device.relay.clone();
-                            self.settings_auto_allow = self.device.auto_allow;
-                            self.settings_autostart = crate::autostart::is_installed();
-                            self.settings_error = None;
-                            self.settings_open = true;
+                            self.open_settings();
                         }
                     });
                 });
@@ -2130,135 +2099,184 @@ mod ui {
                 if self.svc_checked.elapsed() > std::time::Duration::from_secs(1) {
                     self.svc_checked = Instant::now();
                     self.svc_state = crate::service::status();
-                    if !matches!(self.svc_state, crate::service::State::NotInstalled) {
-                        // Автозапуск обеспечивает служба — галочка выключена.
-                        self.settings_autostart = false;
-                    }
                 }
                 let mut open = true;
                 let mut apply = false;
                 let mut cancel = false;
-                egui::Window::new("Настройки подключения")
+                egui::Window::new("Настройки")
                     .collapsible(false)
                     .resizable(false)
                     .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                     .open(&mut open)
                     .show(ctx, |ui| {
-                        ui.label("Режим подключения:");
-                        ui.radio_value(
-                            &mut self.settings_mode,
-                            ConnectionMode::Internet,
-                            "Интернет через relay",
+                        ui.set_min_width(430.0);
+                        ui.label(egui::RichText::new("Этот компьютер").strong());
+                        ui.label(format!(
+                            "{} · ID: {}",
+                            if self.my_name.is_empty() {
+                                "без имени"
+                            } else {
+                                self.my_name.as_str()
+                            },
+                            self.device.id
+                        ));
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Локальный адрес: {}:{}",
+                                self.my_ip, self.server.port
+                            ))
+                            .small()
+                            .color(egui::Color32::from_gray(150)),
                         );
+                        ui.separator();
+                        ui.label(egui::RichText::new("Как запускаться").strong());
+                        ui.label(
+                            "Служба Windows — приложение включается само при загрузке ПК \
+                             и доступно до входа пользователя.",
+                        );
+                        let (state_txt, state_col) = match self.svc_state {
+                            crate::service::State::NotInstalled => {
+                                ("не установлена", egui::Color32::from_gray(130))
+                            }
+                            crate::service::State::Stopped => {
+                                ("остановлена", egui::Color32::from_rgb(230, 120, 30))
+                            }
+                            crate::service::State::Running => ("работает", ON),
+                            crate::service::State::Pending => {
+                                ("меняется…", egui::Color32::from_rgb(150, 150, 60))
+                            }
+                        };
+                        ui.horizontal(|ui| {
+                            ui.label("Состояние:");
+                            ui.colored_label(state_col, state_txt);
+                        });
+                        let not_installed =
+                            matches!(self.svc_state, crate::service::State::NotInstalled);
+                        let running = matches!(self.svc_state, crate::service::State::Running);
+                        let pending = matches!(self.svc_state, crate::service::State::Pending);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    not_installed && !pending,
+                                    egui::Button::new("Установить"),
+                                )
+                                .clicked()
+                            {
+                                self.svc_action(crate::service::Op::Install);
+                            }
+                            // Одна кнопка пуск/стоп — меняет надпись по состоянию.
+                            let toggle = if running {
+                                Some(("Остановить", crate::service::Op::Stop))
+                            } else if !not_installed && !pending {
+                                Some(("Запустить", crate::service::Op::Start))
+                            } else {
+                                None
+                            };
+                            if let Some((label, op)) = toggle {
+                                if ui.button(label).clicked() {
+                                    self.svc_action(op);
+                                }
+                            } else {
+                                ui.add_enabled(
+                                    false,
+                                    egui::Button::new(if running {
+                                        "Остановить"
+                                    } else {
+                                        "Запустить"
+                                    }),
+                                );
+                            }
+                            if ui
+                                .add_enabled(
+                                    !not_installed && !pending,
+                                    egui::Button::new("Удалить"),
+                                )
+                                .clicked()
+                            {
+                                self.svc_action(crate::service::Op::Uninstall);
+                            }
+                        });
+                        ui.label(
+                            egui::RichText::new(
+                                "Без службы приложение работает, только пока вы его запустили \
+                                 (ярлыком). Постоянный доступ — включите службу.",
+                            )
+                            .small()
+                            .color(egui::Color32::from_gray(150)),
+                        );
+                        ui.separator();
+                        ui.label(egui::RichText::new("Подключение").strong());
                         ui.radio_value(
                             &mut self.settings_mode,
                             ConnectionMode::Lan,
                             "Локальная сеть (IP:порт)",
                         );
-                        if self.settings_mode == ConnectionMode::Internet {
-                            ui.separator();
-                            ui.label("Адрес relay (host:порт):");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.settings_relay_edit)
-                                    .desired_width(280.0),
-                            );
-                        }
-                        ui.separator();
-                        ui.checkbox(
-                            &mut self.settings_auto_allow,
-                            "Подключать без подтверждения",
+                        ui.radio_value(
+                            &mut self.settings_mode,
+                            ConnectionMode::Internet,
+                            "Интернет (через relay)",
                         );
+                        if self.settings_mode == ConnectionMode::Internet {
+                            ui.horizontal(|ui| {
+                                ui.label("Адрес relay:");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.settings_relay_edit)
+                                        .desired_width(230.0),
+                                );
+                            });
+                        }
                         ui.label(
                             egui::RichText::new(
-                                "Подключения принимаются сразу — и в локальной сети, и через relay",
+                                "Локальная сеть: подключаемся по адресу вида 192.168.1.50:55140 \
+                                 (или адрес Radmin VPN). Интернет: по 6-значному ID через relay.",
                             )
                             .small()
                             .color(egui::Color32::from_gray(150)),
                         );
-                        let svc_installed =
-                            !matches!(self.svc_state, crate::service::State::NotInstalled);
-                        ui.add_enabled(
-                            !svc_installed,
-                            egui::Checkbox::new(
-                                &mut self.settings_autostart,
-                                "Запускать при входе в Windows \
-                                 (без службы, с правами администратора)",
-                            ),
-                        )
-                        .on_disabled_hover_text("Управляется службой RatNext");
-                        if svc_installed {
-                            ui.label(
-                                egui::RichText::new("Управляется службой RatNext")
-                                    .small()
-                                    .color(egui::Color32::from_gray(150)),
-                            );
+                        ui.separator();
+                        ui.label(egui::RichText::new("Безопасность").strong());
+                        ui.checkbox(
+                            &mut self.settings_auto_allow,
+                            "Подключать без подтверждения (и в локальной сети, и через relay)",
+                        );
+                        ui.separator();
+                        ui.label(egui::RichText::new("Служебное").strong());
+                        ui.checkbox(
+                            &mut self.settings_serve_local,
+                            "Принимать подключения по локальной сети (порт 55140)",
+                        );
+                        if self.settings_serve_local {
+                            ui.horizontal(|ui| {
+                                ui.label("Порт:");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.settings_serve_port)
+                                        .desired_width(56.0),
+                                );
+                            });
                         }
-                        #[cfg(feature = "ffmpeg")]
-                        {
-                            ui.separator();
-                            ui.label(
-                                "Служба Windows — альтернатива автозапуску: \
-                                 работает с загрузки ПК, доступен до входа пользователя:",
-                            );
-                            let (state_txt, state_col) = match self.svc_state {
-                                crate::service::State::NotInstalled => {
-                                    ("не установлена", egui::Color32::from_gray(130))
-                                }
-                                crate::service::State::Stopped => {
-                                    ("остановлена", egui::Color32::from_rgb(230, 120, 30))
-                                }
-                                crate::service::State::Running => ("работает", ON),
-                                crate::service::State::Pending => {
-                                    ("меняется…", egui::Color32::from_rgb(150, 150, 60))
-                                }
-                            };
-                            ui.horizontal(|ui| {
-                                ui.label("Состояние:");
-                                ui.colored_label(state_col, state_txt);
-                            });
-                            let not_installed =
-                                matches!(self.svc_state, crate::service::State::NotInstalled);
-                            let running = matches!(self.svc_state, crate::service::State::Running);
-                            ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "Работает независимо от режима подключения. Нужен только для \
+                                 прямых подключений по сети; на интернет-режим (relay) не влияет.",
+                            )
+                            .small()
+                            .color(egui::Color32::from_gray(150)),
+                        );
+                        let mut mon_pick: Option<u32> = None;
+                        ui.horizontal(|ui| {
+                            ui.label("Отдаваемый экран (что видит оператор):");
+                            for m in &self.monitors {
+                                let sel = self.settings_monitor == m.index;
                                 if ui
-                                    .add_enabled(not_installed, egui::Button::new("Установить"))
+                                    .selectable_label(sel, format!("Монитор {}", m.index + 1))
                                     .clicked()
                                 {
-                                    self.svc_action(crate::service::Op::Install);
+                                    mon_pick = Some(m.index);
                                 }
-                                if ui
-                                    .add_enabled(
-                                        !not_installed && !running,
-                                        egui::Button::new("Запустить"),
-                                    )
-                                    .clicked()
-                                {
-                                    self.svc_action(crate::service::Op::Start);
-                                }
-                                if ui
-                                    .add_enabled(
-                                        !not_installed && running,
-                                        egui::Button::new("Остановить"),
-                                    )
-                                    .clicked()
-                                {
-                                    self.svc_action(crate::service::Op::Stop);
-                                }
-                                if ui
-                                    .add_enabled(!not_installed, egui::Button::new("Удалить"))
-                                    .clicked()
-                                {
-                                    self.svc_action(crate::service::Op::Uninstall);
-                                }
-                            });
-                            ui.label(
-                                egui::RichText::new(
-                                    "Для установки, удаления и остановки Windows \
-                                     запросит права администратора.",
-                                )
-                                .small()
-                                .color(egui::Color32::from_gray(150)),
-                            );
+                            }
+                        });
+                        if let Some(idx) = mon_pick {
+                            self.settings_monitor = idx;
                         }
                         if let Some(error) = &self.settings_error {
                             ui.colored_label(OFF, error);
@@ -2278,7 +2296,12 @@ mod ui {
                         !host.trim().is_empty()
                             && port.parse::<u16>().is_ok_and(|parsed| parsed > 0)
                     });
-                    if self.settings_mode == ConnectionMode::Internet && !valid_relay {
+                    let serve_port = self.settings_serve_port.trim().parse::<u16>().ok();
+                    let serve_ok = !self.settings_serve_local || serve_port.is_some_and(|p| p > 0);
+                    if !serve_ok {
+                        self.settings_error =
+                            Some("Некорректный порт локального приёма (1–65535)".to_string());
+                    } else if self.settings_mode == ConnectionMode::Internet && !valid_relay {
                         self.settings_error = Some(
                             "Укажите адрес relay в формате host:порт, например 194.37.254.233:8889"
                                 .to_string(),
@@ -2293,24 +2316,28 @@ mod ui {
                         self.device.relay = relay;
                         self.device.auto_allow = self.settings_auto_allow;
                         crate::approval::set_auto_allow(self.settings_auto_allow);
-                        let autostart_now = crate::autostart::is_installed();
-                        if self.settings_autostart != autostart_now {
-                            let result = if self.settings_autostart {
-                                crate::autostart::install()
-                            } else {
-                                crate::autostart::remove()
-                            };
-                            match result {
-                                Ok(()) => self.toast(if self.settings_autostart {
-                                    "Автозапуск включён"
-                                } else {
-                                    "Автозапуск выключен"
-                                }),
-                                Err(e) => {
-                                    self.settings_autostart = autostart_now;
-                                    self.toast(format!("Автозапуск: {e}"));
-                                }
+                        // Локальный приём — независимо от режима подключения.
+                        let want_serve = self.settings_serve_local;
+                        let want_port = serve_port.unwrap_or(self.server.port);
+                        let serve_running = self.server.is_running();
+                        if want_serve && (!serve_running || self.server.port != want_port) {
+                            self.server.stop();
+                            if let Err(e) = self.server.start(want_port) {
+                                self.settings_serve_local = false;
+                                self.toast(format!("Приём подключений не запустился: {e}"));
                             }
+                        } else if !want_serve && serve_running {
+                            self.server.stop();
+                            self.toast("Локальный приём выключен");
+                        }
+                        if self.settings_monitor != self.monitor_sel {
+                            self.monitor_sel = self.settings_monitor;
+                            self.server
+                                .monitor
+                                .store(self.settings_monitor, Ordering::Relaxed);
+                            self.toast(
+                                "Сменил отдаваемый экран — применится к следующему подключению",
+                            );
                         }
                         save_device(&self.device);
                         self.settings_open = false;
@@ -3174,28 +3201,34 @@ mod ui {
                 crate::service::Op::Start => ("--start-service", "Запуск службы"),
                 crate::service::Op::Stop => ("--stop-service", "Остановка службы"),
             };
+            // Остановка/удаление из окна: просим службу не завершать помощника —
+            // окно не должно пропадать (служба увидит файл-флаг при завершении).
+            let keep = matches!(op, crate::service::Op::Stop | crate::service::Op::Uninstall);
+            if keep {
+                crate::service::raise_keep_helper();
+            }
             let result = match op {
                 crate::service::Op::Install => crate::service::install(),
                 crate::service::Op::Uninstall => crate::service::uninstall(),
                 crate::service::Op::Start => crate::service::start(),
                 crate::service::Op::Stop => crate::service::stop(),
             };
+            if keep {
+                crate::service::clear_keep_helper();
+            }
             match result {
                 Ok(()) => {
                     self.svc_state = crate::service::status();
                     self.svc_checked = Instant::now();
-                    if let Some(tray) = &self.tray {
-                        tray.set_autostart_text(crate::autostart::is_installed());
-                    }
                     match op {
                         crate::service::Op::Install => {
-                            self.settings_autostart = false;
-                            self.toast("Служба установлена — задача планировщика удалена");
+                            self.toast(
+                                "Служба установлена — окно закроется, служба сразу подхватит",
+                            );
+                            self.quit_at = Some(Instant::now() + Duration::from_millis(1500));
                         }
                         crate::service::Op::Uninstall => {
-                            self.toast(
-                                "Служба удалена. При необходимости включите автозапуск галочкой",
-                            );
+                            self.toast("Служба удалена — приложение продолжает работать");
                         }
                         crate::service::Op::Start => self.toast("Запуск службы: выполнено"),
                         crate::service::Op::Stop => self.toast("Остановка службы: выполнено"),
@@ -3257,7 +3290,7 @@ mod ui {
             }
         }
 
-        /// Команды меню значка: показать окно, настройки, автозапуск, выход.
+        /// Команды меню значка: показать окно, настройки, выход.
         fn poll_tray(&mut self, ctx: &egui::Context) {
             let Some(cmd) = self.tray.as_ref().and_then(|t| t.poll()) else {
                 return;
@@ -3272,62 +3305,13 @@ mod ui {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     self.hidden = false;
-                    self.settings_mode = self.device.mode;
-                    self.settings_relay_edit = self.device.relay.clone();
-                    self.settings_auto_allow = self.device.auto_allow;
-                    self.settings_autostart = crate::autostart::is_installed();
-                    self.settings_error = None;
-                    self.settings_open = true;
+                    self.open_settings();
                 }
-                crate::tray::Cmd::ToggleAutostart => self.toggle_autostart(),
                 crate::tray::Cmd::Quit => {
                     self.quitting = true;
                     self.internet.stop();
                     self.server.stop();
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-            }
-        }
-
-        /// Переключить автозапуск из меню значка; при нехватке прав — через UAC.
-        fn toggle_autostart(&mut self) {
-            if crate::service::is_installed() {
-                self.toast("Автозапуск управляется службой RatNext");
-                return;
-            }
-            let installed = crate::autostart::is_installed();
-            let flag = if installed {
-                "--remove-autostart"
-            } else {
-                "--install-autostart"
-            };
-            let result = if installed {
-                crate::autostart::remove()
-            } else {
-                crate::autostart::install()
-            };
-            match result {
-                Ok(()) => {
-                    let now = crate::autostart::is_installed();
-                    if let Some(tray) = &self.tray {
-                        tray.set_autostart_text(now);
-                    }
-                    self.settings_autostart = now;
-                    self.toast(if now {
-                        "Автозапуск включён"
-                    } else {
-                        "Автозапуск выключен"
-                    });
-                }
-                Err(e) => {
-                    if !self.elevated && crate::elevate::relaunch(flag).is_ok() {
-                        self.autostart_recheck_left = 5;
-                        self.autostart_recheck_at = Instant::now() + Duration::from_secs(3);
-                        self.autostart_recheck_want = !installed;
-                        self.toast("Подтвердите запрос прав администратора");
-                    } else {
-                        self.toast(format!("Автозапуск: {e}"));
-                    }
                 }
             }
         }
@@ -3343,18 +3327,12 @@ mod ui {
             }
             self.tray_retry_left -= 1;
             self.tray_retry_at = Instant::now() + Duration::from_secs(5);
-            let kind = if self.args.service_helper {
+            let kind = if self.args.service_helper && !self.svc_detached {
                 crate::tray::Kind::Service
-            } else if self.args.tray {
-                crate::tray::Kind::Agent
             } else {
                 crate::tray::Kind::Manual
             };
-            match crate::tray::Tray::new(
-                kind,
-                crate::autostart::is_installed(),
-                crate::service::is_installed(),
-            ) {
+            match crate::tray::Tray::new(kind) {
                 Ok(tray) => {
                     crate::note("[ui] значок в трее создан (повторная попытка)");
                     self.tray = Some(tray);
@@ -3368,21 +3346,28 @@ mod ui {
             }
         }
 
-        /// После UAC-переключения автозапуска — обновить подпись пункта меню.
-        fn recheck_autostart(&mut self) {
-            if self.autostart_recheck_left == 0 || Instant::now() < self.autostart_recheck_at {
+        /// Помощник службы: если служба остановлена/удалена, продолжаем работу
+        /// как обычное приложение — окно не должно пропадать.
+        fn check_service_detach(&mut self) {
+            if !self.args.service_helper || self.svc_detached {
                 return;
             }
-            self.autostart_recheck_left -= 1;
-            self.autostart_recheck_at = Instant::now() + Duration::from_secs(3);
-            let installed = crate::autostart::is_installed();
-            if let Some(tray) = &self.tray {
-                tray.set_autostart_text(installed);
+            if self.svc_probe_checked.elapsed() < Duration::from_secs(2) {
+                return;
             }
-            self.settings_autostart = installed;
-            if installed == self.autostart_recheck_want {
-                self.autostart_recheck_left = 0;
+            self.svc_probe_checked = Instant::now();
+            if !matches!(
+                crate::service::status(),
+                crate::service::State::NotInstalled | crate::service::State::Stopped
+            ) {
+                return;
             }
+            self.svc_detached = true;
+            crate::note("[ui] служба остановлена — продолжаю работать как обычное приложение");
+            if let Ok(tray) = crate::tray::Tray::new(crate::tray::Kind::Manual) {
+                self.tray = Some(tray);
+            }
+            self.toast("Служба остановлена — приложение продолжает работать");
         }
     }
 
@@ -3405,7 +3390,14 @@ mod ui {
             self.poll_tray(&ctx);
             self.handle_close(&ctx);
             self.retry_tray();
-            self.recheck_autostart();
+            self.check_service_detach();
+            if let Some(t) = self.quit_at
+                && Instant::now() >= t
+            {
+                self.quit_at = None;
+                self.quitting = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
             if !self.tray_hide_done {
                 self.tray_hide_done = true;
                 // Режим агента (--tray, служба): окно стартует скрытым даже без

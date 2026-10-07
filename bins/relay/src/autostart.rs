@@ -25,29 +25,6 @@ pub fn is_installed() -> bool {
         .unwrap_or(false)
 }
 
-/// Создать (или пересоздать) задачу: запуск при входе, сразу в трей.
-pub fn install() -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let tr = format!("\"{}\" --tray", exe.display());
-    let out = schtasks()
-        .args([
-            "/Create", "/F", "/SC", "ONLOGON", "/TN", TASK, "/TR", &tr, "/RL", "LIMITED",
-        ])
-        .output()
-        .map_err(|e| format!("schtasks: {e}"))?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        let err = if err.is_empty() {
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        } else {
-            err
-        };
-        Err(err)
-    }
-}
-
 /// Удалить задачу автозапуска.
 pub fn remove() -> Result<(), String> {
     let out = schtasks()

@@ -3,13 +3,11 @@
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
-/// Вариант исполнения — влияет на значок, подсказку и контекстное меню.
+/// Вариант исполнения — влияет на значок, подсказку и меню.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     /// Помощник службы (SYSTEM, скрытый агент).
     Service,
-    /// Агент автозапуска (запущен задачей планировщика, `--tray`).
-    Agent,
     /// Обычный запуск из ярлыка.
     Manual,
 }
@@ -20,8 +18,6 @@ pub enum Cmd {
     Show,
     Settings,
     Quit,
-    /// Переключить автозапуск (включить или выключить по состоянию).
-    ToggleAutostart,
 }
 
 pub struct Tray {
@@ -30,20 +26,11 @@ pub struct Tray {
     item_show: MenuItem,
     item_settings: MenuItem,
     item_quit: Option<MenuItem>,
-    item_autostart: Option<MenuItem>,
 }
 
 impl Tray {
     /// Создать значок для варианта `kind`.
-    ///
-    /// `autostart_installed` — есть ли задача планировщика (подпись пункта);
-    /// `service_installed` — установлена ли служба: тогда пункт автозапуска
-    /// не показываем, автозапуском управляет служба.
-    pub fn new(
-        kind: Kind,
-        autostart_installed: bool,
-        service_installed: bool,
-    ) -> Result<Self, String> {
+    pub fn new(kind: Kind) -> Result<Self, String> {
         let item_show = MenuItem::new("Показать окно", true, None);
         let item_settings = MenuItem::new("Настройки…", true, None);
         let sep1 = PredefinedMenuItem::separator();
@@ -53,23 +40,12 @@ impl Tray {
             .map_err(|e| e.to_string())?;
 
         let mut item_quit = None;
-        let mut item_autostart = None;
         match kind {
             Kind::Service => {
                 // Скрытый агент службы: «Выход» отключён — служба поднимет
                 // агента снова, завершать его через трей нельзя.
             }
-            Kind::Agent | Kind::Manual => {
-                if !service_installed {
-                    let label = if autostart_installed {
-                        "Отключить автозапуск"
-                    } else {
-                        "Включить автозапуск"
-                    };
-                    let item = MenuItem::new(label, true, None);
-                    menu.append_items(&[&item]).map_err(|e| e.to_string())?;
-                    item_autostart = Some(item);
-                }
+            Kind::Manual => {
                 let sep2 = PredefinedMenuItem::separator();
                 let quit = MenuItem::new("Выход", true, None);
                 menu.append_items(&[&sep2, &quit])
@@ -80,7 +56,6 @@ impl Tray {
 
         let (tooltip, variant) = match kind {
             Kind::Service => ("Rat Next — служба", crate::icon::IconVariant::Service),
-            Kind::Agent => ("Rat Next — автозапуск", crate::icon::IconVariant::Task),
             Kind::Manual => ("Rat Next", crate::icon::IconVariant::Manual),
         };
 
@@ -96,19 +71,7 @@ impl Tray {
             item_show,
             item_settings,
             item_quit,
-            item_autostart,
         })
-    }
-
-    /// Обновить подпись пункта автозапуска после переключения.
-    pub fn set_autostart_text(&self, installed: bool) {
-        if let Some(item) = &self.item_autostart {
-            item.set_text(if installed {
-                "Отключить автозапуск"
-            } else {
-                "Включить автозапуск"
-            });
-        }
     }
 
     /// Прочитать накопившиеся команды трея (без блокировки).
@@ -124,11 +87,6 @@ impl Tray {
                 && event.id == item.id()
             {
                 return Some(Cmd::Quit);
-            }
-            if let Some(item) = &self.item_autostart
-                && event.id == item.id()
-            {
-                return Some(Cmd::ToggleAutostart);
             }
         }
         while let Ok(event) = TrayIconEvent::receiver().try_recv() {
