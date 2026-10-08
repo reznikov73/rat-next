@@ -387,6 +387,22 @@ mod service;
 #[cfg(feature = "ffmpeg")]
 mod tray;
 
+#[cfg(feature = "ffmpeg")]
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn FindWindowW(class_name: *const u16, window_name: *const u16) -> *mut std::ffi::c_void;
+}
+
+/// Готов ли рабочий стол с панелью задач (поднят ли проводник). Пока нет —
+/// значок в трее создавать нельзя: неудачная попытка до старта панели задач
+/// оставляет служебное окно, которое при рассылке TaskbarCreated «оживает»
+/// вторым значком — в трее появлялся дубликат «Rat Next — служба».
+#[cfg(feature = "ffmpeg")]
+fn shell_ready() -> bool {
+    let class: Vec<u16> = "Shell_TrayWnd\0".encode_utf16().collect();
+    unsafe { !FindWindowW(class.as_ptr(), std::ptr::null()).is_null() }
+}
+
 // ================== хранилище машин ==================
 
 #[cfg(feature = "ffmpeg")]
@@ -1566,24 +1582,37 @@ mod ui {
             let serve_running = server.is_running();
             let mut tray_retry_left: u32 = 0;
             let mut tray_retry_at = Instant::now();
-            let tray = match crate::tray::Tray::new(tray_kind) {
-                Ok(tray) => {
-                    crate::note("[ui] значок в трее создан");
-                    Some(tray)
+            // Пока проводник (панель задач) не поднялся, значок не создаём:
+            // неудачная попытка до старта панели задач оставляет служебное
+            // окно, которое при рассылке TaskbarCreated «оживает» вторым
+            // значком — в трее появлялся дубликат «Rat Next — служба».
+            let tray = if !crate::shell_ready() {
+                crate::note("[ui] оболочка не готова — значок отложен");
+                if args.smoke.is_none() {
+                    tray_retry_left = 120;
+                    tray_retry_at = Instant::now() + Duration::from_secs(5);
                 }
-                Err(e) => {
-                    crate::note(&format!("[ui] значок в трее не создан: {e}"));
-                    if toast.is_none() {
-                        toast = Some((
-                            format!("Не удалось создать значок в трее: {e}"),
-                            Instant::now(),
-                        ));
+                None
+            } else {
+                match crate::tray::Tray::new(tray_kind) {
+                    Ok(tray) => {
+                        crate::note("[ui] значок в трее создан");
+                        Some(tray)
                     }
-                    if args.smoke.is_none() {
-                        tray_retry_left = 120;
-                        tray_retry_at = Instant::now() + Duration::from_secs(5);
+                    Err(e) => {
+                        crate::note(&format!("[ui] значок в трее не создан: {e}"));
+                        if toast.is_none() {
+                            toast = Some((
+                                format!("Не удалось создать значок в трее: {e}"),
+                                Instant::now(),
+                            ));
+                        }
+                        if args.smoke.is_none() {
+                            tray_retry_left = 120;
+                            tray_retry_at = Instant::now() + Duration::from_secs(5);
+                        }
+                        None
                     }
-                    None
                 }
             };
             let mut internet = InternetHandle::new(server.monitor.clone(), incoming_tx);
@@ -3346,6 +3375,12 @@ mod ui {
                 return;
             }
             if Instant::now() < self.tray_retry_at {
+                return;
+            }
+            // Пока оболочка (проводник) не готова, попытки не расходуем — не
+            // создаём значок раньше панели задач (см. комментарий в RatApp::new).
+            if !crate::shell_ready() {
+                self.tray_retry_at = Instant::now() + Duration::from_secs(2);
                 return;
             }
             self.tray_retry_left -= 1;
