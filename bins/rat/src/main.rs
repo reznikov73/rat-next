@@ -40,6 +40,8 @@ struct Args {
     service: bool,
     service_helper: bool,
     probe_secure: bool,
+    /// Просьба о вежливом завершении работающего экземпляра (установщик).
+    request_quit: bool,
 }
 
 #[cfg_attr(not(feature = "ffmpeg"), allow(dead_code))]
@@ -62,6 +64,7 @@ fn parse_args() -> Args {
         service: false,
         service_helper: false,
         probe_secure: false,
+        request_quit: false,
     };
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -113,6 +116,10 @@ fn parse_args() -> Args {
                 a.probe_secure = true;
                 i += 1;
             }
+            "--request-quit" => {
+                a.request_quit = true;
+                i += 1;
+            }
             "--service-helper" => {
                 a.service_helper = true;
                 i += 1;
@@ -152,6 +159,20 @@ fn main() {
 #[cfg(feature = "ffmpeg")]
 fn main() {
     let args = parse_args();
+    // Просьба о вежливом завершении работающего экземпляра (установщик,
+    // скрипты обновления): доставляем сигнал и выходим, ничего не запуская.
+    if args.request_quit {
+        let delivered = rat_session::single_instance::quit_signal("app");
+        note(&format!(
+            "rat: запрос завершения — {}",
+            if delivered {
+                "доставлен"
+            } else {
+                "экземпляр не найден"
+            }
+        ));
+        std::process::exit(0);
+    }
     if args.install_service {
         match service::install() {
             Ok(()) => {
@@ -1318,12 +1339,27 @@ mod ui {
                 }
             })
         };
+        // Слушатель вежливого завершения: установщик (или скрипт обновления)
+        // просит экземпляр выйти — штатный выход сам уберёт значок трея.
+        let quit_request = {
+            let slot = repaint_slot.clone();
+            rat_session::single_instance::quit_listener("app", move || {
+                if let Some(ctx) = slot.lock().ok().and_then(|c| c.clone()) {
+                    ctx.request_repaint();
+                }
+            })
+        };
         eframe::run_native(
             "Rat Next",
             options,
             Box::new(move |cc| {
                 install_ui_fonts(&cc.egui_ctx);
-                Ok(Box::new(RatApp::new(args, show_request, repaint_slot)))
+                Ok(Box::new(RatApp::new(
+                    args,
+                    show_request,
+                    quit_request,
+                    repaint_slot,
+                )))
             }),
         )
         .map_err(|e| e.to_string())
@@ -1481,6 +1517,8 @@ mod ui {
         svc_checked: Instant,
         /// Запрос «показать окно» от повторного запуска exe.
         show_request: Option<rat_session::single_instance::ShowListener>,
+        /// Запрос вежливого завершения (установщик, скрипты обновления).
+        quit_request: Option<rat_session::single_instance::QuitListener>,
         /// Контекст egui для слушателя повторного запуска (будит перерисовку).
         repaint_slot: std::sync::Arc<std::sync::Mutex<Option<egui::Context>>>,
     }
@@ -1489,6 +1527,7 @@ mod ui {
         fn new(
             args: Args,
             show_request: Option<rat_session::single_instance::ShowListener>,
+            quit_request: Option<rat_session::single_instance::QuitListener>,
             repaint_slot: std::sync::Arc<std::sync::Mutex<Option<egui::Context>>>,
         ) -> Self {
             let machines = Arc::new(Mutex::new(load()));
@@ -1667,6 +1706,7 @@ mod ui {
                 #[cfg(feature = "ffmpeg")]
                 svc_checked: Instant::now(),
                 show_request,
+                quit_request,
                 repaint_slot,
                 args,
             }
@@ -3444,6 +3484,15 @@ mod ui {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 self.hidden = false;
+            }
+            // Запрос вежливого завершения (установщик/обновление): выходим
+            // штатно, чтобы значок трея убрался сам.
+            if self.quit_request.as_ref().is_some_and(|q| q.take()) {
+                crate::note("[ui] получен запрос завершения — выхожу");
+                self.quitting = true;
+                self.internet.stop();
+                self.server.stop();
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             self.poll_tray(&ctx);
             self.handle_close(&ctx);

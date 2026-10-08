@@ -130,6 +130,8 @@ pub struct RelayApp {
     svc_checked: Instant,
     /// Запрос «показать окно» от повторного запуска exe.
     show_request: Option<rat_session::single_instance::ShowListener>,
+    /// Запрос вежливого завершения (установщик, скрипты обновления).
+    quit_request: Option<rat_session::single_instance::QuitListener>,
     /// Контекст egui для слушателя повторного запуска (будит перерисовку).
     repaint_slot: std::sync::Arc<std::sync::Mutex<Option<egui::Context>>>,
     /// Когда закрыть окно после передачи управления службе (установка).
@@ -162,6 +164,16 @@ pub fn run(initial_listen: Option<String>, start_hidden: bool, mode: UiMode) -> 
             }
         })
     };
+    // Слушатель вежливого завершения: установщик (или скрипт обновления)
+    // просит экземпляр выйти — штатный выход сам уберёт значок трея.
+    let quit_request = {
+        let slot = repaint_slot.clone();
+        rat_session::single_instance::quit_listener("relay", move || {
+            if let Some(ctx) = slot.lock().ok().and_then(|c| c.clone()) {
+                ctx.request_repaint();
+            }
+        })
+    };
     eframe::run_native(
         "Rat Next relay",
         options,
@@ -171,6 +183,7 @@ pub fn run(initial_listen: Option<String>, start_hidden: bool, mode: UiMode) -> 
                 start_hidden,
                 mode,
                 show_request,
+                quit_request,
                 repaint_slot,
             )))
         }),
@@ -194,6 +207,7 @@ impl RelayApp {
         start_hidden: bool,
         mode: UiMode,
         show_request: Option<rat_session::single_instance::ShowListener>,
+        quit_request: Option<rat_session::single_instance::QuitListener>,
         repaint_slot: std::sync::Arc<std::sync::Mutex<Option<egui::Context>>>,
     ) -> Self {
         let mut settings = settings::load();
@@ -227,6 +241,7 @@ impl RelayApp {
             svc_state,
             svc_checked: Instant::now(),
             show_request,
+            quit_request,
             repaint_slot,
             quit_at: None,
             detached: false,
@@ -521,6 +536,11 @@ impl eframe::App for RelayApp {
         if self.show_request.as_ref().is_some_and(|s| s.take()) {
             self.hidden_once = true;
             show_window(&ctx);
+        }
+        // Запрос вежливого завершения (установщик/обновление): выходим штатно.
+        if self.quit_request.as_ref().is_some_and(|q| q.take()) {
+            self.log_line("получен запрос завершения — выхожу");
+            self.quit(&ctx);
         }
         // Раз в секунду обновляем состояние службы (для значка и интерфейса).
         if self.svc_checked.elapsed() > Duration::from_secs(1) {

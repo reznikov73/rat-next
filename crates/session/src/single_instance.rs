@@ -114,6 +114,74 @@ pub fn show_listener(tag: &str, wake: impl Fn() + Send + 'static) -> Option<Show
     }
 }
 
+/// Слушатель запроса «вежливое завершение» (установщик, скрипты обновления).
+pub struct QuitListener {
+    flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl QuitListener {
+    /// Забрать накопившийся запрос (при чтении сбрасывается).
+    pub fn take(&self) -> bool {
+        self.flag.swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Попросить работающий экземпляр аккуратно завершиться (штатно снимет
+/// значок трея). `true` — запрос доставлен (слушатель существует).
+pub fn quit_signal(tag: &str) -> bool {
+    #[cfg(windows)]
+    {
+        let name = quit_event_name(tag);
+        let handle = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr()) };
+        if handle.is_null() {
+            return false;
+        }
+        let ok = unsafe { SetEvent(handle) } != 0;
+        unsafe { CloseHandle(handle) };
+        ok
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = tag;
+        false
+    }
+}
+
+/// Создать событие «завершение» и слушающий поток. `wake` вызывается после
+/// запроса — им будим перерисовку интерфейса.
+pub fn quit_listener(tag: &str, wake: impl Fn() + Send + 'static) -> Option<QuitListener> {
+    #[cfg(windows)]
+    {
+        let name = quit_event_name(tag);
+        // Авто-сброс (manual_reset = 0): один запрос — одно взведение.
+        let handle = unsafe { CreateEventW(std::ptr::null_mut(), 0, 0, name.as_ptr()) };
+        if handle.is_null() {
+            return None;
+        }
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag2 = flag.clone();
+        // Сырой описатель не Send — переносим числом, в потоке восстанавливаем.
+        let handle_num = handle as usize;
+        std::thread::spawn(move || {
+            let handle = handle_num as *mut std::ffi::c_void;
+            // Хэндл живёт до конца процесса — поток можно не завершать.
+            loop {
+                if unsafe { WaitForSingleObject(handle, INFINITE) } != 0 {
+                    break;
+                }
+                flag2.store(true, std::sync::atomic::Ordering::SeqCst);
+                wake();
+            }
+        });
+        Some(QuitListener { flag })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (tag, wake);
+        None
+    }
+}
+
 #[cfg(windows)]
 fn exe_key() -> String {
     let exe = std::env::current_exe().ok();
@@ -157,6 +225,14 @@ pub fn mutex_name_for_log(tag: &str) -> String {
 #[cfg(windows)]
 fn event_name(tag: &str) -> Vec<u16> {
     format!("rat-next-show-{tag}-{}", exe_key())
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+#[cfg(windows)]
+fn quit_event_name(tag: &str) -> Vec<u16> {
+    format!("rat-next-quit-{tag}-{}", exe_key())
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect()
@@ -212,5 +288,29 @@ mod tests {
         let tag = format!("unit-{}", std::process::id());
         assert!(try_acquire(&tag));
         assert!(!try_acquire(&tag));
+    }
+
+    #[test]
+    fn quit_signal_without_listener() {
+        let tag = format!("unit-quit-none-{}", std::process::id());
+        assert!(!quit_signal(&tag));
+    }
+
+    #[test]
+    fn quit_roundtrip() {
+        let tag = format!("unit-quit-{}", std::process::id());
+        let listener = quit_listener(&tag, || {}).expect("слушатель");
+        assert!(!listener.take());
+        assert!(quit_signal(&tag));
+        // Слушающий поток ставит флаг асинхронно — ждём немного.
+        let mut got = false;
+        for _ in 0..100 {
+            if listener.take() {
+                got = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(got, "запрос вежливого завершения доставлен слушателю");
     }
 }

@@ -43,6 +43,7 @@ fn main() {
     let mut stop_service = false;
     let mut service_helper = false;
     let mut service_mode = false;
+    let mut request_quit = false;
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < args.len() {
@@ -84,6 +85,10 @@ fn main() {
                 service_mode = true;
                 i += 1;
             }
+            "--request-quit" => {
+                request_quit = true;
+                i += 1;
+            }
             s if s.starts_with("--smoke=") => {
                 smoke = s["--smoke=".len()..].parse().ok();
                 i += 1;
@@ -93,6 +98,20 @@ fn main() {
                 i += 1;
             }
         }
+    }
+    // Вежливое завершение работающего окна relay (установщик, скрипты):
+    // доставляем сигнал и выходим, ничего не запуская.
+    if request_quit {
+        let delivered = rat_session::single_instance::quit_signal("relay");
+        println!(
+            "relay: запрос завершения {}",
+            if delivered {
+                "отправлен"
+            } else {
+                "не доставлен"
+            }
+        );
+        std::process::exit(0);
     }
     // Задача-автозапуск «Rat Next relay» больше не используется — убираем
     // устаревшую, если она осталась с прошлых версий.

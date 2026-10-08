@@ -58,7 +58,8 @@ procedure WaitStopped(Name: String);
 var
   I: Integer;
 begin
-  for I := 1 to 20 do
+  { До 10 секунд: служба может завершать помощника «по-хорошему» (вежливо). }
+  for I := 1 to 40 do
   begin
     if not ServiceIsRunning(Name) then
       Break;
@@ -86,12 +87,63 @@ begin
   end;
 end;
 
+{ --- Вежливое завершение приложений перед обновлением -------------------- }
+function OpenEventW(desiredAccess: Cardinal; inheritHandle: Cardinal; name: String): Integer;
+  external 'OpenEventW@kernel32.dll stdcall';
+function SetEvent(hEvent: Integer): Boolean;
+  external 'SetEvent@kernel32.dll stdcall';
+function CloseHandle(hObject: Integer): Boolean;
+  external 'CloseHandle@kernel32.dll stdcall';
+
+function AppStillRunning(ExeName: String): Boolean;
+var
+  ResultCode: Integer;
+begin
+  Result := Exec(
+    ExpandConstant('{cmd}'),
+    '/c tasklist /FI "IMAGENAME eq ' + ExeName + '" /NH | findstr /I "' + ExeName + '" >nul',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0);
+end;
+
+{ Просим работающий экземпляр завершиться самому: он штатно уберёт значок
+  трея (иначе в панели остаётся «мёртвый» значок). Имя события совпадает с
+  тем, что создаёт приложение; старые версии события не слушают — просто
+  ничего не произойдёт. }
+procedure RequestAppQuit(ExeName: String; Tag: String);
+var
+  H: Integer;
+  S: String;
+  I: Integer;
+begin
+  S := LowerCase(ExpandConstant('{app}\') + ExeName);
+  for I := 1 to Length(S) do
+    if S[I] = '\' then
+      S[I] := '_';
+  H := OpenEventW($0002, 0, 'rat-next-quit-' + Tag + '-' + S); { EVENT_MODIFY_STATE }
+  if H <> 0 then
+  begin
+    SetEvent(H);
+    CloseHandle(H);
+  end;
+  { Ждём выхода приложения до ~5 секунд. }
+  for I := 1 to 20 do
+  begin
+    if not AppStillRunning(ExeName) then
+      Break;
+    Sleep(250);
+  end;
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   ResultCode: Integer;
 begin
   if CurStep = ssInstall then
+  begin
     StopOldServices;
+    RequestAppQuit('rat.exe', 'app');
+    RequestAppQuit('rat-relay.exe', 'relay');
+  end;
   if CurStep = ssPostInstall then
   begin
     { Службы, работавшие до обновления, поднимаем обратно. }

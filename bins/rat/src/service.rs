@@ -330,23 +330,59 @@ pub fn clear_keep_helper() {
 
 fn kill_helper() {
     let pid = HELPER_PID.swap(0, Ordering::Relaxed);
-    HELPER_SESSION.store(u32::MAX, Ordering::Relaxed);
-    if pid != 0 {
-        unsafe {
-            let handle = OpenProcess(0x0000_0001, 0, pid); // PROCESS_TERMINATE
-            if !handle.is_null() {
-                TerminateProcess(handle, 0);
-                CloseHandle(handle);
-            }
+    let session = HELPER_SESSION.swap(u32::MAX, Ordering::Relaxed);
+    if pid == 0 {
+        return;
+    }
+    // Сначала по-хорошему: помощник закроется сам и штатно уберёт значок
+    // трея (принудительная смерть оставляет «мёртвый» значок в панели).
+    if process_alive(pid) && polite_quit(pid, session) {
+        log_line(&format!("хелпер завершён вежливо: pid={pid}"));
+        return;
+    }
+    unsafe {
+        let handle = OpenProcess(0x0000_0001, 0, pid); // PROCESS_TERMINATE
+        if !handle.is_null() {
+            TerminateProcess(handle, 0);
+            CloseHandle(handle);
         }
-        log_line(&format!("хелпер остановлен: pid={pid}"));
+    }
+    log_line(&format!("хелпер остановлен: pid={pid}"));
+}
+
+/// Вежливая остановка помощника: просим его завершиться самому (он снимет
+/// значок трея) и ждём выхода до ~4 секунд. Сигнал действует только внутри
+/// сессии, поэтому просьбу доставляет процесс, запущенный в сессии помощника.
+/// `true` — помощник вышел сам.
+fn polite_quit(pid: u32, session: u32) -> bool {
+    if session == u32::MAX {
+        return false;
+    }
+    if let Err(e) = spawn_in_session(session, "--request-quit") {
+        log_line(&format!("вежливое завершение не доставлено: {e}"));
+        return false;
+    }
+    unsafe {
+        // SYNCHRONIZE
+        let handle = OpenProcess(0x0010_0000, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let result = WaitForSingleObject(handle, 4_000);
+        CloseHandle(handle);
+        result == 0
     }
 }
 
 /// Запустить хелпер в сессии `session` с системным токеном.
 fn spawn_helper(session: u32) -> Result<u32, String> {
+    spawn_in_session(session, "--service-helper --tray")
+}
+
+/// Запустить наш exe с аргументами в сессии `session` (системный токен).
+fn spawn_in_session(session: u32, args_line: &str) -> Result<u32, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let cmd = format!("\"{}\" --service-helper --tray", exe.display());
+    let cmd = format!("\"{}\" {args_line}", exe.display());
     unsafe {
         let mut token: *mut c_void = std::ptr::null_mut();
         if OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &mut token) == 0 {
