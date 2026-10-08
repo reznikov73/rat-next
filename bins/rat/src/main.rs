@@ -40,6 +40,8 @@ struct Args {
     service: bool,
     service_helper: bool,
     probe_secure: bool,
+    /// Проверка доставки ввода: подключиться к агенту по адресу и сверить курсор.
+    input_check: Option<String>,
     /// Просьба о вежливом завершении работающего экземпляра (установщик).
     request_quit: bool,
 }
@@ -64,6 +66,7 @@ fn parse_args() -> Args {
         service: false,
         service_helper: false,
         probe_secure: false,
+        input_check: None,
         request_quit: false,
     };
     let args: Vec<String> = std::env::args().collect();
@@ -116,6 +119,14 @@ fn parse_args() -> Args {
                 a.probe_secure = true;
                 i += 1;
             }
+            "--input-check" => {
+                a.input_check = Some("127.0.0.1:55140".to_string());
+                i += 1;
+            }
+            s if s.starts_with("--input-check=") => {
+                a.input_check = Some(s["--input-check=".len()..].to_string());
+                i += 1;
+            }
             "--request-quit" => {
                 a.request_quit = true;
                 i += 1;
@@ -159,6 +170,8 @@ fn main() {
 #[cfg(feature = "ffmpeg")]
 fn main() {
     let args = parse_args();
+    // Сессионные потоки (агент/вьюер) пишут диагностику в тот же журнал.
+    rat_session::log::set_logger(note);
     // Просьба о вежливом завершении работающего экземпляра (установщик,
     // скрипты обновления): доставляем сигнал и выходим, ничего не запуская.
     if args.request_quit {
@@ -250,6 +263,14 @@ fn main() {
                 }
             }
             Err(e) => note(&format!("probe-secure: ошибка: {e}")),
+        }
+        std::process::exit(0);
+    }
+    if let Some(addr) = args.input_check.as_deref() {
+        // Диагностика доставки ввода: движения мыши и сверка курсора.
+        match rat_session::inputcheck::run(addr) {
+            Ok(report) => note(&report),
+            Err(e) => note(&format!("ввод-проверка: ошибка: {e}")),
         }
         std::process::exit(0);
     }

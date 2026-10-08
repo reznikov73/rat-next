@@ -384,9 +384,15 @@ pub fn spawn_agent(
         let mut clip_sent: Option<String> = None;
         let mut clip_set_by_us: Option<String> = None;
 
-        // Защищённый стол: поток ввода привязываем к нему при необходимости.
-        let mut secure_desk: Option<crate::secure::DesktopAttach> = None;
+        // Защищённый стол: поток ввода привязываем к активному входному столу
+        // (см. secure.rs: для SendInput нужен доступ DESKTOP_JOURNALPLAYBACK,
+        // иначе события молча игнорируются).
+        let mut secure_desk: Option<(String, crate::secure::DesktopAttach)> = None;
         let mut desk_check_b = Instant::now() - Duration::from_secs(1);
+        // Самопроверка «события применяются»: сверяем последнюю цель движения
+        // мыши с реальной позицией курсора (только на защищённом столе).
+        let mut last_move_target: Option<(u16, u16, Instant)> = None;
+        let mut accept_checked = false;
 
         // Hello (capabilities) сразу при старте.
         let hello = control::hello(
@@ -428,17 +434,31 @@ pub fn spawn_agent(
             // Переключение потока на защищённый стол (не чаще раза в 250 мс).
             if desk_check_b.elapsed() >= Duration::from_millis(250) {
                 desk_check_b = Instant::now();
-                let secure_now = crate::secure::active_is_secure();
-                if secure_now && secure_desk.is_none() {
-                    match crate::secure::DesktopAttach::attach_winlogon() {
-                        Ok(a) => secure_desk = Some(a),
-                        Err(e) => {
-                            stats_b.lock().unwrap().last_error =
-                                format!("ввод: защищённый стол: {e}");
+                match crate::secure::active_desktop_name() {
+                    Some(name) if name != "Default" => {
+                        let need = !matches!(secure_desk.as_ref(), Some((n, _)) if *n == name);
+                        if need {
+                            secure_desk = None;
+                            accept_checked = false;
+                            last_move_target = None;
+                            match crate::secure::DesktopAttach::attach_input() {
+                                Ok(a) => {
+                                    crate::log::log_line(&format!(
+                                        "[secure] ввод: поток привязан к столу «{name}»"
+                                    ));
+                                    secure_desk = Some((name, a));
+                                }
+                                Err(e) => {
+                                    stats_b.lock().unwrap().last_error =
+                                        format!("ввод: защищённый стол: {e}");
+                                }
+                            }
                         }
                     }
-                } else if !secure_now && secure_desk.is_some() {
-                    secure_desk = None;
+                    Some(_) => {
+                        secure_desk = None;
+                    }
+                    None => {}
                 }
             }
 
@@ -482,9 +502,25 @@ pub fn spawn_agent(
                         } else if f.channel == Channel::Input
                             && let Some(evs) = input::parse_batch(f.payload)
                         {
+                            if let Some(InputEvent::Move { x, y }) = evs
+                                .iter()
+                                .rev()
+                                .find(|e| matches!(e, InputEvent::Move { .. }))
+                            {
+                                last_move_target = Some((*x, *y, Instant::now()));
+                                accept_checked = false;
+                            }
                             let g = *geom_b.lock().unwrap();
-                            let n = inject_events(&evs, g, virt);
+                            let (n, failed, err) = inject_events(&evs, g, virt);
                             stats_b.lock().unwrap().input_recv += n as u64;
+                            if failed > 0 {
+                                stats_b.lock().unwrap().last_error = format!(
+                                    "ввод: SendInput отклонил частей: {failed} (ошибка {err})"
+                                );
+                                crate::log::log_line(&format!(
+                                    "[secure] ввод: SendInput отклонил частей: {failed} (ошибка {err})"
+                                ));
+                            }
                         }
                     }
                     Ok(None) => break,
@@ -539,6 +575,29 @@ pub fn spawn_agent(
                 last_cursor_t = Instant::now();
                 let g = *geom_b.lock().unwrap();
                 if let Some((cx, cy, vis, kind, hcur)) = cursor_captured_norm(g) {
+                    // Самопроверка ввода на защищённом столе: если события
+                    // применяются, позиция курсора должна совпасть с целью
+                    // последнего движения. Сообщаем один раз за эпизод.
+                    if secure_desk.is_some()
+                        && !accept_checked
+                        && let Some((tx, ty, t_at)) = last_move_target
+                        && t_at.elapsed() >= Duration::from_millis(1200)
+                    {
+                        accept_checked = true;
+                        let dx = (cx as i32 - tx as i32).abs();
+                        let dy = (cy as i32 - ty as i32).abs();
+                        if dx <= 640 && dy <= 640 {
+                            crate::log::log_line(
+                                "[secure] ввод: самопроверка пройдена — курсор следует за событиями",
+                            );
+                        } else {
+                            crate::log::log_line(&format!(
+                                "[secure] ввод: события НЕ применяются: цель ({tx},{ty}), курсор ({cx},{cy})"
+                            ));
+                            stats_b.lock().unwrap().last_error =
+                                "ввод: на защищённом столе события не применяются".to_string();
+                        }
+                    }
                     if last_cursor != Some((cx, cy, vis, kind)) {
                         let mut cb = [0u8; 6];
                         input::pack_cursor(&mut cb, cx, cy, vis, kind);
@@ -650,8 +709,9 @@ fn open_encoder(cfg: &AgentConfig, w: u32, h: u32) -> Result<(Encoder, String), 
     }
 }
 
-/// Инъекция событий ввода через SendInput. Возвращает число обработанных событий.
-fn inject_events(evs: &[InputEvent], out: OutputGeom, virt: RectI) -> u32 {
+/// Инъекция событий ввода через SendInput.
+/// Возвращает (принятых частей, отклонённых частей, код последней ошибки).
+fn inject_events(evs: &[InputEvent], out: OutputGeom, virt: RectI) -> (u32, u32, u32) {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
         KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, MOUSEEVENTF_HWHEEL,
@@ -661,6 +721,8 @@ fn inject_events(evs: &[InputEvent], out: OutputGeom, virt: RectI) -> u32 {
     };
 
     let mut ok = 0u32;
+    let mut failed = 0u32;
+    let mut last_err = 0u32;
     let mut buf: Vec<INPUT> = Vec::with_capacity(4);
     for ev in evs {
         buf.clear();
@@ -760,9 +822,12 @@ fn inject_events(evs: &[InputEvent], out: OutputGeom, virt: RectI) -> u32 {
         let sent = unsafe { SendInput(&buf, std::mem::size_of::<INPUT>() as i32) };
         if sent == buf.len() as u32 {
             ok += 1;
+        } else {
+            failed += 1;
+            last_err = unsafe { windows::Win32::Foundation::GetLastError().0 };
         }
     }
-    ok
+    (ok, failed, last_err)
 }
 
 /// Абсолютный перенос курсора (виртуальный рабочий стол, 0..=65535).

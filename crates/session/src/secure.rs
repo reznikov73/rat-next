@@ -18,10 +18,21 @@ use windows::Win32::System::StationsAndDesktops::{
 };
 use windows::core::w;
 
-/// Минимальный набор прав, который просим у столов. SYSTEM получает всё.
+/// Права на чтение имени стола (диагностика активного стола).
 /// DESKTOP_READOBJECTS | DESKTOP_SWITCHDESKTOP.
-fn desk_access() -> u32 {
+fn desk_read() -> u32 {
     0x0001 | 0x0100
+}
+
+/// Права для привязки потока к столу и инъекции ввода.
+/// DESKTOP_READOBJECTS | DESKTOP_SWITCHDESKTOP | DESKTOP_JOURNALPLAYBACK.
+///
+/// Без DESKTOP_JOURNALPLAYBACK `SendInput` на защищённом столе МОЛЧА
+/// игнорируется: вызов возвращает успех, но события не применяются
+/// (подтверждено практикой: блог A. Campos Magencio, retired MSFT —
+/// «SendInput doesn't work but it doesn't return an error»).
+fn desk_attach() -> u32 {
+    0x0001 | 0x0100 | 0x0020
 }
 
 fn null_hwnd() -> HWND {
@@ -34,7 +45,7 @@ pub fn active_desktop_name() -> Option<String> {
         let desk = OpenInputDesktop(
             DESKTOP_CONTROL_FLAGS(0),
             BOOL(0),
-            DESKTOP_ACCESS_FLAGS(desk_access()),
+            DESKTOP_ACCESS_FLAGS(desk_read()),
         )
         .ok()?;
         let name = desk_name(desk);
@@ -87,7 +98,7 @@ impl DesktopAttach {
                 w!("Winlogon"),
                 DESKTOP_CONTROL_FLAGS(0),
                 BOOL(0),
-                desk_access(),
+                desk_attach(),
             )
             .map_err(|e| format!("OpenDesktop(Winlogon): {e}"))?;
             if let Err(e) = SetThreadDesktop(desk) {
@@ -97,17 +108,55 @@ impl DesktopAttach {
             Ok(Self { desk })
         }
     }
+
+    /// Привязать текущий поток к активному входному столу сессии (для ввода).
+    /// События SendInput должны уходить на активный стол; на защищённом
+    /// столе это «Winlogon», но спрашиваем у системы текущий, чтобы не
+    /// промахнуться в момент перехода.
+    pub fn attach_input() -> Result<Self, String> {
+        unsafe {
+            let desk = OpenInputDesktop(
+                DESKTOP_CONTROL_FLAGS(0),
+                BOOL(0),
+                DESKTOP_ACCESS_FLAGS(desk_attach()),
+            )
+            .map_err(|e| format!("OpenInputDesktop: {e}"))?;
+            if let Err(e) = SetThreadDesktop(desk) {
+                let _ = CloseDesktop(desk);
+                return Err(format!("SetThreadDesktop(входной стол): {e}"));
+            }
+            Ok(Self { desk })
+        }
+    }
 }
 
 impl Drop for DesktopAttach {
     fn drop(&mut self) {
         unsafe {
-            if let Ok(def) = OpenDesktopW(
+            // Возвращаем поток на «Default». Пробуем разные наборы прав,
+            // чтобы при любом раскладе не оставить поток на защищённом столе.
+            let back = OpenDesktopW(
                 w!("Default"),
                 DESKTOP_CONTROL_FLAGS(0),
                 BOOL(0),
-                desk_access(),
-            ) {
+                desk_attach(),
+            )
+            .or_else(|_| {
+                OpenDesktopW(
+                    w!("Default"),
+                    DESKTOP_CONTROL_FLAGS(0),
+                    BOOL(0),
+                    desk_read(),
+                )
+            })
+            .or_else(|_| {
+                OpenInputDesktop(
+                    DESKTOP_CONTROL_FLAGS(0),
+                    BOOL(0),
+                    DESKTOP_ACCESS_FLAGS(desk_read()),
+                )
+            });
+            if let Ok(def) = back {
                 let _ = SetThreadDesktop(def);
                 let _ = CloseDesktop(def);
             }

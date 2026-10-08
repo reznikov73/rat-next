@@ -8,7 +8,9 @@ pub mod control;
 pub mod elevation;
 pub mod frame;
 pub mod input;
+pub mod inputcheck;
 pub mod link;
+pub mod log;
 pub mod single_instance;
 pub mod stats;
 
