@@ -112,3 +112,54 @@ fn app_icon(variant: crate::icon::IconVariant) -> Result<Icon, String> {
     const SIDE: u32 = 32;
     Icon::from_rgba(crate::icon::rgba_variant(SIDE, variant), SIDE, SIDE).map_err(|e| e.to_string())
 }
+
+/// Уничтожить осиротевшие служебные окна значка (класс `tray_icon_app`).
+///
+/// Неудачная попытка регистрации значка оставляет такое окно «пустым» (без
+/// значка), но при перезапуске проводника оно получает рассылку TaskbarCreated
+/// и регистрирует значок заново — в панели появляется дубликат. Вызывать
+/// можно только когда собственного значка нет (tray == None), иначе есть риск
+/// уничтожить живой значок.
+pub fn cleanup_orphans() {
+    unsafe {
+        EnumWindows(Some(close_orphan_cb), 0);
+    }
+}
+
+/// Колбэк перечисления окон: закрыть «пустые» окна значка нашего процесса.
+unsafe extern "system" fn close_orphan_cb(hwnd: *mut std::ffi::c_void, _lp: isize) -> i32 {
+    let mut buf = [0u16; 64];
+    let n = unsafe { GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+    if n <= 0 {
+        return 1;
+    }
+    if String::from_utf16_lossy(&buf[..n as usize]) != "tray_icon_app" {
+        return 1;
+    }
+    let mut pid: u32 = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+    if pid == unsafe { GetCurrentProcessId() } {
+        // WM_CLOSE через SendMessage: окно закрывается синхронно, до того как
+        // очередь сообщений успеет доставить рассылку TaskbarCreated — иначе
+        // «черновик» мог бы успеть зарегистрировать значок. DefWindowProc по
+        // WM_CLOSE разрушает окно и освобождает данные.
+        unsafe { SendMessageW(hwnd, 0x0010, 0, 0) };
+    }
+    1
+}
+
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn EnumWindows(
+        cb: Option<unsafe extern "system" fn(*mut std::ffi::c_void, isize) -> i32>,
+        lparam: isize,
+    ) -> i32;
+    fn GetClassNameW(hwnd: *mut std::ffi::c_void, buf: *mut u16, max: i32) -> i32;
+    fn GetWindowThreadProcessId(hwnd: *mut std::ffi::c_void, pid: *mut u32) -> u32;
+    fn SendMessageW(hwnd: *mut std::ffi::c_void, msg: u32, wparam: usize, lparam: isize) -> isize;
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetCurrentProcessId() -> u32;
+}

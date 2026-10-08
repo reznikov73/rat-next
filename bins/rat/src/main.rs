@@ -1640,6 +1640,9 @@ mod ui {
                     }
                     Err(e) => {
                         crate::note(&format!("[ui] значок в трее не создан: {e}"));
+                        // см. tray::cleanup_orphans: неудачная попытка могла
+                        // оставить «пустое» окно значка.
+                        crate::tray::cleanup_orphans();
                         if toast.is_none() {
                             toast = Some((
                                 format!("Не удалось создать значок в трее: {e}"),
@@ -3436,7 +3439,12 @@ mod ui {
                     self.tray = Some(tray);
                     self.tray_retry_left = 0;
                 }
-                Err(_) => {
+                Err(e) => {
+                    crate::note(&format!("[ui] значок в трее не создан: {e}"));
+                    // Неудачная попытка могла оставить «пустое» служебное окно
+                    // значка — уберём его, чтобы при перезапуске проводника оно
+                    // не «оживилось» вторым значком.
+                    crate::tray::cleanup_orphans();
                     if self.tray_retry_left == 0 {
                         crate::note("[ui] значок в трее: попытки исчерпаны");
                     }
@@ -3462,8 +3470,9 @@ mod ui {
             }
             self.svc_detached = true;
             crate::note("[ui] служба остановлена — продолжаю работать как обычное приложение");
-            if let Ok(tray) = crate::tray::Tray::new(crate::tray::Kind::Manual) {
-                self.tray = Some(tray);
+            match crate::tray::Tray::new(crate::tray::Kind::Manual) {
+                Ok(tray) => self.tray = Some(tray),
+                Err(e) => crate::note(&format!("[ui] значок трея не заменён: {e}")),
             }
             self.toast("Служба остановлена — приложение продолжает работать");
         }
