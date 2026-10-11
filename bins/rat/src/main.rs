@@ -47,6 +47,8 @@ struct Args {
     file_cmd: Option<Vec<String>>,
     /// Авто-открытие файлового окна (тест/отладка): адрес агента.
     files_ui: Option<String>,
+    /// Тест воркера файлов: адрес; далее три пути (исходная, удалённая, выгрузка).
+    files_worker_test: Option<String>,
     /// Просьба о вежливом завершении работающего экземпляра (установщик).
     request_quit: bool,
 }
@@ -75,6 +77,7 @@ fn parse_args() -> Args {
         files_check: None,
         file_cmd: None,
         files_ui: None,
+        files_worker_test: None,
         request_quit: false,
     };
     let args: Vec<String> = std::env::args().collect();
@@ -144,6 +147,12 @@ fn parse_args() -> Args {
                 a.files_ui = Some(s["--files-ui=".len()..].to_string());
                 i += 1;
             }
+            s if s.starts_with("--files-worker-test=") => {
+                a.files_worker_test = Some(s["--files-worker-test=".len()..].to_string());
+                a.file_cmd = Some(args[i + 1..].to_vec());
+                i = args.len();
+            }
+
             "--request-quit" => {
                 a.request_quit = true;
                 i += 1;
@@ -307,6 +316,22 @@ fn main() {
             Err(e) => {
                 println!("файлы: {e}");
                 std::process::exit(2);
+            }
+        }
+        std::process::exit(0);
+    }
+    if let Some(addr) = args.files_worker_test.as_deref() {
+        let rest = args.file_cmd.clone().unwrap_or_default();
+        if rest.len() != 3 {
+            println!("использование: --files-worker-test=АДРЕС <исходная> <удалённая> <выгрузка>");
+            std::process::exit(2);
+        }
+        let target = rat_session::files_worker::Target::Tcp(addr.to_string());
+        match rat_session::files_worker::selftest(target, &rest[0], &rest[1], &rest[2]) {
+            Ok(s) => println!("{s}"),
+            Err(e) => {
+                println!("ошибка: {e}");
+                std::process::exit(1);
             }
         }
         std::process::exit(0);
@@ -1453,6 +1478,8 @@ mod ui {
         speed: f32,
         last_done: u64,
         last_t: Instant,
+        note: String,
+        is_dir: bool,
     }
 
     enum JobStatusUi {
@@ -1540,6 +1567,7 @@ mod ui {
         status: Option<String>,
         status_t: Instant,
         want_close: bool,
+        drag_src: Option<(Side, String, bool, u64)>,
     }
 
     impl FilesState {
@@ -1565,6 +1593,7 @@ mod ui {
                 status: None,
                 status_t: Instant::now() - Duration::from_secs(10),
                 want_close: false,
+                drag_src: None,
             };
             s.reload(Side::Local);
             s
@@ -1645,6 +1674,17 @@ mod ui {
                     }
                 }
             }
+            // Перетаскивание файлов из Проводника прямо на окно.
+            for f in ctx.input(|i| i.raw.dropped_files.clone()) {
+                let p = f.path().to_path_buf();
+                let full = p.to_string_lossy().into_owned();
+                let name = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| full.clone());
+                let is_dir = p.is_dir();
+                self.upload_path(full, name, is_dir);
+            }
             let now = Instant::now();
             for j in &mut self.jobs {
                 if matches!(j.status, JobStatusUi::Active) {
@@ -1701,6 +1741,14 @@ mod ui {
                     if let Some(j) = self.jobs.iter_mut().find(|j| j.id == id) {
                         j.status = JobStatusUi::Active;
                         j.last_t = Instant::now();
+                    }
+                }
+                FsEvt::JobNote { id, text, bytes } => {
+                    if let Some(j) = self.jobs.iter_mut().find(|j| j.id == id) {
+                        j.note = text;
+                        if bytes > 0 {
+                            j.total = bytes;
+                        }
                     }
                 }
                 FsEvt::Progress { id, done, total } => {
@@ -1773,22 +1821,12 @@ mod ui {
             }
         }
 
-        fn start_download(&mut self) {
-            let Some((name, is_dir, size)) = self.selected_entry(Side::Remote) else {
-                self.note("выберите файл в правой панели".to_string());
-                return;
-            };
-            if is_dir {
-                self.note("передача папок — следующим этапом".to_string());
-                return;
-            }
+        fn add_job(&mut self, name: String, is_dir: bool, size: u64, up: bool) -> u64 {
             let id = self.next_job;
             self.next_job += 1;
-            let remote = join_path(&self.remote.path, &name);
-            let local = join_path(&self.local.path, &name);
             self.jobs.push(UiJob {
                 id,
-                up: false,
+                up,
                 name,
                 total: size,
                 done: 0,
@@ -1796,35 +1834,84 @@ mod ui {
                 speed: 0.0,
                 last_done: 0,
                 last_t: Instant::now(),
+                note: String::new(),
+                is_dir,
             });
-            let _ = self.tx.send(FsCmd::Download { id, remote, local });
+            id
         }
 
-        fn start_upload(&mut self) {
-            let Some((name, is_dir, size)) = self.selected_entry(Side::Local) else {
-                self.note("выберите файл в левой панели".to_string());
+        fn act_download_selected(&mut self) {
+            let Some((name, is_dir, size)) = self.selected_entry(Side::Remote) else {
+                self.note("выберите файл или папку в правой панели".to_string());
                 return;
             };
-            if is_dir {
-                self.note("передача папок — следующим этапом".to_string());
+            self.begin_download(name, is_dir, size);
+        }
+
+        fn act_upload_selected(&mut self) {
+            let Some((name, is_dir, size)) = self.selected_entry(Side::Local) else {
+                self.note("выберите файл или папку в левой панели".to_string());
+                return;
+            };
+            self.begin_upload(name, is_dir, size);
+        }
+
+        fn begin_download(&mut self, name: String, is_dir: bool, size: u64) {
+            if !self.connected {
+                self.note("дождитесь соединения".to_string());
                 return;
             }
-            let id = self.next_job;
-            self.next_job += 1;
+            let remote = join_path(&self.remote.path, &name);
+            let local = join_path(&self.local.path, &name);
+            let id = self.add_job(name, is_dir, size, false);
+            if is_dir {
+                let _ = self.tx.send(FsCmd::DownloadFolder { id, remote, local });
+            } else {
+                let _ = self.tx.send(FsCmd::Download { id, remote, local });
+            }
+        }
+
+        fn begin_upload(&mut self, name: String, is_dir: bool, size: u64) {
+            if !self.connected {
+                self.note("дождитесь соединения".to_string());
+                return;
+            }
             let local = join_path(&self.local.path, &name);
             let remote = join_path(&self.remote.path, &name);
-            self.jobs.push(UiJob {
-                id,
-                up: true,
-                name,
-                total: size,
-                done: 0,
-                status: JobStatusUi::Queued,
-                speed: 0.0,
-                last_done: 0,
-                last_t: Instant::now(),
-            });
-            let _ = self.tx.send(FsCmd::Upload { id, local, remote });
+            let id = self.add_job(name, is_dir, size, true);
+            if is_dir {
+                let _ = self.tx.send(FsCmd::UploadFolder { id, local, remote });
+            } else {
+                let _ = self.tx.send(FsCmd::Upload { id, local, remote });
+            }
+        }
+
+        /// Загрузка произвольного локального пути (перетаскивание из Проводника).
+        fn upload_path(&mut self, full: String, name: String, is_dir: bool) {
+            if !self.connected {
+                self.note("дождитесь соединения".to_string());
+                return;
+            }
+            let size = if is_dir {
+                0
+            } else {
+                std::fs::metadata(&full).map(|m| m.len()).unwrap_or(0)
+            };
+            let remote = join_path(&self.remote.path, &name);
+            let id = self.add_job(name, is_dir, size, true);
+            if is_dir {
+                let _ = self.tx.send(FsCmd::UploadFolder {
+                    id,
+                    local: full,
+                    remote,
+                });
+            } else {
+                let _ = self.tx.send(FsCmd::Upload {
+                    id,
+                    local: full,
+                    remote,
+                });
+            }
         }
 
         fn ui(&mut self, ui: &mut egui::Ui) {
@@ -1914,10 +2001,10 @@ mod ui {
                 ui.label(egui::RichText::new(active).color(DIM2).size(12.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Загрузить →").clicked() {
-                        self.start_upload();
+                        self.act_upload_selected();
                     }
                     if ui.button("← Скачать").clicked() {
-                        self.start_download();
+                        self.act_download_selected();
                     }
                 });
             });
@@ -1951,7 +2038,17 @@ mod ui {
                     for j in &self.jobs {
                         ui.horizontal(|ui| {
                             ui.label(if j.up { "→" } else { "←" });
-                            ui.label(&j.name);
+                            let nm = if j.is_dir {
+                                format!("{} (папка)", j.name)
+                            } else {
+                                j.name.clone()
+                            };
+                            ui.label(nm);
+                            if !j.note.is_empty() && matches!(j.status, JobStatusUi::Active) {
+                                ui.label(
+                                    egui::RichText::new(j.note.clone()).size(11.5).color(DIM2),
+                                );
+                            }
                             let frac = if j.total > 0 {
                                 (j.done as f32 / j.total as f32).clamp(0.0, 1.0)
                             } else if matches!(j.status, JobStatusUi::Done) {
@@ -2008,9 +2105,13 @@ mod ui {
                 self.pane_ui(&mut cols[0], Side::Local);
                 self.pane_ui(&mut cols[1], Side::Remote);
             });
+            if ui.input(|i| i.pointer.any_released()) {
+                self.drag_src = None;
+            }
         }
 
         fn pane_ui(&mut self, ui: &mut egui::Ui, side: Side) {
+            let pane_rect = ui.available_rect_before_wrap();
             let is_active = self.side == side;
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -2060,7 +2161,8 @@ mod ui {
                 );
             });
             ui.add_space(2.0);
-            let mut dbl: Option<(bool, String)> = None;
+            let mut dbl: Option<(bool, String, u64, String)> = None;
+            let mut drag_new: Option<(Side, String, bool, u64)> = None;
             let mut clicked = false;
             {
                 let pane = self.pane(side);
@@ -2088,7 +2190,15 @@ mod ui {
                         if resp.double_clicked() {
                             pane.selected = Some(i);
                             clicked = true;
-                            dbl = Some((e.is_dir, join_path(&pane.path, &e.name)));
+                            dbl = Some((
+                                e.is_dir,
+                                e.name.clone(),
+                                e.size,
+                                join_path(&pane.path, &e.name),
+                            ));
+                        }
+                        if resp.drag_started() {
+                            drag_new = Some((side, e.name.clone(), e.is_dir, e.size));
                         }
                     }
                 });
@@ -2096,13 +2206,36 @@ mod ui {
             if clicked {
                 self.side = side;
             }
-            if let Some((is_dir, full)) = dbl {
+            if let Some(d) = drag_new {
+                self.drag_src = Some(d);
+            }
+            if let Some((is_dir, name, size, full)) = dbl {
                 if is_dir {
                     self.navigate(side, full);
                 } else if side == Side::Remote {
-                    self.start_download();
+                    self.begin_download(name, false, size);
                 } else {
-                    self.start_upload();
+                    self.begin_upload(name, false, size);
+                }
+            }
+            // Перетаскивание между панелями: подсветка приёмника и сброс.
+            if let Some((src, name, is_dir, size)) = self.drag_src.clone()
+                && src != side
+                && ui.rect_contains_pointer(pane_rect)
+            {
+                ui.painter().rect_filled(
+                    pane_rect,
+                    6.0,
+                    egui::Color32::from_rgba_unmultiplied(75, 141, 240, 20),
+                );
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                if ui.input(|i| i.pointer.any_released()) {
+                    match (src, side) {
+                        (Side::Remote, Side::Local) => self.begin_download(name, is_dir, size),
+                        (Side::Local, Side::Remote) => self.begin_upload(name, is_dir, size),
+                        _ => {}
+                    }
+                    self.drag_src = None;
                 }
             }
         }
