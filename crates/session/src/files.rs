@@ -483,7 +483,7 @@ fn io_status(e: &std::io::Error) -> (u8, String) {
 }
 
 #[cfg(windows)]
-fn drives() -> Vec<String> {
+pub fn local_drives() -> Vec<String> {
     use windows::Win32::Storage::FileSystem::GetLogicalDrives;
     let mask = unsafe { GetLogicalDrives() };
     let mut out = Vec::new();
@@ -497,7 +497,7 @@ fn drives() -> Vec<String> {
 }
 
 #[cfg(not(windows))]
-fn drives() -> Vec<String> {
+pub fn local_drives() -> Vec<String> {
     Vec::new()
 }
 
@@ -579,7 +579,7 @@ impl Server {
             }
             kind::DRIVES_REQ => {
                 if let Some(id) = parse_tid(payload, kind::DRIVES_REQ) {
-                    emit(0, &pack_drives_resp(id, &drives()));
+                    emit(0, &pack_drives_resp(id, &local_drives()));
                 }
             }
             kind::READ_OPEN => {
@@ -872,7 +872,7 @@ pub fn parse_cmd(args: &[String]) -> Result<FileCmd, String> {
     }
 }
 
-fn human_size(n: u64) -> String {
+pub fn human_size(n: u64) -> String {
     const KB: f64 = 1024.0;
     let x = n as f64;
     if x < KB {

@@ -125,6 +125,9 @@ pub fn spawn_agent(
     let switch_a = switch_req.clone();
     let dirty_a = geom_dirty.clone();
     let fps = cfg.fps.max(1);
+    // Файловые клиенты могут отключить видео (экономия канала).
+    let video_off = Arc::new(AtomicBool::new(false));
+    let video_off_a = video_off.clone();
     let thread_a = std::thread::spawn(move || {
         set_above_normal();
         let mut cap = cap0;
@@ -140,6 +143,11 @@ pub fn spawn_agent(
         let mut desk_check_t = Instant::now() - Duration::from_secs(1);
 
         while !stop_a.load(Ordering::Relaxed) {
+            // Контент не нужен (файловый режим) — не тратим захват и кодек.
+            if video_off_a.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
             // Переключение монитора по запросу вьюера: пересоздаём весь конвейер.
             if let Some(idx) = switch_a.lock().unwrap().take() {
                 let res: Result<(), String> = 'sw: {
@@ -368,6 +376,7 @@ pub fn spawn_agent(
     let active_b = sh_active.clone();
     let switch_b = switch_req.clone();
     let dirty_b = geom_dirty.clone();
+    let video_off_b = video_off.clone();
     let thread_b = std::thread::spawn(move || {
         set_above_normal();
         let mut mux = MuxEncoder::new();
@@ -493,6 +502,11 @@ pub fn spawn_agent(
                                 {
                                     clip_set_by_us = Some(text);
                                     stats_b.lock().unwrap().clip_in += 1;
+                                } else if input::parse_video_off(f.payload) {
+                                    video_off_b.store(true, Ordering::Relaxed);
+                                    crate::log::log_line(
+                                        "[files] клиент отключил видео (файловый режим)",
+                                    );
                                 }
                             } else if let Some(env) = control::decode_env(f.payload) {
                                 stats_b.lock().unwrap().control_msgs += 1;

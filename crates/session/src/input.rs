@@ -26,6 +26,18 @@ pub const META_MONITORS: u8 = 3;
 pub const META_CLIP: u8 = 4;
 /// Картинка системного курсора агента (RGBA + хотспот), канал Control.
 pub const META_CURSOR_IMG: u8 = 5;
+/// Meta-тип: клиент просит не передавать видео (файловый режим, viewer → agent).
+pub const META_VIDEO_OFF: u8 = 6;
+
+/// Полезная нагрузка «отключи видео» (канал Control).
+pub fn video_off_payload() -> [u8; 2] {
+    [META_MAGIC, META_VIDEO_OFF]
+}
+
+/// Разобрать «отключи видео».
+pub fn parse_video_off(p: &[u8]) -> bool {
+    p.len() == 2 && p[0] == META_MAGIC && p[1] == META_VIDEO_OFF
+}
 
 /// Прямоугольник в экранных координатах.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

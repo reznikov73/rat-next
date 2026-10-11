@@ -45,6 +45,8 @@ struct Args {
     /// Файловая проверка: адрес агента, дальше — команда (ls/get/put/…).
     files_check: Option<String>,
     file_cmd: Option<Vec<String>>,
+    /// Авто-открытие файлового окна (тест/отладка): адрес агента.
+    files_ui: Option<String>,
     /// Просьба о вежливом завершении работающего экземпляра (установщик).
     request_quit: bool,
 }
@@ -72,6 +74,7 @@ fn parse_args() -> Args {
         input_check: None,
         files_check: None,
         file_cmd: None,
+        files_ui: None,
         request_quit: false,
     };
     let args: Vec<String> = std::env::args().collect();
@@ -136,6 +139,10 @@ fn parse_args() -> Args {
                 a.files_check = Some(s["--files-check=".len()..].to_string());
                 a.file_cmd = Some(args[i + 1..].to_vec());
                 i = args.len();
+            }
+            s if s.starts_with("--files-ui=") => {
+                a.files_ui = Some(s["--files-ui=".len()..].to_string());
+                i += 1;
             }
             "--request-quit" => {
                 a.request_quit = true;
@@ -1428,9 +1435,980 @@ mod ui {
 
     type ConnectMsg = Result<ViewerSession, String>;
 
+    // ---------------- файловый менеджер ----------------
+
+    type FsDirEntry = rat_session::files::DirEntry;
+    type FsCmd = rat_session::files_worker::WCmd;
+    type FsEvt = rat_session::files_worker::WEvt;
+    type FsAction = rat_session::files_worker::ConflictAction;
+
+    /// Элемент очереди передач (отображение).
+    struct UiJob {
+        id: u64,
+        up: bool,
+        name: String,
+        total: u64,
+        done: u64,
+        status: JobStatusUi,
+        speed: f32,
+        last_done: u64,
+        last_t: Instant,
+    }
+
+    enum JobStatusUi {
+        Queued,
+        Active,
+        Done,
+        Skipped,
+        Failed(String),
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Side {
+        Local,
+        Remote,
+    }
+
+    struct PaneState {
+        path: String,
+        entries: Vec<FsDirEntry>,
+        selected: Option<usize>,
+        loading: bool,
+        err: Option<String>,
+    }
+
+    impl PaneState {
+        fn new(path: String) -> Self {
+            Self {
+                path,
+                entries: Vec::new(),
+                selected: None,
+                loading: false,
+                err: None,
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum PromptKind {
+        NewFolder,
+        Rename,
+    }
+
+    struct PromptState {
+        kind: PromptKind,
+        side: Side,
+        text: String,
+        target: String,
+    }
+
+    struct ConfirmState {
+        side: Side,
+        path: String,
+        name: String,
+        is_dir: bool,
+    }
+
+    struct ConflictState {
+        id: u64,
+        path: String,
+        up: bool,
+        name: String,
+        choice: u8,
+        apply_all: bool,
+        new_name: String,
+    }
+
+    /// Состояние экрана «Файлы».
+    struct FilesState {
+        name: String,
+        addr: String,
+        tx: std::sync::mpsc::Sender<FsCmd>,
+        rx: std::sync::mpsc::Receiver<FsEvt>,
+        connected: bool,
+        failed: Option<String>,
+        side: Side,
+        local: PaneState,
+        remote: PaneState,
+        remote_drives: Vec<String>,
+        jobs: Vec<UiJob>,
+        next_job: u64,
+        conflict: Option<ConflictState>,
+        conflict_all: Option<bool>,
+        prompt: Option<PromptState>,
+        confirm: Option<ConfirmState>,
+        status: Option<String>,
+        status_t: Instant,
+        want_close: bool,
+    }
+
+    impl FilesState {
+        fn open(name: String, addr: String, target: rat_session::files_worker::Target) -> Self {
+            let (tx, rx) = rat_session::files_worker::spawn(target);
+            let mut s = Self {
+                name,
+                addr,
+                tx,
+                rx,
+                connected: false,
+                failed: None,
+                side: Side::Local,
+                local: PaneState::new(local_home_dir()),
+                remote: PaneState::new("C:\\".to_string()),
+                remote_drives: Vec::new(),
+                jobs: Vec::new(),
+                next_job: 1,
+                conflict: None,
+                conflict_all: None,
+                prompt: None,
+                confirm: None,
+                status: None,
+                status_t: Instant::now() - Duration::from_secs(10),
+                want_close: false,
+            };
+            s.reload(Side::Local);
+            s
+        }
+
+        fn shutdown(&mut self) {
+            let _ = self.tx.send(FsCmd::Quit);
+        }
+
+        fn note(&mut self, s: String) {
+            self.status = Some(s);
+            self.status_t = Instant::now();
+        }
+
+        fn reload(&mut self, side: Side) {
+            match side {
+                Side::Local => {
+                    let p = &mut self.local;
+                    match list_dir(&p.path) {
+                        Ok(e) => {
+                            p.entries = e;
+                            p.selected = None;
+                            p.err = None;
+                        }
+                        Err(e) => p.err = Some(e),
+                    }
+                }
+                Side::Remote => {
+                    self.remote.loading = true;
+                    self.remote.err = None;
+                    let _ = self.tx.send(FsCmd::List {
+                        path: self.remote.path.clone(),
+                    });
+                }
+            }
+        }
+
+        fn navigate(&mut self, side: Side, path: String) {
+            match side {
+                Side::Local => {
+                    self.local.path = path;
+                    self.reload(Side::Local);
+                }
+                Side::Remote => {
+                    self.remote.path = path;
+                    self.reload(Side::Remote);
+                }
+            }
+        }
+
+        fn pane(&mut self, side: Side) -> &mut PaneState {
+            match side {
+                Side::Local => &mut self.local,
+                Side::Remote => &mut self.remote,
+            }
+        }
+
+        fn selected_entry(&self, side: Side) -> Option<(String, bool, u64)> {
+            let p = match side {
+                Side::Local => &self.local,
+                Side::Remote => &self.remote,
+            };
+            p.selected
+                .and_then(|i| p.entries.get(i))
+                .map(|e| (e.name.clone(), e.is_dir, e.size))
+        }
+
+        fn tick(&mut self, ctx: &egui::Context) {
+            loop {
+                match self.rx.try_recv() {
+                    Ok(ev) => self.on_event(ev),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        if self.failed.is_none() && self.connected {
+                            self.failed = Some("соединение закрыто".to_string());
+                        }
+                        break;
+                    }
+                }
+            }
+            let now = Instant::now();
+            for j in &mut self.jobs {
+                if matches!(j.status, JobStatusUi::Active) {
+                    let dt = now.duration_since(j.last_t).as_secs_f32();
+                    if dt >= 0.5 {
+                        j.speed = ((j.done.saturating_sub(j.last_done)) as f32 / dt).max(0.0);
+                        j.last_done = j.done;
+                        j.last_t = now;
+                    }
+                }
+            }
+            if self.failed.is_none() {
+                ctx.request_repaint_after(Duration::from_millis(80));
+            }
+        }
+
+        fn on_event(&mut self, ev: FsEvt) {
+            match ev {
+                FsEvt::Connected => {
+                    self.connected = true;
+                    let _ = self.tx.send(FsCmd::Drives);
+                    self.reload(Side::Remote);
+                }
+                FsEvt::ConnectFailed { err } => {
+                    self.failed = Some(err);
+                }
+                FsEvt::List { path, result } => {
+                    if path == self.remote.path {
+                        self.remote.loading = false;
+                        match result {
+                            Ok(e) => {
+                                self.remote.entries = e;
+                                self.remote.selected = None;
+                            }
+                            Err(e) => self.remote.err = Some(e),
+                        }
+                    }
+                }
+                FsEvt::Drives { drives } => {
+                    self.remote_drives = drives;
+                }
+                FsEvt::Op {
+                    action,
+                    path,
+                    result,
+                } => match result {
+                    Ok(()) => {
+                        self.note(format!("{action}: {path}"));
+                        self.reload(Side::Remote);
+                    }
+                    Err(e) => self.note(format!("{action}: {e}")),
+                },
+                FsEvt::JobStarted { id } => {
+                    if let Some(j) = self.jobs.iter_mut().find(|j| j.id == id) {
+                        j.status = JobStatusUi::Active;
+                        j.last_t = Instant::now();
+                    }
+                }
+                FsEvt::Progress { id, done, total } => {
+                    if let Some(j) = self.jobs.iter_mut().find(|j| j.id == id) {
+                        j.done = done;
+                        j.total = total;
+                    }
+                }
+                FsEvt::JobDone { id, result } => {
+                    if let Some(j) = self.jobs.iter_mut().find(|j| j.id == id) {
+                        j.status = match &result {
+                            Ok(()) => {
+                                j.done = j.total;
+                                JobStatusUi::Done
+                            }
+                            Err(e) if e == "пропущено" => JobStatusUi::Skipped,
+                            Err(e) => JobStatusUi::Failed(e.clone()),
+                        };
+                    }
+                    if result.is_ok() {
+                        self.reload(Side::Remote);
+                        self.reload(Side::Local);
+                    }
+                }
+                FsEvt::Conflict { id, path } => {
+                    let up = self
+                        .jobs
+                        .iter()
+                        .find(|j| j.id == id)
+                        .map(|j| j.up)
+                        .unwrap_or(false);
+                    if let Some(choice) = self.conflict_all {
+                        let action = if choice {
+                            FsAction::Overwrite
+                        } else {
+                            FsAction::Skip
+                        };
+                        let _ = self.tx.send(FsCmd::Resolve { id, action });
+                    } else {
+                        let name = path.rsplit('\\').next().unwrap_or(&path).to_string();
+                        self.conflict = Some(ConflictState {
+                            id,
+                            path,
+                            up,
+                            name: name.clone(),
+                            choice: 0,
+                            apply_all: false,
+                            new_name: name,
+                        });
+                    }
+                }
+                FsEvt::Disconnected { err } => {
+                    self.failed = Some(err);
+                }
+            }
+        }
+
+        fn local_op(
+            &mut self,
+            action: &'static str,
+            f: impl FnOnce() -> std::io::Result<()>,
+            path: &str,
+        ) {
+            match f() {
+                Ok(()) => {
+                    self.note(format!("{action}: {path}"));
+                    self.reload(Side::Local);
+                }
+                Err(e) => self.note(format!("{action}: ошибка: {e}")),
+            }
+        }
+
+        fn start_download(&mut self) {
+            let Some((name, is_dir, size)) = self.selected_entry(Side::Remote) else {
+                self.note("выберите файл в правой панели".to_string());
+                return;
+            };
+            if is_dir {
+                self.note("передача папок — следующим этапом".to_string());
+                return;
+            }
+            let id = self.next_job;
+            self.next_job += 1;
+            let remote = join_path(&self.remote.path, &name);
+            let local = join_path(&self.local.path, &name);
+            self.jobs.push(UiJob {
+                id,
+                up: false,
+                name,
+                total: size,
+                done: 0,
+                status: JobStatusUi::Queued,
+                speed: 0.0,
+                last_done: 0,
+                last_t: Instant::now(),
+            });
+            let _ = self.tx.send(FsCmd::Download { id, remote, local });
+        }
+
+        fn start_upload(&mut self) {
+            let Some((name, is_dir, size)) = self.selected_entry(Side::Local) else {
+                self.note("выберите файл в левой панели".to_string());
+                return;
+            };
+            if is_dir {
+                self.note("передача папок — следующим этапом".to_string());
+                return;
+            }
+            let id = self.next_job;
+            self.next_job += 1;
+            let local = join_path(&self.local.path, &name);
+            let remote = join_path(&self.remote.path, &name);
+            self.jobs.push(UiJob {
+                id,
+                up: true,
+                name,
+                total: size,
+                done: 0,
+                status: JobStatusUi::Queued,
+                speed: 0.0,
+                last_done: 0,
+                last_t: Instant::now(),
+            });
+            let _ = self.tx.send(FsCmd::Upload { id, local, remote });
+        }
+
+        fn ui(&mut self, ui: &mut egui::Ui) {
+            egui::Panel::top(egui::Id::new("files_top")).show(ui, |ui| self.top_ui(ui));
+            egui::Panel::bottom(egui::Id::new("files_queue"))
+                .exact_size(118.0)
+                .show(ui, |ui| self.queue_ui(ui));
+            egui::CentralPanel::default().show(ui, |ui| self.panes_ui(ui));
+        }
+
+        fn top_ui(&mut self, ui: &mut egui::Ui) {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui.button("← Назад").clicked() {
+                    self.want_close = true;
+                }
+                ui.add_space(6.0);
+                let (dot, text) = if let Some(e) = &self.failed {
+                    (egui::Color32::from_rgb(203, 60, 60), format!("ошибка: {e}"))
+                } else if self.connected {
+                    (
+                        egui::Color32::from_rgb(34, 160, 107),
+                        format!("Файловый режим (без экрана) — {}", self.name),
+                    )
+                } else {
+                    (
+                        egui::Color32::from_rgb(195, 200, 207),
+                        format!("подключение… {}", self.addr),
+                    )
+                };
+                ui.label(egui::RichText::new("●").color(dot).size(13.0));
+                ui.label(text);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Отключиться").clicked() {
+                        self.want_close = true;
+                    }
+                    if let Some(st) = &self.status
+                        && self.status_t.elapsed().as_secs() < 7
+                    {
+                        ui.label(egui::RichText::new(st.clone()).color(DIM2).size(12.5));
+                    }
+                });
+            });
+            ui.add_space(3.0);
+            ui.horizontal(|ui| {
+                let active = match self.side {
+                    Side::Local => "активна левая панель",
+                    Side::Remote => "активна правая панель",
+                };
+                if ui.button("Новая папка").clicked() {
+                    self.prompt = Some(PromptState {
+                        kind: PromptKind::NewFolder,
+                        side: self.side,
+                        text: "Новая папка".to_string(),
+                        target: String::new(),
+                    });
+                }
+                if ui.button("Переименовать").clicked() {
+                    if let Some((name, _, _)) = self.selected_entry(self.side) {
+                        self.prompt = Some(PromptState {
+                            kind: PromptKind::Rename,
+                            side: self.side,
+                            text: name.clone(),
+                            target: name,
+                        });
+                    } else {
+                        self.note("выберите файл или папку".to_string());
+                    }
+                }
+                if ui.button("Удалить").clicked() {
+                    if let Some((name, is_dir, _)) = self.selected_entry(self.side) {
+                        let p = match self.side {
+                            Side::Local => self.local.path.clone(),
+                            Side::Remote => self.remote.path.clone(),
+                        };
+                        self.confirm = Some(ConfirmState {
+                            side: self.side,
+                            path: join_path(&p, &name),
+                            name,
+                            is_dir,
+                        });
+                    } else {
+                        self.note("выберите файл или папку".to_string());
+                    }
+                }
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new(active).color(DIM2).size(12.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Загрузить →").clicked() {
+                        self.start_upload();
+                    }
+                    if ui.button("← Скачать").clicked() {
+                        self.start_download();
+                    }
+                });
+            });
+            ui.add_space(3.0);
+        }
+
+        fn queue_ui(&mut self, ui: &mut egui::Ui) {
+            ui.add_space(3.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Передачи").strong());
+                ui.label(
+                    egui::RichText::new(format!("({})", self.jobs.len()))
+                        .color(DIM2)
+                        .size(12.0),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Очистить завершённые").clicked() {
+                        self.jobs.retain(|j| {
+                            matches!(j.status, JobStatusUi::Queued | JobStatusUi::Active)
+                        });
+                    }
+                });
+            });
+            let mut cancel: Option<u64> = None;
+            egui::ScrollArea::vertical()
+                .max_height(76.0)
+                .show(ui, |ui| {
+                    if self.jobs.is_empty() {
+                        ui.label(egui::RichText::new("очередь пуста").color(DIM2).size(12.0));
+                    }
+                    for j in &self.jobs {
+                        ui.horizontal(|ui| {
+                            ui.label(if j.up { "→" } else { "←" });
+                            ui.label(&j.name);
+                            let frac = if j.total > 0 {
+                                (j.done as f32 / j.total as f32).clamp(0.0, 1.0)
+                            } else if matches!(j.status, JobStatusUi::Done) {
+                                1.0
+                            } else {
+                                0.0
+                            };
+                            let (rect, _) = ui
+                                .allocate_exact_size(egui::vec2(200.0, 8.0), egui::Sense::hover());
+                            ui.painter().rect_filled(
+                                rect,
+                                4.0,
+                                egui::Color32::from_rgb(232, 235, 239),
+                            );
+                            if frac > 0.0 {
+                                let mut fr = rect;
+                                fr.set_width(rect.width() * frac);
+                                ui.painter().rect_filled(
+                                    fr,
+                                    4.0,
+                                    egui::Color32::from_rgb(75, 141, 240),
+                                );
+                            }
+                            let st = match &j.status {
+                                JobStatusUi::Queued => "в очереди".to_string(),
+                                JobStatusUi::Active => format!(
+                                    "{} / {} · {}/с",
+                                    rat_session::files::human_size(j.done),
+                                    rat_session::files::human_size(j.total),
+                                    rat_session::files::human_size(j.speed as u64)
+                                ),
+                                JobStatusUi::Done => {
+                                    format!("готово · {}", rat_session::files::human_size(j.total))
+                                }
+                                JobStatusUi::Skipped => "пропущено".to_string(),
+                                JobStatusUi::Failed(e) => format!("ошибка: {e}"),
+                            };
+                            ui.label(egui::RichText::new(st).size(12.0).color(DIM2));
+                            if matches!(j.status, JobStatusUi::Active | JobStatusUi::Queued)
+                                && ui.button("✕").clicked()
+                            {
+                                cancel = Some(j.id);
+                            }
+                        });
+                    }
+                });
+            if let Some(id) = cancel {
+                let _ = self.tx.send(FsCmd::Cancel { id });
+            }
+        }
+
+        fn panes_ui(&mut self, ui: &mut egui::Ui) {
+            ui.columns(2, |cols| {
+                self.pane_ui(&mut cols[0], Side::Local);
+                self.pane_ui(&mut cols[1], Side::Remote);
+            });
+        }
+
+        fn pane_ui(&mut self, ui: &mut egui::Ui, side: Side) {
+            let is_active = self.side == side;
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let title = match side {
+                    Side::Local => "Этот компьютер".to_string(),
+                    Side::Remote => self.name.clone(),
+                };
+                let t = egui::RichText::new(title).strong();
+                if is_active {
+                    ui.label(t.color(egui::Color32::from_rgb(29, 79, 159)));
+                } else {
+                    ui.label(t);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("⟳").clicked() {
+                        self.reload(side);
+                    }
+                    if let Some(p) = up_dir(&self.pane(side).path)
+                        && ui.small_button("⬆").clicked()
+                    {
+                        self.navigate(side, p);
+                    }
+                });
+            });
+            ui.horizontal(|ui| {
+                let drives = match side {
+                    Side::Local => rat_session::files::local_drives(),
+                    Side::Remote => self.remote_drives.clone(),
+                };
+                ui.menu_button("Диски ▾", |ui| {
+                    if drives.is_empty() {
+                        ui.label("нет данных");
+                    }
+                    for d in &drives {
+                        if ui.button(d).clicked() {
+                            self.navigate(side, d.clone());
+                            ui.close();
+                        }
+                    }
+                });
+                let path = self.pane(side).path.clone();
+                ui.label(
+                    egui::RichText::new(path)
+                        .monospace()
+                        .size(12.0)
+                        .color(egui::Color32::from_rgb(58, 63, 70)),
+                );
+            });
+            ui.add_space(2.0);
+            let mut dbl: Option<(bool, String)> = None;
+            let mut clicked = false;
+            {
+                let pane = self.pane(side);
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    if pane.loading {
+                        ui.label(egui::RichText::new("загрузка…").color(DIM2).size(12.0));
+                    }
+                    if let Some(e) = &pane.err {
+                        ui.label(
+                            egui::RichText::new(format!("ошибка: {e}"))
+                                .color(egui::Color32::from_rgb(203, 60, 60))
+                                .size(12.0),
+                        );
+                    }
+                    if pane.entries.is_empty() && !pane.loading {
+                        ui.label(egui::RichText::new("пусто").color(DIM2).size(12.0));
+                    }
+                    for (i, e) in pane.entries.iter().enumerate() {
+                        let selected = pane.selected == Some(i);
+                        let resp = files_row(ui, e, selected);
+                        if resp.clicked() {
+                            pane.selected = Some(i);
+                            clicked = true;
+                        }
+                        if resp.double_clicked() {
+                            pane.selected = Some(i);
+                            clicked = true;
+                            dbl = Some((e.is_dir, join_path(&pane.path, &e.name)));
+                        }
+                    }
+                });
+            }
+            if clicked {
+                self.side = side;
+            }
+            if let Some((is_dir, full)) = dbl {
+                if is_dir {
+                    self.navigate(side, full);
+                } else if side == Side::Remote {
+                    self.start_download();
+                } else {
+                    self.start_upload();
+                }
+            }
+        }
+
+        fn dialogs(&mut self, ctx: &egui::Context) {
+            // Конфликт имён.
+            if self.conflict.is_some() {
+                let mut answer: Option<FsAction> = None;
+                let mut cancel = false;
+                {
+                    let c = self.conflict.as_mut().unwrap();
+                    egui::Window::new("Файл уже существует")
+                        .collapsible(false)
+                        .resizable(false)
+                        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                        .show(ctx, |ui| {
+                            let where_ = if c.up {
+                                "на удалённой машине"
+                            } else {
+                                "в папке назначения"
+                            };
+                            ui.label(format!("«{}» уже есть {where_}.", c.name));
+                            ui.label(
+                                egui::RichText::new(&c.path)
+                                    .monospace()
+                                    .size(11.0)
+                                    .color(DIM2),
+                            );
+                            ui.add_space(4.0);
+                            ui.radio_value(&mut c.choice, 0u8, "Заменить");
+                            ui.radio_value(&mut c.choice, 1u8, "Пропустить");
+                            ui.radio_value(&mut c.choice, 2u8, "Сохранить как…");
+                            if c.choice == 2 {
+                                ui.text_edit_singleline(&mut c.new_name);
+                            }
+                            ui.checkbox(&mut c.apply_all, "Применить ко всем файлам");
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                if ui.button("Отмена").clicked() {
+                                    cancel = true;
+                                }
+                                let can_ok = c.choice != 2 || !c.new_name.trim().is_empty();
+                                if ui.button("Далее").clicked() && can_ok {
+                                    answer = Some(match c.choice {
+                                        0 => FsAction::Overwrite,
+                                        1 => FsAction::Skip,
+                                        _ => FsAction::Rename(c.new_name.trim().to_string()),
+                                    });
+                                }
+                            });
+                        });
+                }
+                if cancel || answer.is_some() {
+                    let c = self.conflict.take().unwrap();
+                    let action = answer.unwrap_or(FsAction::Skip);
+                    if c.apply_all {
+                        self.conflict_all = match action {
+                            FsAction::Overwrite => Some(true),
+                            FsAction::Skip => Some(false),
+                            FsAction::Rename(_) => None,
+                        };
+                    }
+                    let _ = self.tx.send(FsCmd::Resolve { id: c.id, action });
+                }
+            }
+            // Новая папка / переименование.
+            if self.prompt.is_some() {
+                let (kind, side) = {
+                    let p = self.prompt.as_ref().unwrap();
+                    (p.kind, p.side)
+                };
+                let mut ok = false;
+                let mut cancel = false;
+                {
+                    let p = self.prompt.as_mut().unwrap();
+                    let title = match kind {
+                        PromptKind::NewFolder => "Новая папка",
+                        PromptKind::Rename => "Переименовать",
+                    };
+                    egui::Window::new(title)
+                        .collapsible(false)
+                        .resizable(false)
+                        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                        .show(ctx, |ui| {
+                            ui.label("Имя:");
+                            ui.text_edit_singleline(&mut p.text);
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                if ui.button("Отмена").clicked() {
+                                    cancel = true;
+                                }
+                                if ui.button("ОК").clicked() {
+                                    ok = true;
+                                }
+                            });
+                        });
+                }
+                if ok || cancel {
+                    let p = self.prompt.take().unwrap();
+                    let name = p.text.trim().to_string();
+                    if ok && !name.is_empty() {
+                        self.apply_prompt(kind, side, &name, &p.target);
+                    }
+                }
+            }
+            // Подтверждение удаления.
+            if self.confirm.is_some() {
+                let mut ok = false;
+                let mut cancel = false;
+                {
+                    let c = self.confirm.as_ref().unwrap();
+                    egui::Window::new("Удаление")
+                        .collapsible(false)
+                        .resizable(false)
+                        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                        .show(ctx, |ui| {
+                            if c.is_dir {
+                                ui.label(format!("Удалить папку «{}» со всем содержимым?", c.name));
+                            } else {
+                                ui.label(format!("Удалить файл «{}»? (без корзины)", c.name));
+                            }
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                if ui.button("Отмена").clicked() {
+                                    cancel = true;
+                                }
+                                if ui.button("Удалить").clicked() {
+                                    ok = true;
+                                }
+                            });
+                        });
+                }
+                if ok || cancel {
+                    let c = self.confirm.take().unwrap();
+                    if ok {
+                        match c.side {
+                            Side::Local => {
+                                let path = c.path.clone();
+                                let is_dir = c.is_dir;
+                                self.local_op(
+                                    "удалено",
+                                    move || {
+                                        if is_dir {
+                                            std::fs::remove_dir_all(&path)
+                                        } else {
+                                            std::fs::remove_file(&path)
+                                        }
+                                    },
+                                    &c.path,
+                                );
+                            }
+                            Side::Remote => {
+                                let _ = self.tx.send(FsCmd::Delete { path: c.path });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        fn apply_prompt(&mut self, kind: PromptKind, side: Side, name: &str, target: &str) {
+            let base = match side {
+                Side::Local => self.local.path.clone(),
+                Side::Remote => self.remote.path.clone(),
+            };
+            match kind {
+                PromptKind::NewFolder => {
+                    let path = join_path(&base, name);
+                    match side {
+                        Side::Local => {
+                            let p2 = path.clone();
+                            self.local_op("папка создана", move || std::fs::create_dir(&p2), &path);
+                        }
+                        Side::Remote => {
+                            let _ = self.tx.send(FsCmd::Mkdir { path });
+                        }
+                    }
+                }
+                PromptKind::Rename => {
+                    let old = join_path(&base, target);
+                    let new = join_path(&base, name);
+                    match side {
+                        Side::Local => {
+                            let a = old.clone();
+                            let b = new.clone();
+                            self.local_op("переименовано", move || std::fs::rename(&a, &b), &new);
+                        }
+                        Side::Remote => {
+                            let _ = self.tx.send(FsCmd::Rename { old, new });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn join_path(dir: &str, name: &str) -> String {
+        if dir.ends_with('\\') || dir.ends_with('/') {
+            format!("{dir}{name}")
+        } else {
+            format!("{dir}\\{name}")
+        }
+    }
+
+    fn up_dir(path: &str) -> Option<String> {
+        let p = std::path::Path::new(path);
+        p.parent().map(|d| d.to_string_lossy().into_owned())
+    }
+
+    fn list_dir(path: &str) -> Result<Vec<FsDirEntry>, String> {
+        let rd = std::fs::read_dir(path).map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if let Ok(md) = e.metadata() {
+                let is_dir = md.is_dir();
+                let mtime = md
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                out.push(FsDirEntry {
+                    name,
+                    is_dir,
+                    size: if is_dir { 0 } else { md.len() },
+                    mtime,
+                });
+            }
+        }
+        out.sort_by(|a, b| {
+            b.is_dir
+                .cmp(&a.is_dir)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+        Ok(out)
+    }
+
+    fn local_home_dir() -> String {
+        let home = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".to_string());
+        let docs = format!("{home}\\Documents");
+        if std::path::Path::new(&docs).is_dir() {
+            docs
+        } else {
+            home
+        }
+    }
+
+    fn files_row(ui: &mut egui::Ui, e: &FsDirEntry, selected: bool) -> egui::Response {
+        let (rect, resp) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::click());
+        if selected {
+            ui.painter()
+                .rect_filled(rect, 3.0, egui::Color32::from_rgb(227, 237, 253));
+        } else if resp.hovered() {
+            ui.painter()
+                .rect_filled(rect, 3.0, egui::Color32::from_rgb(244, 246, 249));
+        }
+        let ic = egui::Rect::from_min_size(
+            egui::pos2(rect.left() + 6.0, rect.center().y - 7.0),
+            egui::vec2(14.0, 14.0),
+        );
+        if e.is_dir {
+            ui.painter()
+                .rect_filled(ic, 2.0, egui::Color32::from_rgb(244, 185, 65));
+            ui.painter().rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(ic.left(), ic.top() - 2.5),
+                    egui::vec2(6.0, 4.0),
+                ),
+                1.5,
+                egui::Color32::from_rgb(244, 185, 65),
+            );
+        } else {
+            ui.painter()
+                .rect_filled(ic, 2.0, egui::Color32::from_rgb(185, 193, 204));
+            ui.painter()
+                .rect_filled(ic.shrink(1.0), 1.5, egui::Color32::WHITE);
+        }
+        let clip = ui.painter().with_clip_rect(rect);
+        clip.text(
+            egui::pos2(rect.left() + 28.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            &e.name,
+            egui::FontId::proportional(13.0),
+            egui::Color32::from_rgb(31, 35, 40),
+        );
+        let sz = if e.is_dir {
+            "папка".to_string()
+        } else {
+            rat_session::files::human_size(e.size)
+        };
+        clip.text(
+            egui::pos2(rect.right() - 6.0, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            sz,
+            egui::FontId::proportional(11.5),
+            DIM2,
+        );
+        resp
+    }
+
     enum Screen {
         Home,
         Viewer,
+        Files,
     }
 
     struct ViewerSession {
@@ -1496,6 +2474,7 @@ mod ui {
 
     enum TileAction {
         Connect(usize),
+        Files(usize),
         Rename(usize),
         Delete(usize),
         Add,
@@ -1524,6 +2503,8 @@ mod ui {
         my_name: String,
         screen: Screen,
         viewer: Option<ViewerSession>,
+        files: Option<FilesState>,
+        title_now: String,
         connect_rx: Option<Receiver<ConnectMsg>>,
         connecting_to: Option<String>,
         toast: Option<(String, Instant)>,
@@ -1534,6 +2515,7 @@ mod ui {
         edit_open: Option<usize>,
         edit_name: String,
         autoconnect_done: bool,
+        files_ui_done: bool,
         started: Instant,
         finished: bool,
         /// Значок в области уведомлений (создаётся всегда; если оболочка
@@ -1732,6 +2714,8 @@ mod ui {
                 my_name: std::env::var("COMPUTERNAME").unwrap_or_default(),
                 screen: Screen::Home,
                 viewer: None,
+                files: None,
+                title_now: "Rat Next".to_string(),
                 connect_rx: None,
                 connecting_to: None,
                 toast,
@@ -1742,6 +2726,7 @@ mod ui {
                 edit_open: None,
                 edit_name: String::new(),
                 autoconnect_done: false,
+                files_ui_done: false,
                 started: Instant::now(),
                 finished: false,
                 tray,
@@ -1968,6 +2953,7 @@ mod ui {
         }
 
         fn home_ui(&mut self, ui: &mut egui::Ui) {
+            self.set_title(ui.ctx(), "Rat Next");
             egui::Panel::top("top").show(ui, |ui| {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
@@ -2095,13 +3081,19 @@ mod ui {
                         }
                         for (i, m, online) in &snapshot {
                             let addr = m.addr.clone();
-                            let resp = tile(ui, m, *online);
-                            if resp.clicked() {
+                            let (resp, files_clicked) = tile(ui, m, *online);
+                            if files_clicked {
+                                actions.push(TileAction::Files(*i));
+                            } else if resp.clicked() {
                                 actions.push(TileAction::Connect(*i));
                             }
                             resp.context_menu(|ui| {
                                 if ui.button("Подключиться").clicked() {
                                     actions.push(TileAction::Connect(*i));
+                                    ui.close();
+                                }
+                                if ui.button("Файлы").clicked() {
+                                    actions.push(TileAction::Files(*i));
                                     ui.close();
                                 }
                                 if ui.button("Переименовать").clicked() {
@@ -2130,6 +3122,15 @@ mod ui {
                         };
                         if let Some((name, addr)) = pair {
                             self.start_connect(name, addr);
+                        }
+                    }
+                    TileAction::Files(i) => {
+                        let pair = {
+                            let list = self.machines.lock().unwrap();
+                            list.get(i).map(|m| (m.name.clone(), m.addr.clone()))
+                        };
+                        if let Some((name, addr)) = pair {
+                            self.open_files(name, addr);
                         }
                     }
                     TileAction::Rename(i) => {
@@ -2603,7 +3604,7 @@ mod ui {
         resp
     }
 
-    fn tile(ui: &mut egui::Ui, m: &Machine, online: bool) -> egui::Response {
+    fn tile(ui: &mut egui::Ui, m: &Machine, online: bool) -> (egui::Response, bool) {
         let desired = egui::vec2(225.0, 112.0);
         let (rect, resp) = ui.allocate_exact_size(desired, egui::Sense::click());
         let border = if resp.hovered() {
@@ -2644,10 +3645,10 @@ mod ui {
             egui::FontId::proportional(12.5),
             if online { ON } else { DIM2 },
         );
-        // Кнопка-подсказка: клик по плитке = подключиться.
+        // Кнопки-подсказки: клик по карточке = подключиться; «Файлы» — менеджер.
         let btn = egui::Rect::from_min_size(
             egui::pos2(rect.left() + 18.0, rect.bottom() - 34.0),
-            egui::vec2(112.0, 24.0),
+            egui::vec2(100.0, 24.0),
         );
         painter.rect_filled(
             btn,
@@ -2665,7 +3666,33 @@ mod ui {
             egui::FontId::proportional(13.0),
             egui::Color32::WHITE,
         );
-        resp
+        let fbtn = egui::Rect::from_min_size(
+            egui::pos2(rect.left() + 124.0, rect.bottom() - 34.0),
+            egui::vec2(58.0, 24.0),
+        );
+        let fresp = ui.interact(
+            fbtn,
+            egui::Id::new(("tile-files", &m.addr)),
+            egui::Sense::click(),
+        );
+        painter.rect_filled(fbtn, 6.0, egui::Color32::from_rgb(195, 199, 207));
+        painter.rect_filled(
+            fbtn.shrink(1.0),
+            5.5,
+            if fresp.hovered() {
+                egui::Color32::from_rgb(233, 238, 245)
+            } else {
+                egui::Color32::from_rgb(252, 252, 253)
+            },
+        );
+        painter.text(
+            fbtn.center(),
+            egui::Align2::CENTER_CENTER,
+            "Файлы",
+            egui::FontId::proportional(12.5),
+            egui::Color32::from_rgb(58, 63, 70),
+        );
+        (resp, fresp.clicked())
     }
 
     fn local_ip() -> String {
@@ -2684,6 +3711,59 @@ mod ui {
         }
     }
     impl RatApp {
+        /// Заголовок окна (меняется по экранам).
+        fn set_title(&mut self, ctx: &egui::Context, t: &str) {
+            if self.title_now != t {
+                self.title_now = t.to_string();
+                ctx.send_viewport_cmd(egui::ViewportCommand::Title(t.to_string()));
+            }
+        }
+
+        fn open_files(&mut self, name: String, addr: String) {
+            if self.viewer.is_some() || self.connect_rx.is_some() || self.files.is_some() {
+                return;
+            }
+            let target = if self.device.mode == ConnectionMode::Internet && !addr.contains(':') {
+                rat_session::files_worker::Target::Relay {
+                    relay: self.device.relay.clone(),
+                    id: addr.clone(),
+                }
+            } else {
+                rat_session::files_worker::Target::Tcp(addr.clone())
+            };
+            self.files = Some(FilesState::open(name, addr, target));
+            self.screen = Screen::Files;
+        }
+
+        fn close_files(&mut self) {
+            if let Some(mut f) = self.files.take() {
+                f.shutdown();
+            }
+            self.screen = Screen::Home;
+        }
+
+        // Типы менеджера файлов — на уровне модуля (см. выше impl RatApp).
+        fn files_ui(&mut self, ui: &mut egui::Ui) {
+            let title = self.files.as_ref().map(|f| format!("Файлы — {}", f.name));
+            let Some(title) = title else {
+                self.screen = Screen::Home;
+                return;
+            };
+            self.set_title(ui.ctx(), &title);
+            let close = {
+                let Some(f) = self.files.as_mut() else {
+                    return;
+                };
+                f.tick(ui.ctx());
+                f.ui(ui);
+                f.dialogs(ui.ctx());
+                f.want_close
+            };
+            if close {
+                self.close_files();
+            }
+        }
+
         fn viewer_ui(&mut self, ui: &mut egui::Ui) {
             let mut back = false;
             let Some(v) = self.viewer.as_mut() else {
@@ -3424,6 +4504,12 @@ mod ui {
                     self.close_viewer();
                     return;
                 }
+                // Крестик в файловом режиме = вернуться к списку машин.
+                if self.files.is_some() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    self.close_files();
+                    return;
+                }
                 // Закрытие окна только прячет его: приложение и активные
                 // сессии продолжают работать; полный выход — через «Выход»
                 // в меню значка (там, где он есть).
@@ -3588,10 +4674,19 @@ mod ui {
                     }
                 }
             }
+            if !self.files_ui_done
+                && let Some(addr) = self.args.files_ui.clone()
+            {
+                self.files_ui_done = true;
+                let target = rat_session::files_worker::Target::Tcp(addr.clone());
+                self.files = Some(FilesState::open("Тест".to_string(), addr.clone(), target));
+                self.screen = Screen::Files;
+            }
             self.poll_connect();
             match self.screen {
                 Screen::Home => self.home_ui(ui),
                 Screen::Viewer => self.viewer_ui(ui),
+                Screen::Files => self.files_ui(ui),
             }
             self.dialogs(ui.ctx());
             if let Some(secs) = self.args.smoke
