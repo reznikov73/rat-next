@@ -42,6 +42,9 @@ struct Args {
     probe_secure: bool,
     /// Проверка доставки ввода: подключиться к агенту по адресу и сверить курсор.
     input_check: Option<String>,
+    /// Файловая проверка: адрес агента, дальше — команда (ls/get/put/…).
+    files_check: Option<String>,
+    file_cmd: Option<Vec<String>>,
     /// Просьба о вежливом завершении работающего экземпляра (установщик).
     request_quit: bool,
 }
@@ -67,6 +70,8 @@ fn parse_args() -> Args {
         service_helper: false,
         probe_secure: false,
         input_check: None,
+        files_check: None,
+        file_cmd: None,
         request_quit: false,
     };
     let args: Vec<String> = std::env::args().collect();
@@ -126,6 +131,11 @@ fn parse_args() -> Args {
             s if s.starts_with("--input-check=") => {
                 a.input_check = Some(s["--input-check=".len()..].to_string());
                 i += 1;
+            }
+            s if s.starts_with("--files-check=") => {
+                a.files_check = Some(s["--files-check=".len()..].to_string());
+                a.file_cmd = Some(args[i + 1..].to_vec());
+                i = args.len();
             }
             "--request-quit" => {
                 a.request_quit = true;
@@ -271,6 +281,26 @@ fn main() {
         match rat_session::inputcheck::run(addr) {
             Ok(report) => note(&report),
             Err(e) => note(&format!("ввод-проверка: ошибка: {e}")),
+        }
+        std::process::exit(0);
+    }
+    if let Some(addr) = args.files_check.as_deref() {
+        // Файловая проверка: команда в аргументах (ls/drives/get/put/mkdir/rm/mv).
+        let cmd_args = args.file_cmd.clone().unwrap_or_default();
+        match rat_session::files::parse_cmd(&cmd_args) {
+            Ok(cmd) => match rat_session::files::client_run(addr, &cmd) {
+                Ok(report) => {
+                    println!("{report}");
+                }
+                Err(e) => {
+                    println!("файлы: ошибка: {e}");
+                    std::process::exit(1);
+                }
+            },
+            Err(e) => {
+                println!("файлы: {e}");
+                std::process::exit(2);
+            }
         }
         std::process::exit(0);
     }

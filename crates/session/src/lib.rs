@@ -6,6 +6,7 @@
 
 pub mod control;
 pub mod elevation;
+pub mod files;
 pub mod frame;
 pub mod input;
 pub mod inputcheck;

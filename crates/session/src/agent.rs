@@ -393,6 +393,8 @@ pub fn spawn_agent(
         // мыши с реальной позицией курсора (только на защищённом столе).
         let mut last_move_target: Option<(u16, u16, Instant)> = None;
         let mut accept_checked = false;
+        // Файловые операции и передачи этой сессии (канал Files).
+        let mut fsrv = crate::files::Server::new();
 
         // Hello (capabilities) сразу при старте.
         let hello = control::hello(
@@ -520,6 +522,14 @@ pub fn spawn_agent(
                                 crate::log::log_line(&format!(
                                     "[secure] ввод: SendInput отклонил частей: {failed} (ошибка {err})"
                                 ));
+                            }
+                        } else if f.channel == Channel::Files {
+                            // Файлы: список каталогов, скачивание, загрузка.
+                            let logs = fsrv.handle(f.payload, &mut |fl, b| {
+                                mux.push(Channel::Files, fl, b);
+                            });
+                            for line in logs {
+                                crate::log::log_line(&line);
                             }
                         }
                     }
