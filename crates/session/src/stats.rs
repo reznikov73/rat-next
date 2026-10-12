@@ -36,6 +36,10 @@ pub struct SessionStats {
     pub input_recv: u64,
     /// Обновлений курсора отправлено агентом.
     pub cursor_sent: u64,
+    /// Паузы доставки курсорных пакетов >250 мс при активном вводе (вьюер).
+    pub cursor_gaps: u64,
+    /// Максимальная наблюдённая пауза доставки курсора, мс.
+    pub cursor_gap_max_ms: f32,
     /// Успешных переключений монитора «на лету».
     pub capture_switches: u64,
     /// Отправок текста буфера обмена (агент → вьюер).
@@ -77,7 +81,7 @@ impl SessionStats {
             "frames: captured={} sent_pkts={} shown={} drops(agent={} viewer={})\n\
              bytes: sent={} recv={}\n\
              fps={:.1}  codec={}  control_msgs={}\n\
-             input: sent={} injected={} cursor={} switches={}\n\
+             input: sent={} injected={} cursor={} switches={} gaps={} max_gap={:.0}ms\n\
              clip:  out={} in={}\n\
              e2e:   avg {:.2}ms  p50 {:.2}ms  p95 {:.2}ms\n\
              rtt:   avg {:.2}ms  p95 {:.2}ms\n\
@@ -99,6 +103,8 @@ impl SessionStats {
             self.input_sent,
             self.input_recv,
             self.cursor_sent,
+            self.cursor_gaps,
+            self.cursor_gap_max_ms,
             self.capture_switches,
             self.clip_out,
             self.clip_in,

@@ -3052,6 +3052,11 @@ mod ui {
         switch_done: bool,
         connected_at: Instant,
         last_pointer: Option<(u16, u16)>,
+        /// Диагностика/предсказание курсора (Шаг 0/1): последняя позиция из
+        /// пакетов агента, время её изменения и время последней отправки ввода.
+        last_cursor_pos: Option<(u16, u16)>,
+        last_cursor_change_at: Instant,
+        last_move_at: Instant,
         prev_mods: egui::Modifiers,
         buttons_down: [bool; 5],
         ui_e2e_ms: Vec<f32>,
@@ -3514,6 +3519,9 @@ mod ui {
                             switch_done: false,
                             connected_at: Instant::now(),
                             last_pointer: None,
+                            last_cursor_pos: None,
+                            last_cursor_change_at: Instant::now() - Duration::from_secs(10),
+                            last_move_at: Instant::now() - Duration::from_secs(10),
                             prev_mods: egui::Modifiers::default(),
                             buttons_down: [false; 5],
                             ui_e2e_ms: Vec::new(),
@@ -4690,6 +4698,7 @@ mod ui {
                             input::ui_px_to_norm(rel.x, rel.y, draw.width(), draw.height());
                         if v.last_pointer != Some((nx, ny)) {
                             v.last_pointer = Some((nx, ny));
+                            v.last_move_at = Instant::now();
                             locked.push(InputEvent::Move { x: nx, y: ny });
                         }
                     }
@@ -4724,6 +4733,7 @@ mod ui {
                             let (nx, ny) =
                                 input::ui_px_to_norm(rx, ry, draw.width(), draw.height());
                             v.last_pointer = Some((nx, ny));
+                            v.last_move_at = Instant::now();
                             v.buttons_down[i] = pressed;
                             locked.push(InputEvent::Button {
                                 btn: idx,
@@ -4894,8 +4904,21 @@ mod ui {
                 // Удалённый курсор поверх видео — настоящей картинкой, как на
                 // удалённой машине; пока картинки нет — векторная форма.
                 let cs = *cursor_arc.lock().unwrap();
+                if v.last_cursor_pos != Some((cs.x, cs.y)) {
+                    v.last_cursor_pos = Some((cs.x, cs.y));
+                    v.last_cursor_change_at = Instant::now();
+                }
                 if cs.visible {
-                    let (px, py) = input::norm_to_ui_px(cs.x, cs.y, draw.width(), draw.height());
+                    // Шаг 1 (против «залипаний» на интернет-канале): пока
+                    // управление идёт от нас, рисуем курсор по последней
+                    // отправленной цели — сетевые паузы не «морозят» картинку.
+                    // Пакеты агента возвращают управление, когда подтвердят
+                    // позицию (или по страховочному таймауту).
+                    let since_move = v.last_move_at.elapsed();
+                    let confirmed = v.last_cursor_change_at >= v.last_move_at;
+                    let predicting = cursor_predicting(since_move, confirmed);
+                    let (nx, ny) = cursor_draw_norm((cs.x, cs.y), v.last_pointer, predicting);
+                    let (px, py) = input::norm_to_ui_px(nx, ny, draw.width(), draw.height());
                     let pos = egui::pos2(draw.min.x + px, draw.min.y + py);
                     let remote_h = v
                         .info
@@ -4957,6 +4980,28 @@ mod ui {
     /// VK печатных клавиш: их доставляет Text-событие, по Key-пути не дублируем.
     fn is_char_vk(vk: u16) -> bool {
         matches!(vk, 0x20 | 0x30..=0x39 | 0x41..=0x5A)
+    }
+
+    /// Пора ли рисовать курсор по нашей цели (предсказание, Шаг 1)?
+    /// Пока управляем — да; после остановки — пока агент не подтвердит позицию
+    /// свежим пакетом (страховочное окно 2 с).
+    fn cursor_predicting(since_move: Duration, confirmed: bool) -> bool {
+        since_move < Duration::from_millis(300)
+            || (!confirmed && since_move < Duration::from_millis(2000))
+    }
+
+    /// Норм. координаты для отрисовки удалённого курсора: последняя отправленная
+    /// цель (если предсказываем) или пакет агента.
+    fn cursor_draw_norm(
+        cs: (u16, u16),
+        last_pointer: Option<(u16, u16)>,
+        predicting: bool,
+    ) -> (u16, u16) {
+        if predicting {
+            last_pointer.unwrap_or(cs)
+        } else {
+            cs
+        }
     }
 
     /// egui-клавиша → Windows VK (служебные клавиши; печатные идут через vk_for_char).
@@ -5384,6 +5429,19 @@ mod ui {
         fn human_size_comma() {
             assert_eq!(rat_session::files::human_size(1536), "1,5 КБ");
             assert_eq!(rat_session::files::human_size(500), "500 Б");
+        }
+
+        #[test]
+        fn cursor_prediction_windows() {
+            let ms = Duration::from_millis;
+            assert!(cursor_predicting(ms(100), false));
+            assert!(cursor_predicting(ms(500), false));
+            assert!(!cursor_predicting(ms(500), true));
+            assert!(!cursor_predicting(ms(2500), false));
+            assert!(!cursor_predicting(ms(2500), true));
+            assert_eq!(cursor_draw_norm((10, 20), Some((30, 40)), true), (30, 40));
+            assert_eq!(cursor_draw_norm((10, 20), Some((30, 40)), false), (10, 20));
+            assert_eq!(cursor_draw_norm((10, 20), None, true), (10, 20));
         }
     }
 }

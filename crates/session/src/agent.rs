@@ -385,6 +385,9 @@ pub fn spawn_agent(
 
         // Курсор: отправляем не чаще ~30 Гц и только при изменении.
         let mut last_cursor_t = Instant::now() - Duration::from_secs(1);
+        // Первый тик не считаем «паузой»: last_cursor_t намеренно в прошлом,
+        // чтобы курсор ушёл сразу.
+        let mut cursor_tick_seen = false;
         let mut last_cursor: Option<(u16, u16, bool, u8)> = None;
         let mut last_cursor_img_key: (usize, u8) = (0, 0);
 
@@ -595,8 +598,18 @@ pub fn spawn_agent(
             }
 
             // 2.5) курсор агента (droppable, «последний выигрывает»).
-            if last_cursor_t.elapsed() >= Duration::from_millis(33) {
+            let cur_wait = last_cursor_t.elapsed();
+            if cur_wait >= Duration::from_millis(33) {
                 last_cursor_t = Instant::now();
+                if cursor_tick_seen && cur_wait >= Duration::from_millis(250) {
+                    // Поток B был заблокирован (например, буфер обмена или
+                    // переключение стола) — маркер для разбора «залипаний».
+                    crate::log::log_line(&format!(
+                        "[net] курсор: поток обработки молчал {:.0} мс",
+                        cur_wait.as_secs_f32() * 1000.0
+                    ));
+                }
+                cursor_tick_seen = true;
                 let g = *geom_b.lock().unwrap();
                 if let Some((cx, cy, vis, kind, hcur)) = cursor_captured_norm(g) {
                     // Самопроверка ввода на защищённом столе: если события

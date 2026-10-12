@@ -97,6 +97,11 @@ pub fn spawn_viewer(
         let mut hello_seen = false;
         let mut fps_t = Instant::now();
         let mut fps_count: u32 = 0;
+        // Диагностика «залипаний» курсора (Шаг 0): время последнего принятого
+        // пакета курсора и время последней отправки ввода от нас.
+        let mut last_cursor_rx: Option<Instant> = None;
+        let mut first_cursor_rx: Option<Instant> = None;
+        let mut last_input_at: Option<Instant> = None;
 
         while !stop.load(Ordering::Relaxed) {
             match link.rx.recv_timeout(Duration::from_millis(5)) {
@@ -263,6 +268,25 @@ pub fn spawn_viewer(
                         }
                         Channel::Cursor => {
                             if let Some(c) = input::parse_cursor(f.payload) {
+                                let now = Instant::now();
+                                // Прогрев: первые 2 с после первого пакета не
+                                // считаем паузами (сессия ещё «раскручивается»).
+                                let warm = first_cursor_rx.is_some_and(|t| {
+                                    now.duration_since(t) >= Duration::from_secs(2)
+                                });
+                                first_cursor_rx.get_or_insert(now);
+                                if let Some(gap_ms) = note_cursor_gap(
+                                    last_cursor_rx,
+                                    now,
+                                    last_input_at,
+                                    warm,
+                                    &mut stats.lock().unwrap(),
+                                ) {
+                                    crate::log::log_line(&format!(
+                                        "[net] курсор: пауза доставки {gap_ms:.0} мс (при активном вводе)"
+                                    ));
+                                }
+                                last_cursor_rx = Some(now);
                                 *shared.cursor.lock().unwrap() = c;
                             }
                         }
@@ -308,6 +332,7 @@ pub fn spawn_viewer(
                 input::pack_batch(&mut buf, &coalesced);
                 out.push(Channel::Input, 0, &buf);
                 stats.lock().unwrap().input_sent += coalesced.len() as u64;
+                last_input_at = Some(Instant::now());
             }
             if !out.is_empty() && link.tx.send(out.take_bytes()).is_err() {
                 break;
@@ -321,6 +346,96 @@ pub fn spawn_viewer(
             }
         }
     })
+}
+
+/// Учесть паузу между пакетами курсора (диагностика «залипаний», Шаг 0):
+/// считаем только когда ввод недавно отправлялся (иначе курсор просто стоял
+/// на месте). Возвращает длину значимой паузы в мс.
+fn note_cursor_gap(
+    prev: Option<Instant>,
+    now: Instant,
+    last_input_at: Option<Instant>,
+    warm: bool,
+    st: &mut SessionStats,
+) -> Option<f32> {
+    let prev = prev?;
+    if !warm {
+        return None;
+    }
+    let active = last_input_at.is_some_and(|t| now.duration_since(t) < Duration::from_millis(1500));
+    if !active {
+        return None;
+    }
+    let gap_ms = now.duration_since(prev).as_secs_f32() * 1000.0;
+    if gap_ms <= 250.0 {
+        return None;
+    }
+    st.cursor_gaps += 1;
+    if gap_ms > st.cursor_gap_max_ms {
+        st.cursor_gap_max_ms = gap_ms;
+    }
+    Some(gap_ms)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_gap_counting() {
+        let mut st = SessionStats::default();
+        let t0 = Instant::now();
+        let active = Some(t0);
+        // обычная частота — не пауза
+        assert!(
+            note_cursor_gap(
+                Some(t0),
+                t0 + Duration::from_millis(40),
+                active,
+                true,
+                &mut st
+            )
+            .is_none()
+        );
+        // пауза при активном вводе — засчитывается
+        let g = note_cursor_gap(
+            Some(t0),
+            t0 + Duration::from_millis(420),
+            active,
+            true,
+            &mut st,
+        );
+        assert!(g.is_some());
+        assert_eq!(st.cursor_gaps, 1);
+        assert!(st.cursor_gap_max_ms >= 400.0);
+        // без активного ввода — не считаем
+        let idle = t0.checked_sub(Duration::from_secs(10));
+        assert!(
+            note_cursor_gap(
+                Some(t0),
+                t0 + Duration::from_millis(500),
+                idle,
+                true,
+                &mut st
+            )
+            .is_none()
+        );
+        assert_eq!(st.cursor_gaps, 1);
+        // прогрев — не считаем
+        assert!(
+            note_cursor_gap(
+                Some(t0),
+                t0 + Duration::from_millis(600),
+                active,
+                false,
+                &mut st
+            )
+            .is_none()
+        );
+        assert_eq!(st.cursor_gaps, 1);
+        // первый пакет — без паузы
+        assert!(note_cursor_gap(None, t0, active, true, &mut st).is_none());
+    }
 }
 
 fn set_above_normal() {
