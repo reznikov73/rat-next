@@ -51,6 +51,8 @@ pub mod kind {
     pub const WRITE_CLOSE_RESP: u8 = 18;
     pub const WRITE_ABORT: u8 = 19;
     pub const SERV_ERROR: u8 = 20;
+    pub const FSINFO_REQ: u8 = 21;
+    pub const FSINFO_RESP: u8 = 22;
 }
 
 /// Коды статуса ответов.
@@ -298,6 +300,28 @@ pub fn parse_drives_resp(payload: &[u8]) -> Option<(u32, Vec<String>)> {
     Some((id, out))
 }
 
+pub fn pack_fsinfo_resp(id: u32, status: u8, free: u64, total: u64) -> Vec<u8> {
+    let mut v = Vec::new();
+    wu8(&mut v, kind::FSINFO_RESP);
+    wu32(&mut v, id);
+    wu8(&mut v, status);
+    wu64(&mut v, free);
+    wu64(&mut v, total);
+    v
+}
+
+pub fn parse_fsinfo_resp(payload: &[u8]) -> Option<(u32, u8, u64, u64)> {
+    let mut r = Rd::new(payload);
+    if r.u8()? != kind::FSINFO_RESP {
+        return None;
+    }
+    let id = r.u32v()?;
+    let status = r.u8()?;
+    let free = r.u64v()?;
+    let total = r.u64v()?;
+    Some((id, status, free, total))
+}
+
 pub fn pack_read_open(tid: u32, path: &str) -> Vec<u8> {
     pack_id_path(kind::READ_OPEN, tid, path)
 }
@@ -501,6 +525,45 @@ pub fn local_drives() -> Vec<String> {
     Vec::new()
 }
 
+/// Свободно/всего на томе, содержащем путь (Windows).
+#[cfg(windows)]
+pub fn drive_space(path: &str) -> Option<(u64, u64)> {
+    use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    use windows::core::PCWSTR;
+    fn probe(p: &str, free: &mut u64, total: &mut u64) -> bool {
+        let w: Vec<u16> = p.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe {
+            GetDiskFreeSpaceExW(
+                PCWSTR(w.as_ptr()),
+                Some(free as *mut u64),
+                Some(total as *mut u64),
+                None,
+            )
+            .is_ok()
+        }
+    }
+    let mut free = 0u64;
+    let mut total = 0u64;
+    if probe(path, &mut free, &mut total) {
+        return Some((free, total));
+    }
+    // Путь мог исчезнуть — пробуем корень диска («C:\»).
+    if path.as_bytes().get(1) == Some(&b':')
+        && let Some(c) = path.chars().next()
+    {
+        let root = format!("{c}:\\");
+        if probe(&root, &mut free, &mut total) {
+            return Some((free, total));
+        }
+    }
+    None
+}
+
+#[cfg(not(windows))]
+pub fn drive_space(_path: &str) -> Option<(u64, u64)> {
+    None
+}
+
 struct ReadT {
     file: std::fs::File,
     path: String,
@@ -580,6 +643,18 @@ impl Server {
             kind::DRIVES_REQ => {
                 if let Some(id) = parse_tid(payload, kind::DRIVES_REQ) {
                     emit(0, &pack_drives_resp(id, &local_drives()));
+                }
+            }
+            kind::FSINFO_REQ => {
+                if let Some((id, path)) = parse_id_path(payload, kind::FSINFO_REQ) {
+                    match drive_space(&path) {
+                        Some((free, total)) => {
+                            emit(0, &pack_fsinfo_resp(id, st::OK, free, total));
+                        }
+                        None => {
+                            emit(0, &pack_fsinfo_resp(id, st::IO_ERR, 0, 0));
+                        }
+                    }
                 }
             }
             kind::READ_OPEN => {
@@ -878,11 +953,11 @@ pub fn human_size(n: u64) -> String {
     if x < KB {
         format!("{n} Б")
     } else if x < KB * KB {
-        format!("{:.1} КБ", x / KB)
+        format!("{:.1} КБ", x / KB).replace('.', ",")
     } else if x < KB * KB * KB {
-        format!("{:.1} МБ", x / (KB * KB))
+        format!("{:.1} МБ", x / (KB * KB)).replace('.', ",")
     } else {
-        format!("{:.2} ГБ", x / (KB * KB * KB))
+        format!("{:.2} ГБ", x / (KB * KB * KB)).replace('.', ",")
     }
 }
 
@@ -1339,5 +1414,12 @@ mod tests {
         let (id, d) = parse_drives_resp(&p).unwrap();
         assert_eq!(id, 1);
         assert_eq!(d, vec!["C:\\".to_string(), "D:\\".to_string()]);
+    }
+
+    #[test]
+    fn fsinfo_roundtrip() {
+        let p = pack_fsinfo_resp(3, st::OK, 12_345, 67_890);
+        assert_eq!(parse_fsinfo_resp(&p), Some((3, st::OK, 12_345, 67_890)));
+        assert_eq!(parse_fsinfo_resp(&[kind::FSINFO_RESP]), None);
     }
 }

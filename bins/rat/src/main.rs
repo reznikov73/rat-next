@@ -1328,7 +1328,8 @@ mod internet {
 
 #[cfg(feature = "ffmpeg")]
 mod ui {
-    use std::collections::HashMap;
+    use serde::{Deserialize, Serialize};
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::net::ToSocketAddrs;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{Receiver, TryRecvError, channel, sync_channel};
@@ -1499,9 +1500,14 @@ mod ui {
     struct PaneState {
         path: String,
         entries: Vec<FsDirEntry>,
-        selected: Option<usize>,
+        /// Множественное выделение (индексы записей).
+        sel: BTreeSet<usize>,
+        /// «Якорь» для Shift-диапазона.
+        anchor: Option<usize>,
         loading: bool,
         err: Option<String>,
+        /// Свободно/всего на томе текущего пути.
+        free: Option<(u64, u64)>,
     }
 
     impl PaneState {
@@ -1509,9 +1515,11 @@ mod ui {
             Self {
                 path,
                 entries: Vec::new(),
-                selected: None,
+                sel: BTreeSet::new(),
+                anchor: None,
                 loading: false,
                 err: None,
+                free: None,
             }
         }
     }
@@ -1531,9 +1539,8 @@ mod ui {
 
     struct ConfirmState {
         side: Side,
-        path: String,
-        name: String,
-        is_dir: bool,
+        /// Что удаляем: (полный путь, имя, это папка).
+        items: Vec<(String, String, bool)>,
     }
 
     struct ConflictState {
@@ -1544,6 +1551,14 @@ mod ui {
         choice: u8,
         apply_all: bool,
         new_name: String,
+    }
+
+    /// Переносимый набор: панель-источник и выбранные объекты
+    /// (имя, папка?, размер).
+    #[derive(Clone)]
+    struct DragPayload {
+        side: Side,
+        items: Vec<(String, bool, u64)>,
     }
 
     /// Состояние экрана «Файлы».
@@ -1567,12 +1582,26 @@ mod ui {
         status: Option<String>,
         status_t: Instant,
         want_close: bool,
-        drag_src: Option<(Side, String, bool, u64)>,
+        drag_src: Option<DragPayload>,
+        /// Пробуем восстановить сохранённый путь удалённой панели:
+        /// если он не открылся — перейдём на первый диск.
+        remote_restore: bool,
     }
 
     impl FilesState {
         fn open(name: String, addr: String, target: rat_session::files_worker::Target) -> Self {
             let (tx, rx) = rat_session::files_worker::spawn(target);
+            // Пути панелей помним между открытиями окна и перезапусками (ui.json).
+            let prefs = load_ui_prefs();
+            let local_saved = prefs.files_local.clone();
+            let local_path =
+                if !local_saved.is_empty() && std::path::Path::new(&local_saved).is_dir() {
+                    local_saved
+                } else {
+                    local_home_dir()
+                };
+            let remote_saved = prefs.files_remote.get(&addr).cloned();
+            let remote_path = remote_saved.clone().unwrap_or_else(|| "C:\\".to_string());
             let mut s = Self {
                 name,
                 addr,
@@ -1581,8 +1610,8 @@ mod ui {
                 connected: false,
                 failed: None,
                 side: Side::Local,
-                local: PaneState::new(local_home_dir()),
-                remote: PaneState::new("C:\\".to_string()),
+                local: PaneState::new(local_path),
+                remote: PaneState::new(remote_path),
                 remote_drives: Vec::new(),
                 jobs: Vec::new(),
                 next_job: 1,
@@ -1594,6 +1623,7 @@ mod ui {
                 status_t: Instant::now() - Duration::from_secs(10),
                 want_close: false,
                 drag_src: None,
+                remote_restore: remote_saved.is_some(),
             };
             s.reload(Side::Local);
             s
@@ -1615,16 +1645,21 @@ mod ui {
                     match list_dir(&p.path) {
                         Ok(e) => {
                             p.entries = e;
-                            p.selected = None;
+                            p.sel.clear();
+                            p.anchor = None;
                             p.err = None;
                         }
                         Err(e) => p.err = Some(e),
                     }
+                    p.free = rat_session::files::drive_space(&p.path);
                 }
                 Side::Remote => {
                     self.remote.loading = true;
                     self.remote.err = None;
                     let _ = self.tx.send(FsCmd::List {
+                        path: self.remote.path.clone(),
+                    });
+                    let _ = self.tx.send(FsCmd::FreeSpace {
                         path: self.remote.path.clone(),
                     });
                 }
@@ -1639,9 +1674,21 @@ mod ui {
                 }
                 Side::Remote => {
                     self.remote.path = path;
+                    self.remote_restore = false;
                     self.reload(Side::Remote);
                 }
             }
+            self.save_prefs();
+        }
+
+        /// Сохранить текущие пути панелей (ui.json рядом с exe).
+        fn save_prefs(&self) {
+            let mut prefs = load_ui_prefs();
+            prefs.files_local = self.local.path.clone();
+            prefs
+                .files_remote
+                .insert(self.addr.clone(), self.remote.path.clone());
+            save_ui_prefs(&prefs);
         }
 
         fn pane(&mut self, side: Side) -> &mut PaneState {
@@ -1651,14 +1698,55 @@ mod ui {
             }
         }
 
-        fn selected_entry(&self, side: Side) -> Option<(String, bool, u64)> {
+        /// Первый (по порядку) выделенный объект панели.
+        fn first_selected(&self, side: Side) -> Option<(String, bool, u64)> {
             let p = match side {
                 Side::Local => &self.local,
                 Side::Remote => &self.remote,
             };
-            p.selected
-                .and_then(|i| p.entries.get(i))
+            p.sel
+                .iter()
+                .next()
+                .and_then(|&i| p.entries.get(i))
                 .map(|e| (e.name.clone(), e.is_dir, e.size))
+        }
+
+        /// Все выделенные объекты панели: (имя, папка?, размер).
+        fn sel_items(&self, side: Side) -> Vec<(String, bool, u64)> {
+            let p = match side {
+                Side::Local => &self.local,
+                Side::Remote => &self.remote,
+            };
+            p.sel
+                .iter()
+                .filter_map(|&i| p.entries.get(i))
+                .map(|e| (e.name.clone(), e.is_dir, e.size))
+                .collect()
+        }
+
+        /// «3 объекта · 12,4 МБ» для нижней строки панели.
+        fn sel_info(p: &PaneState) -> String {
+            if p.sel.is_empty() {
+                return String::new();
+            }
+            let mut bytes = 0u64;
+            for &i in &p.sel {
+                if let Some(e) = p.entries.get(i)
+                    && !e.is_dir
+                {
+                    bytes += e.size;
+                }
+            }
+            let n = p.sel.len();
+            if bytes > 0 {
+                format!(
+                    "{n} {} · {}",
+                    obj_word(n),
+                    rat_session::files::human_size(bytes)
+                )
+            } else {
+                format!("{n} {}", obj_word(n))
+            }
         }
 
         fn tick(&mut self, ctx: &egui::Context) {
@@ -1672,6 +1760,30 @@ mod ui {
                         }
                         break;
                     }
+                }
+            }
+            // Горячие клавиши (когда нет модальных окон).
+            if self.prompt.is_none() && self.confirm.is_none() && self.conflict.is_none() {
+                let (ctrl_a, esc, del) = ctx.input(|i| {
+                    (
+                        i.modifiers.command && i.key_pressed(egui::Key::A),
+                        i.key_pressed(egui::Key::Escape),
+                        i.key_pressed(egui::Key::Delete),
+                    )
+                });
+                if ctrl_a {
+                    let p = self.pane(self.side);
+                    p.sel = (0..p.entries.len()).collect();
+                    p.anchor = None;
+                }
+                if esc {
+                    let p = self.pane(self.side);
+                    p.sel.clear();
+                    p.anchor = None;
+                }
+                if del {
+                    let side = self.side;
+                    self.delete_selected(side);
                 }
             }
             // Перетаскивание файлов из Проводника прямо на окно.
@@ -1717,14 +1829,37 @@ mod ui {
                         match result {
                             Ok(e) => {
                                 self.remote.entries = e;
-                                self.remote.selected = None;
+                                self.remote.sel.clear();
+                                self.remote.anchor = None;
+                                self.remote_restore = false;
                             }
-                            Err(e) => self.remote.err = Some(e),
+                            Err(e) => {
+                                // Сохранённый путь не открылся — на первый диск.
+                                if self.remote_restore
+                                    && let Some(d) = self.remote_drives.first().cloned()
+                                {
+                                    self.navigate(Side::Remote, d);
+                                    return;
+                                }
+                                self.remote.err = Some(e);
+                            }
                         }
                     }
                 }
                 FsEvt::Drives { drives } => {
                     self.remote_drives = drives;
+                    // Путь не восстановился сразу — если был отказ, идём на первый диск.
+                    if self.remote_restore
+                        && self.remote.err.is_some()
+                        && let Some(d) = self.remote_drives.first().cloned()
+                    {
+                        self.navigate(Side::Remote, d);
+                    }
+                }
+                FsEvt::FreeSpace { path, free } => {
+                    if path == self.remote.path {
+                        self.remote.free = free;
+                    }
                 }
                 FsEvt::Op {
                     action,
@@ -1840,20 +1975,51 @@ mod ui {
             id
         }
 
+        /// «Скачать» (кнопка на правой панели): выделенное на удалённой
+        /// машине → в текущую папку локальной панели.
         fn act_download_selected(&mut self) {
-            let Some((name, is_dir, size)) = self.selected_entry(Side::Remote) else {
-                self.note("выберите файл или папку в правой панели".to_string());
+            let items = self.sel_items(Side::Remote);
+            if items.is_empty() {
+                self.note("выберите файлы в правой панели".to_string());
                 return;
-            };
-            self.begin_download(name, is_dir, size);
+            }
+            for (name, is_dir, size) in items {
+                self.begin_download(name, is_dir, size);
+            }
         }
 
+        /// «Загрузить» (кнопка на левой панели): выделенное локально →
+        /// в текущую папку удалённой машины.
         fn act_upload_selected(&mut self) {
-            let Some((name, is_dir, size)) = self.selected_entry(Side::Local) else {
-                self.note("выберите файл или папку в левой панели".to_string());
+            let items = self.sel_items(Side::Local);
+            if items.is_empty() {
+                self.note("выберите файлы в левой панели".to_string());
                 return;
+            }
+            for (name, is_dir, size) in items {
+                self.begin_upload(name, is_dir, size);
+            }
+        }
+
+        /// Удаление выделенного (одним подтверждением на всех).
+        fn delete_selected(&mut self, side: Side) {
+            let items = self.sel_items(side);
+            if items.is_empty() {
+                self.note("выберите файлы или папки".to_string());
+                return;
+            }
+            let base = match side {
+                Side::Local => self.local.path.clone(),
+                Side::Remote => self.remote.path.clone(),
             };
-            self.begin_upload(name, is_dir, size);
+            let paths = items
+                .into_iter()
+                .map(|(name, is_dir, _)| {
+                    let full = join_path(&base, &name);
+                    (full, name, is_dir)
+                })
+                .collect();
+            self.confirm = Some(ConfirmState { side, items: paths });
         }
 
         fn begin_download(&mut self, name: String, is_dir: bool, size: u64) {
@@ -1948,63 +2114,26 @@ mod ui {
                     if ui.button("Отключиться").clicked() {
                         self.want_close = true;
                     }
+                    let speed: f32 = self
+                        .jobs
+                        .iter()
+                        .filter(|j| matches!(j.status, JobStatusUi::Active))
+                        .map(|j| j.speed)
+                        .sum();
+                    if speed > 1.0 {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "канал: {}/с",
+                                rat_session::files::human_size(speed as u64)
+                            ))
+                            .color(DIM2)
+                            .size(12.0),
+                        );
+                    }
                     if let Some(st) = &self.status
                         && self.status_t.elapsed().as_secs() < 7
                     {
                         ui.label(egui::RichText::new(st.clone()).color(DIM2).size(12.5));
-                    }
-                });
-            });
-            ui.add_space(3.0);
-            ui.horizontal(|ui| {
-                let active = match self.side {
-                    Side::Local => "активна левая панель",
-                    Side::Remote => "активна правая панель",
-                };
-                if ui.button("Новая папка").clicked() {
-                    self.prompt = Some(PromptState {
-                        kind: PromptKind::NewFolder,
-                        side: self.side,
-                        text: "Новая папка".to_string(),
-                        target: String::new(),
-                    });
-                }
-                if ui.button("Переименовать").clicked() {
-                    if let Some((name, _, _)) = self.selected_entry(self.side) {
-                        self.prompt = Some(PromptState {
-                            kind: PromptKind::Rename,
-                            side: self.side,
-                            text: name.clone(),
-                            target: name,
-                        });
-                    } else {
-                        self.note("выберите файл или папку".to_string());
-                    }
-                }
-                if ui.button("Удалить").clicked() {
-                    if let Some((name, is_dir, _)) = self.selected_entry(self.side) {
-                        let p = match self.side {
-                            Side::Local => self.local.path.clone(),
-                            Side::Remote => self.remote.path.clone(),
-                        };
-                        self.confirm = Some(ConfirmState {
-                            side: self.side,
-                            path: join_path(&p, &name),
-                            name,
-                            is_dir,
-                        });
-                    } else {
-                        self.note("выберите файл или папку".to_string());
-                    }
-                }
-                ui.add_space(8.0);
-                ui.label(egui::RichText::new(active).color(DIM2).size(12.0));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Загрузить →").clicked() {
-                        self.act_upload_selected();
-                    }
-                    if ui.button("← Скачать").clicked() {
-                        self.act_download_selected();
                     }
                 });
             });
@@ -2106,102 +2235,245 @@ mod ui {
                 self.pane_ui(&mut cols[1], Side::Remote);
             });
             if ui.input(|i| i.pointer.any_released()) {
+                // Отпустили не над панелью-приёмником — перенос отменяется.
                 self.drag_src = None;
             }
         }
 
         fn pane_ui(&mut self, ui: &mut egui::Ui, side: Side) {
-            let pane_rect = ui.available_rect_before_wrap();
+            let resp = egui::Frame::NONE
+                .fill(egui::Color32::from_rgb(252, 252, 253))
+                .stroke(egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgb(226, 229, 232),
+                ))
+                .corner_radius(8.0)
+                .inner_margin(egui::Margin::same(10))
+                .show(ui, |ui| {
+                    let full = ui.available_size();
+                    ui.set_min_size(full);
+                    self.pane_body(ui, side);
+                });
+            let pane_rect = resp.response.rect;
+            // Клик по панели делает её активной (Ctrl+A, Delete и т.п.).
+            if ui.rect_contains_pointer(pane_rect) && ui.input(|i| i.pointer.any_click()) {
+                self.side = side;
+            }
+            // Перетаскивание между панелями: подсветка приёмника и приём.
+            if let Some(d) = self.drag_src.clone()
+                && d.side != side
+                && ui.rect_contains_pointer(pane_rect)
+            {
+                ui.painter().rect_filled(
+                    pane_rect,
+                    8.0,
+                    egui::Color32::from_rgba_unmultiplied(75, 141, 240, 18),
+                );
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                if ui.input(|i| i.pointer.any_released()) {
+                    self.drop_drag(side);
+                }
+            }
+        }
+
+        /// Принять перетаскивание в панель `target`.
+        fn drop_drag(&mut self, target: Side) {
+            let Some(d) = self.drag_src.take() else {
+                return;
+            };
+            match (d.side, target) {
+                (Side::Local, Side::Remote) => {
+                    for (name, is_dir, size) in d.items {
+                        self.begin_upload(name, is_dir, size);
+                    }
+                }
+                (Side::Remote, Side::Local) => {
+                    for (name, is_dir, size) in d.items {
+                        self.begin_download(name, is_dir, size);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        fn pane_body(&mut self, ui: &mut egui::Ui, side: Side) {
             let is_active = self.side == side;
-            ui.add_space(4.0);
+            // Заголовок панели: имя + свободное место.
             ui.horizontal(|ui| {
                 let title = match side {
                     Side::Local => "Этот компьютер".to_string(),
                     Side::Remote => self.name.clone(),
                 };
-                let t = egui::RichText::new(title).strong();
+                let t = egui::RichText::new(title).strong().size(14.5);
                 if is_active {
                     ui.label(t.color(egui::Color32::from_rgb(29, 79, 159)));
                 } else {
                     ui.label(t);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("⟳").clicked() {
-                        self.reload(side);
-                    }
-                    if let Some(p) = up_dir(&self.pane(side).path)
-                        && ui.small_button("⬆").clicked()
-                    {
-                        self.navigate(side, p);
+                    let free = match side {
+                        Side::Local => self.local.free,
+                        Side::Remote => self.remote.free,
+                    };
+                    if let Some((free, _total)) = free {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "свободно {}",
+                                rat_session::files::human_size(free)
+                            ))
+                            .color(DIM2)
+                            .size(12.0),
+                        );
                     }
                 });
             });
+            ui.add_space(2.0);
+            // Навигация: свои кнопки в каждой панели + кликабельный путь.
+            ui.horizontal(|ui| {
+                let path = self.pane(side).path.clone();
+                if ui.small_button("⬆ Вверх").clicked()
+                    && let Some(p) = up_dir(&path)
+                {
+                    self.navigate(side, p);
+                }
+                if ui.small_button("⟳ Обновить").clicked() {
+                    self.reload(side);
+                }
+                ui.separator();
+                let crumbs = crumbs(&path);
+                let mut jump: Option<String> = None;
+                let n = crumbs.len();
+                for (k, (label, full)) in crumbs.into_iter().enumerate() {
+                    if k > 0 {
+                        ui.label(egui::RichText::new("›").color(DIM2).size(11.0));
+                    }
+                    let cur = k + 1 == n;
+                    let text = if cur {
+                        egui::RichText::new(&label)
+                            .strong()
+                            .color(egui::Color32::from_rgb(35, 38, 42))
+                    } else {
+                        egui::RichText::new(&label).color(egui::Color32::from_rgb(52, 83, 126))
+                    };
+                    let r = ui.add(egui::Button::new(text).frame(false));
+                    if !cur && r.clicked() {
+                        jump = Some(full.clone());
+                    }
+                }
+                if let Some(p) = jump {
+                    self.navigate(side, p);
+                }
+            });
+            ui.add_space(2.0);
+            // Диски — горизонтальный ряд кнопок.
             ui.horizontal(|ui| {
                 let drives = match side {
                     Side::Local => rat_session::files::local_drives(),
                     Side::Remote => self.remote_drives.clone(),
                 };
-                ui.menu_button("Диски ▾", |ui| {
-                    if drives.is_empty() {
-                        ui.label("нет данных");
+                ui.label(egui::RichText::new("Диски:").color(DIM2).size(12.0));
+                let cur = self.pane(side).path.clone();
+                let mut jump: Option<String> = None;
+                for d in &drives {
+                    let on = cur.starts_with(d.as_str());
+                    let label = d.trim_end_matches('\\');
+                    if ui
+                        .selectable_label(on, egui::RichText::new(label).size(12.5))
+                        .clicked()
+                    {
+                        jump = Some(d.clone());
                     }
-                    for d in &drives {
-                        if ui.button(d).clicked() {
-                            self.navigate(side, d.clone());
-                            ui.close();
-                        }
-                    }
-                });
-                let path = self.pane(side).path.clone();
-                ui.label(
-                    egui::RichText::new(path)
-                        .monospace()
-                        .size(12.0)
-                        .color(egui::Color32::from_rgb(58, 63, 70)),
-                );
+                }
+                if drives.is_empty() {
+                    ui.label(egui::RichText::new("нет данных").color(DIM2).size(12.0));
+                }
+                if let Some(p) = jump {
+                    self.navigate(side, p);
+                }
             });
             ui.add_space(2.0);
+            // Список файлов: прокрутка независима, колесо — над своей панелью.
+            let scroll_h = (ui.available_height() - 34.0).max(90.0);
             let mut dbl: Option<(bool, String, u64, String)> = None;
-            let mut drag_new: Option<(Side, String, bool, u64)> = None;
+            let mut drag_new: Option<DragPayload> = None;
             let mut clicked = false;
             {
                 let pane = self.pane(side);
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    if pane.loading {
-                        ui.label(egui::RichText::new("загрузка…").color(DIM2).size(12.0));
-                    }
-                    if let Some(e) = &pane.err {
-                        ui.label(
-                            egui::RichText::new(format!("ошибка: {e}"))
-                                .color(egui::Color32::from_rgb(203, 60, 60))
-                                .size(12.0),
-                        );
-                    }
-                    if pane.entries.is_empty() && !pane.loading {
-                        ui.label(egui::RichText::new("пусто").color(DIM2).size(12.0));
-                    }
-                    for (i, e) in pane.entries.iter().enumerate() {
-                        let selected = pane.selected == Some(i);
-                        let resp = files_row(ui, e, selected);
-                        if resp.clicked() {
-                            pane.selected = Some(i);
-                            clicked = true;
+                let pane_len = pane.entries.len();
+                egui::ScrollArea::vertical()
+                    .id_salt(("files_pane", side == Side::Local))
+                    .auto_shrink([false, false])
+                    .max_height(scroll_h)
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        if pane.loading {
+                            ui.label(egui::RichText::new("загрузка…").color(DIM2).size(12.0));
                         }
-                        if resp.double_clicked() {
-                            pane.selected = Some(i);
-                            clicked = true;
-                            dbl = Some((
-                                e.is_dir,
-                                e.name.clone(),
-                                e.size,
-                                join_path(&pane.path, &e.name),
-                            ));
+                        if let Some(e) = &pane.err {
+                            ui.label(
+                                egui::RichText::new(format!("ошибка: {e}"))
+                                    .color(egui::Color32::from_rgb(203, 60, 60))
+                                    .size(12.0),
+                            );
                         }
-                        if resp.drag_started() {
-                            drag_new = Some((side, e.name.clone(), e.is_dir, e.size));
+                        if pane.entries.is_empty() && !pane.loading {
+                            ui.label(egui::RichText::new("пусто").color(DIM2).size(12.0));
                         }
-                    }
-                });
+                        for (i, e) in pane.entries.iter().enumerate() {
+                            let selected = pane.sel.contains(&i);
+                            let resp = files_row(ui, e, selected);
+                            if resp.clicked() {
+                                let (ctrl, shift) =
+                                    ui.input(|i2| (i2.modifiers.command, i2.modifiers.shift));
+                                sel_click(
+                                    &mut pane.sel,
+                                    &mut pane.anchor,
+                                    i,
+                                    pane_len,
+                                    ctrl,
+                                    shift,
+                                );
+                                clicked = true;
+                            }
+                            if resp.double_clicked() {
+                                pane.sel.clear();
+                                pane.sel.insert(i);
+                                pane.anchor = Some(i);
+                                clicked = true;
+                                dbl = Some((
+                                    e.is_dir,
+                                    e.name.clone(),
+                                    e.size,
+                                    join_path(&pane.path, &e.name),
+                                ));
+                            }
+                            if resp.drag_started() {
+                                let items: Vec<(String, bool, u64)> = if pane.sel.contains(&i) {
+                                    pane.sel
+                                        .iter()
+                                        .filter_map(|&k| pane.entries.get(k))
+                                        .map(|e2| (e2.name.clone(), e2.is_dir, e2.size))
+                                        .collect()
+                                } else {
+                                    pane.sel.clear();
+                                    pane.sel.insert(i);
+                                    pane.anchor = Some(i);
+                                    vec![(e.name.clone(), e.is_dir, e.size)]
+                                };
+                                drag_new = Some(DragPayload { side, items });
+                            }
+                        }
+                        // Клик по пустому месту — снять выделение.
+                        let gap = ui.available_size();
+                        if gap.y > 8.0 {
+                            let resp = ui.allocate_response(gap, egui::Sense::click());
+                            if resp.clicked() && !ui.input(|i2| i2.modifiers.command) {
+                                pane.sel.clear();
+                                pane.anchor = None;
+                                clicked = true;
+                            }
+                        }
+                    });
             }
             if clicked {
                 self.side = side;
@@ -2218,26 +2490,61 @@ mod ui {
                     self.begin_upload(name, false, size);
                 }
             }
-            // Перетаскивание между панелями: подсветка приёмника и сброс.
-            if let Some((src, name, is_dir, size)) = self.drag_src.clone()
-                && src != side
-                && ui.rect_contains_pointer(pane_rect)
-            {
-                ui.painter().rect_filled(
-                    pane_rect,
-                    6.0,
-                    egui::Color32::from_rgba_unmultiplied(75, 141, 240, 20),
-                );
-                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-                if ui.input(|i| i.pointer.any_released()) {
-                    match (src, side) {
-                        (Side::Remote, Side::Local) => self.begin_download(name, is_dir, size),
-                        (Side::Local, Side::Remote) => self.begin_upload(name, is_dir, size),
-                        _ => {}
+            // Нижняя строка панели: свои кнопки действий.
+            ui.horizontal(|ui| {
+                match side {
+                    Side::Local => {
+                        let b = egui::Button::new(
+                            egui::RichText::new("⬆ Загрузить").color(egui::Color32::WHITE),
+                        )
+                        .fill(egui::Color32::from_rgb(46, 111, 208));
+                        if ui.add(b).clicked() {
+                            self.act_upload_selected();
+                        }
                     }
-                    self.drag_src = None;
+                    Side::Remote => {
+                        let b = egui::Button::new(
+                            egui::RichText::new("⬇ Скачать").color(egui::Color32::WHITE),
+                        )
+                        .fill(egui::Color32::from_rgb(46, 111, 208));
+                        if ui.add(b).clicked() {
+                            self.act_download_selected();
+                        }
+                    }
                 }
-            }
+                if ui.button("Удалить").clicked() {
+                    self.delete_selected(side);
+                }
+                let sel_n = self.pane(side).sel.len();
+                let rename = ui.add_enabled(sel_n == 1, egui::Button::new("Переименовать"));
+                if rename.clicked()
+                    && let Some((name, _, _)) = self.first_selected(side)
+                {
+                    self.prompt = Some(PromptState {
+                        kind: PromptKind::Rename,
+                        side,
+                        text: name.clone(),
+                        target: name,
+                    });
+                }
+                if ui.button("Новая папка").clicked() {
+                    self.prompt = Some(PromptState {
+                        kind: PromptKind::NewFolder,
+                        side,
+                        text: "Новая папка".to_string(),
+                        target: String::new(),
+                    });
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let info = match side {
+                        Side::Local => Self::sel_info(&self.local),
+                        Side::Remote => Self::sel_info(&self.remote),
+                    };
+                    if !info.is_empty() {
+                        ui.label(egui::RichText::new(info).color(DIM2).size(11.5));
+                    }
+                });
+            });
         }
 
         fn dialogs(&mut self, ctx: &egui::Context) {
@@ -2341,7 +2648,7 @@ mod ui {
                     }
                 }
             }
-            // Подтверждение удаления.
+            // Подтверждение удаления (может быть сразу несколько объектов).
             if self.confirm.is_some() {
                 let mut ok = false;
                 let mut cancel = false;
@@ -2352,10 +2659,23 @@ mod ui {
                         .resizable(false)
                         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                         .show(ctx, |ui| {
-                            if c.is_dir {
-                                ui.label(format!("Удалить папку «{}» со всем содержимым?", c.name));
+                            let n = c.items.len();
+                            if n == 1 {
+                                let (_, name, is_dir) = &c.items[0];
+                                if *is_dir {
+                                    ui.label(format!("Удалить папку «{name}» со всем содержимым?"));
+                                } else {
+                                    ui.label(format!("Удалить файл «{name}»? (без корзины)"));
+                                }
                             } else {
-                                ui.label(format!("Удалить файл «{}»? (без корзины)", c.name));
+                                ui.label(format!("Удалить {} {} (без корзины)?", n, obj_word(n)));
+                                let names: Vec<&str> =
+                                    c.items.iter().take(5).map(|(_, n, _)| n.as_str()).collect();
+                                let mut line = names.join(", ");
+                                if n > 5 {
+                                    line.push_str(", …");
+                                }
+                                ui.label(egui::RichText::new(line).color(DIM2).size(12.0));
                             }
                             ui.add_space(4.0);
                             ui.horizontal(|ui| {
@@ -2373,22 +2693,29 @@ mod ui {
                     if ok {
                         match c.side {
                             Side::Local => {
-                                let path = c.path.clone();
-                                let is_dir = c.is_dir;
-                                self.local_op(
-                                    "удалено",
-                                    move || {
-                                        if is_dir {
-                                            std::fs::remove_dir_all(&path)
-                                        } else {
-                                            std::fs::remove_file(&path)
-                                        }
-                                    },
-                                    &c.path,
-                                );
+                                let mut failed: Vec<String> = Vec::new();
+                                for (path, _, is_dir) in &c.items {
+                                    let r = if *is_dir {
+                                        std::fs::remove_dir_all(path)
+                                    } else {
+                                        std::fs::remove_file(path)
+                                    };
+                                    if let Err(e) = r {
+                                        failed.push(format!("{path}: {e}"));
+                                    }
+                                }
+                                let n = c.items.len();
+                                if failed.is_empty() {
+                                    self.note(format!("удалено: {n} {}", obj_word(n)));
+                                } else {
+                                    self.note(format!("удаление: {}", failed.join("; ")));
+                                }
+                                self.reload(Side::Local);
                             }
                             Side::Remote => {
-                                let _ = self.tx.send(FsCmd::Delete { path: c.path });
+                                for (path, _, _) in &c.items {
+                                    let _ = self.tx.send(FsCmd::Delete { path: path.clone() });
+                                }
                             }
                         }
                     }
@@ -2485,39 +2812,38 @@ mod ui {
     }
 
     fn files_row(ui: &mut egui::Ui, e: &FsDirEntry, selected: bool) -> egui::Response {
-        let (rect, resp) =
-            ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::click());
+        let (rect, resp) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), 26.0),
+            egui::Sense::click_and_drag(),
+        );
         if selected {
             ui.painter()
-                .rect_filled(rect, 3.0, egui::Color32::from_rgb(227, 237, 253));
+                .rect_filled(rect, 6.0, egui::Color32::from_rgb(207, 228, 250));
         } else if resp.hovered() {
             ui.painter()
-                .rect_filled(rect, 3.0, egui::Color32::from_rgb(244, 246, 249));
+                .rect_filled(rect, 6.0, egui::Color32::from_rgb(240, 244, 248));
         }
         let ic = egui::Rect::from_min_size(
-            egui::pos2(rect.left() + 6.0, rect.center().y - 7.0),
-            egui::vec2(14.0, 14.0),
+            egui::pos2(rect.left() + 8.0, rect.center().y - 7.5),
+            egui::vec2(15.0, 15.0),
         );
         if e.is_dir {
             ui.painter()
-                .rect_filled(ic, 2.0, egui::Color32::from_rgb(244, 185, 65));
+                .rect_filled(ic, 3.0, egui::Color32::from_rgb(243, 178, 76));
             ui.painter().rect_filled(
                 egui::Rect::from_min_size(
-                    egui::pos2(ic.left(), ic.top() - 2.5),
-                    egui::vec2(6.0, 4.0),
+                    egui::pos2(ic.left(), ic.top() - 3.0),
+                    egui::vec2(7.0, 4.5),
                 ),
                 1.5,
-                egui::Color32::from_rgb(244, 185, 65),
+                egui::Color32::from_rgb(243, 178, 76),
             );
         } else {
-            ui.painter()
-                .rect_filled(ic, 2.0, egui::Color32::from_rgb(185, 193, 204));
-            ui.painter()
-                .rect_filled(ic.shrink(1.0), 1.5, egui::Color32::WHITE);
+            ui.painter().rect_filled(ic, 3.5, icon_color(&e.name));
         }
         let clip = ui.painter().with_clip_rect(rect);
         clip.text(
-            egui::pos2(rect.left() + 28.0, rect.center().y),
+            egui::pos2(rect.left() + 30.0, rect.center().y),
             egui::Align2::LEFT_CENTER,
             &e.name,
             egui::FontId::proportional(13.0),
@@ -2536,6 +2862,159 @@ mod ui {
             DIM2,
         );
         resp
+    }
+
+    /// Цвет иконки файла по типу (как на согласованном макете).
+    fn icon_color(name: &str) -> egui::Color32 {
+        let ext = name
+            .rsplit_once('.')
+            .map(|(_, e)| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        let (r, g, b) = match ext.as_str() {
+            "xlsx" | "xls" | "xlsm" | "ods" | "csv" => (86, 166, 100),
+            "doc" | "docx" | "odt" | "rtf" => (77, 137, 200),
+            "ppt" | "pptx" | "odp" => (219, 100, 86),
+            "pdf" => (216, 85, 85),
+            "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "ico" | "svg" | "heic" => {
+                (90, 150, 220)
+            }
+            "zip" | "7z" | "rar" | "tar" | "gz" | "xz" => (155, 122, 210),
+            "exe" | "msi" | "dll" | "sys" | "bat" | "cmd" | "ps1" => (238, 158, 68),
+            _ => (155, 164, 175),
+        };
+        egui::Color32::from_rgb(r, g, b)
+    }
+
+    /// «1 объект / 2 объекта / 5 объектов».
+    fn obj_word(n: usize) -> &'static str {
+        let d100 = n % 100;
+        let d10 = n % 10;
+        if (11..=14).contains(&d100) {
+            "объектов"
+        } else {
+            match d10 {
+                1 => "объект",
+                2..=4 => "объекта",
+                _ => "объектов",
+            }
+        }
+    }
+
+    /// Клик по строке: обычный — один объект; Ctrl — добавить/убрать;
+    /// Shift — диапазон от «якоря»; Shift+Ctrl — добавить диапазон.
+    fn sel_click(
+        sel: &mut BTreeSet<usize>,
+        anchor: &mut Option<usize>,
+        idx: usize,
+        count: usize,
+        ctrl: bool,
+        shift: bool,
+    ) {
+        if shift
+            && let Some(a) = *anchor
+            && a < count
+            && idx < count
+        {
+            let (lo, hi) = if a <= idx { (a, idx) } else { (idx, a) };
+            if !ctrl {
+                sel.clear();
+            }
+            for k in lo..=hi {
+                sel.insert(k);
+            }
+            return;
+        }
+        if ctrl {
+            if !sel.remove(&idx) {
+                sel.insert(idx);
+            }
+            *anchor = Some(idx);
+            return;
+        }
+        sel.clear();
+        sel.insert(idx);
+        *anchor = Some(idx);
+    }
+
+    /// Путь → «хлебные крошки»: (подпись, полный путь до этого уровня).
+    fn crumbs(path: &str) -> Vec<(String, String)> {
+        let norm = path.replace('/', "\\");
+        let mut out: Vec<(String, String)> = Vec::new();
+        if norm.is_empty() {
+            return out;
+        }
+        if let Some(rest) = norm.strip_prefix("\\\\") {
+            let mut it = rest.splitn(3, '\\');
+            let srv = it.next().unwrap_or("").to_string();
+            let share = it.next().unwrap_or("").to_string();
+            if !srv.is_empty() {
+                out.push((srv.clone(), format!("\\\\{srv}\\")));
+            }
+            if !share.is_empty() {
+                let mut acc = format!("\\\\{srv}\\{share}");
+                out.push((share, acc.clone()));
+                for comp in it
+                    .next()
+                    .unwrap_or("")
+                    .split('\\')
+                    .filter(|s| !s.is_empty())
+                {
+                    acc = format!("{acc}\\{comp}");
+                    out.push((comp.to_string(), acc.clone()));
+                }
+            }
+            return out;
+        }
+        let mut acc = String::new();
+        let mut comps = norm.split('\\').filter(|s| !s.is_empty()).peekable();
+        if let Some(first) = comps.peek()
+            && first.ends_with(':')
+        {
+            let d = first.to_string();
+            comps.next();
+            acc = format!("{d}\\");
+            out.push((d, acc.clone()));
+        }
+        for comp in comps {
+            if acc.is_empty() {
+                acc = comp.to_string();
+            } else if acc.ends_with('\\') {
+                acc = format!("{acc}{comp}");
+            } else {
+                acc = format!("{acc}\\{comp}");
+            }
+            out.push((comp.to_string(), acc.clone()));
+        }
+        out
+    }
+
+    /// Запомненные пути панелей (ui.json рядом с exe).
+    #[derive(Default, Serialize, Deserialize)]
+    struct UiPrefs {
+        #[serde(default)]
+        files_local: String,
+        #[serde(default)]
+        files_remote: BTreeMap<String, String>,
+    }
+
+    fn ui_prefs_path() -> std::path::PathBuf {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("ui.json")))
+            .unwrap_or_else(|| std::path::PathBuf::from("ui.json"))
+    }
+
+    fn load_ui_prefs() -> UiPrefs {
+        std::fs::read_to_string(ui_prefs_path())
+            .ok()
+            .and_then(|s| serde_json::from_str::<UiPrefs>(&s).ok())
+            .unwrap_or_default()
+    }
+
+    fn save_ui_prefs(p: &UiPrefs) {
+        if let Ok(s) = serde_json::to_string_pretty(p) {
+            let _ = std::fs::write(ui_prefs_path(), s);
+        }
     }
 
     enum Screen {
@@ -3870,6 +4349,7 @@ mod ui {
 
         fn close_files(&mut self) {
             if let Some(mut f) = self.files.take() {
+                f.save_prefs();
                 f.shutdown();
             }
             self.screen = Screen::Home;
@@ -4841,6 +5321,69 @@ mod ui {
             } else {
                 ctx.request_repaint_after(Duration::from_millis(10));
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod files_util_tests {
+        use super::*;
+
+        #[test]
+        fn sel_click_behaviour() {
+            let mut sel = BTreeSet::new();
+            let mut anchor = None;
+            sel_click(&mut sel, &mut anchor, 3, 10, false, false);
+            assert_eq!(sel.iter().copied().collect::<Vec<_>>(), vec![3]);
+            sel_click(&mut sel, &mut anchor, 5, 10, true, false);
+            assert_eq!(sel.iter().copied().collect::<Vec<_>>(), vec![3, 5]);
+            sel_click(&mut sel, &mut anchor, 3, 10, true, false);
+            assert_eq!(sel.iter().copied().collect::<Vec<_>>(), vec![5]);
+            sel_click(&mut sel, &mut anchor, 2, 10, false, false);
+            sel_click(&mut sel, &mut anchor, 7, 10, false, true);
+            assert_eq!(
+                sel.iter().copied().collect::<Vec<_>>(),
+                (2..=7).collect::<Vec<_>>()
+            );
+            sel_click(&mut sel, &mut anchor, 0, 10, false, false);
+            assert_eq!(sel.iter().copied().collect::<Vec<_>>(), vec![0]);
+        }
+
+        #[test]
+        fn crumbs_split_paths() {
+            let c = crumbs("C:\\Users\\ad\\Documents");
+            let labels: Vec<&str> = c.iter().map(|(l, _)| l.as_str()).collect();
+            assert_eq!(labels, vec!["C:", "Users", "ad", "Documents"]);
+            assert_eq!(c[0].1, "C:\\");
+            assert_eq!(c[3].1, "C:\\Users\\ad\\Documents");
+            let r = crumbs("D:\\1c_base");
+            assert_eq!(r.len(), 2);
+            assert_eq!(r[1].1, "D:\\1c_base");
+            assert_eq!(crumbs("C:\\").len(), 1);
+        }
+
+        #[test]
+        fn plural_objects() {
+            assert_eq!(obj_word(1), "объект");
+            assert_eq!(obj_word(3), "объекта");
+            assert_eq!(obj_word(7), "объектов");
+            assert_eq!(obj_word(11), "объектов");
+            assert_eq!(obj_word(21), "объект");
+        }
+
+        #[test]
+        fn icon_colors_by_type() {
+            assert_eq!(icon_color("a.XLSX"), egui::Color32::from_rgb(86, 166, 100));
+            assert_eq!(icon_color("b.zip"), egui::Color32::from_rgb(155, 122, 210));
+            assert_eq!(
+                icon_color("без_точки"),
+                egui::Color32::from_rgb(155, 164, 175)
+            );
+        }
+
+        #[test]
+        fn human_size_comma() {
+            assert_eq!(rat_session::files::human_size(1536), "1,5 КБ");
+            assert_eq!(rat_session::files::human_size(500), "500 Б");
         }
     }
 }

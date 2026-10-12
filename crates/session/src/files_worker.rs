@@ -11,8 +11,8 @@
 use crate::files::{
     self, CHUNK, DirEntry, WINDOW, human_size, pack_credit, pack_data, pack_id_path,
     pack_read_open, pack_tid, pack_write_close, pack_write_open, parse_credit, parse_data,
-    parse_drives_resp, parse_list_resp, parse_ok_resp, parse_read_open_resp, parse_serv_error,
-    parse_write_close_resp, parse_write_open_resp, st,
+    parse_drives_resp, parse_fsinfo_resp, parse_list_resp, parse_ok_resp, parse_read_open_resp,
+    parse_serv_error, parse_write_close_resp, parse_write_open_resp, st,
 };
 use crate::input;
 use crate::link;
@@ -41,6 +41,10 @@ pub enum WCmd {
         path: String,
     },
     Drives,
+    /// Свободное место на томе, содержащем путь.
+    FreeSpace {
+        path: String,
+    },
     Mkdir {
         path: String,
     },
@@ -93,6 +97,11 @@ pub enum WEvt {
     },
     Drives {
         drives: Vec<String>,
+    },
+    /// Свободное место на томе (ответ на WCmd::FreeSpace).
+    FreeSpace {
+        path: String,
+        free: Option<(u64, u64)>,
     },
     Op {
         action: &'static str,
@@ -414,6 +423,17 @@ fn start_next(st: &mut State, ctx: &mut Ctx) {
                 st.cur = Some(CurOp {
                     action: "диски",
                     path: String::new(),
+                    deadline: Instant::now() + Duration::from_secs(10),
+                    scan: false,
+                    silent: false,
+                });
+            }
+        }
+        WCmd::FreeSpace { path } => {
+            if ctx.send(&pack_id_path(files::kind::FSINFO_REQ, REQ, &path)) {
+                st.cur = Some(CurOp {
+                    action: "место",
+                    path,
                     deadline: Instant::now() + Duration::from_secs(10),
                     scan: false,
                     silent: false,
@@ -783,6 +803,7 @@ fn handle_cmd(st: &mut State, c: WCmd, ctx: &mut Ctx) {
     match c {
         WCmd::List { .. }
         | WCmd::Drives
+        | WCmd::FreeSpace { .. }
         | WCmd::Mkdir { .. }
         | WCmd::Rename { .. }
         | WCmd::Delete { .. }
@@ -1063,6 +1084,17 @@ fn handle_frame(st: &mut State, payload: &[u8], ctx: &mut Ctx) {
             if let Some((_id, drives)) = parse_drives_resp(payload) {
                 st.cur = None;
                 ctx.ev(WEvt::Drives { drives });
+            }
+        }
+        files::kind::FSINFO_RESP => {
+            if let Some((_id, status, free, total)) = parse_fsinfo_resp(payload) {
+                let path = st.cur.take().map(|o| o.path).unwrap_or_default();
+                let free = if status == st::OK {
+                    Some((free, total))
+                } else {
+                    None
+                };
+                ctx.ev(WEvt::FreeSpace { path, free });
             }
         }
         files::kind::OK_RESP => {
