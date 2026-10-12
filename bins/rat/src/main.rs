@@ -1408,6 +1408,21 @@ mod ui {
         }
     }
 
+    /// Вернуть системе холодные страницы: в простое «горячими» остаются
+    /// единицы МБ (окно/графика загружены, но не используются), остальное
+    /// можно выгрузить — при возобновлении работы страницы вернутся сами.
+    fn mem_trim(tag: &str) {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn SetProcessWorkingSetSize(h: *mut core::ffi::c_void, min: usize, max: usize) -> i32;
+            fn GetCurrentProcess() -> *mut core::ffi::c_void;
+        }
+        let ok = unsafe { SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX) };
+        if ok != 0 {
+            mem_report(tag);
+        }
+    }
+
     /// Подключает системный жирный шрифт для номера ID (`strong()` в egui
     /// меняет только цвет — реальной жирности в комплекте нет).
     fn install_ui_fonts(ctx: &egui::Context) {
@@ -3147,6 +3162,10 @@ mod ui {
         server: ServerHandle,
         internet: InternetHandle,
         device: Device,
+        /// Экономия памяти: время последней активности и признак «после простоя
+        /// уже вернули холодные страницы системе».
+        last_activity: Instant,
+        idle_trimmed: bool,
         settings_open: bool,
         settings_mode: ConnectionMode,
         settings_relay_edit: String,
@@ -3377,6 +3396,8 @@ mod ui {
                 server,
                 internet,
                 device,
+                last_activity: Instant::now(),
+                idle_trimmed: false,
                 settings_open: false,
                 settings_mode,
                 settings_relay_edit,
@@ -3898,6 +3919,7 @@ mod ui {
                 self.shown_for_dialog = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                 self.hidden = true;
+                mem_trim("трей");
             }
 
             if self.settings_open {
@@ -4419,7 +4441,7 @@ mod ui {
                 f.save_prefs();
                 f.shutdown();
             }
-            mem_report("после файлового окна");
+            mem_trim("после файлового окна");
             self.screen = Screen::Home;
         }
 
@@ -5202,7 +5224,7 @@ mod ui {
             if let Some(mut s) = self.viewer.take() {
                 s.shutdown();
             }
-            mem_report("после сеанса");
+            mem_trim("после сеанса");
             self.screen = Screen::Home;
         }
 
@@ -5238,6 +5260,7 @@ mod ui {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                 self.hidden = true;
+                mem_trim("трей");
             }
         }
 
@@ -5337,6 +5360,11 @@ mod ui {
     impl eframe::App for RatApp {
         fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
             let ctx = ui.ctx().clone();
+            // Экономный простой: любое событие ввода — активность.
+            if ui.ctx().input(|i| !i.events.is_empty()) {
+                self.last_activity = Instant::now();
+                self.idle_trimmed = false;
+            }
             // Первый кадр: запомнить контекст egui — поток слушателя
             // повторного запуска будит им перерисовку.
             if let Ok(mut slot) = self.repaint_slot.lock()
@@ -5377,6 +5405,7 @@ mod ui {
                 if self.args.tray {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                     self.hidden = true;
+                    mem_trim("трей");
                 }
             }
             if !self.autoconnect_done {
@@ -5422,6 +5451,18 @@ mod ui {
             if self.finished {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             } else {
+                // Простой без сеансов и файлов: через 90 с тишины возвращаем
+                // холодные страницы системе (в диспетчере — единицы МБ; при
+                // возобновлении работы страницы подгружаются обратно).
+                if self.viewer.is_none()
+                    && self.files.is_none()
+                    && self.connect_rx.is_none()
+                    && !self.idle_trimmed
+                    && self.last_activity.elapsed() > Duration::from_secs(90)
+                {
+                    self.idle_trimmed = true;
+                    mem_trim("простой");
+                }
                 // Перерисовка — по событиям (egui сам просыпается на ввод и
                 // сетевые команды); этот таймер — только страховочный, чтобы
                 // фоновые изменения (статусы, кадры сеанса, очередь файлов)
