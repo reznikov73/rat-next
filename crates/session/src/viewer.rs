@@ -98,10 +98,11 @@ pub fn spawn_viewer(
         let mut fps_t = Instant::now();
         let mut fps_count: u32 = 0;
         // Диагностика «залипаний» курсора (Шаг 0): время последнего принятого
-        // пакета курсора и время последней отправки ввода от нас.
+        // пакета курсора; «пауза доставки» считается только если пользователь
+        // в это время действительно двигал мышь (по счётчику движений).
         let mut last_cursor_rx: Option<Instant> = None;
         let mut first_cursor_rx: Option<Instant> = None;
-        let mut last_input_at: Option<Instant> = None;
+        let mut moves_since_pkt: u64 = 0;
 
         while !stop.load(Ordering::Relaxed) {
             match link.rx.recv_timeout(Duration::from_millis(5)) {
@@ -275,15 +276,17 @@ pub fn spawn_viewer(
                                     now.duration_since(t) >= Duration::from_secs(2)
                                 });
                                 first_cursor_rx.get_or_insert(now);
+                                let moves = moves_since_pkt;
+                                moves_since_pkt = 0;
                                 if let Some(gap_ms) = note_cursor_gap(
                                     last_cursor_rx,
                                     now,
-                                    last_input_at,
+                                    moves,
                                     warm,
                                     &mut stats.lock().unwrap(),
                                 ) {
                                     crate::log::log_line(&format!(
-                                        "[net] курсор: пауза доставки {gap_ms:.0} мс (при активном вводе)"
+                                        "[net] курсор: пауза доставки {gap_ms:.0} мс (движений за паузу: {moves})"
                                     ));
                                 }
                                 last_cursor_rx = Some(now);
@@ -332,7 +335,7 @@ pub fn spawn_viewer(
                 input::pack_batch(&mut buf, &coalesced);
                 out.push(Channel::Input, 0, &buf);
                 stats.lock().unwrap().input_sent += coalesced.len() as u64;
-                last_input_at = Some(Instant::now());
+                moves_since_pkt += coalesced.len() as u64;
             }
             if !out.is_empty() && link.tx.send(out.take_bytes()).is_err() {
                 break;
@@ -354,7 +357,7 @@ pub fn spawn_viewer(
 fn note_cursor_gap(
     prev: Option<Instant>,
     now: Instant,
-    last_input_at: Option<Instant>,
+    moves_during: u64,
     warm: bool,
     st: &mut SessionStats,
 ) -> Option<f32> {
@@ -362,12 +365,14 @@ fn note_cursor_gap(
     if !warm {
         return None;
     }
-    let active = last_input_at.is_some_and(|t| now.duration_since(t) < Duration::from_millis(1500));
-    if !active {
-        return None;
-    }
     let gap_ms = now.duration_since(prev).as_secs_f32() * 1000.0;
     if gap_ms <= 250.0 {
+        return None;
+    }
+    // Считаем паузой доставки только если движения шли всё это время:
+    // порог растёт с длиной паузы, обычные «помолчал и сдвинул мышь»
+    // (мало движений за паузу) отсекаются.
+    if (moves_during as f32) < 8.0 + gap_ms / 20.0 {
         return None;
     }
     st.cursor_gaps += 1;
@@ -385,48 +390,38 @@ mod tests {
     fn cursor_gap_counting() {
         let mut st = SessionStats::default();
         let t0 = Instant::now();
-        let active = Some(t0);
         // обычная частота — не пауза
+        assert!(
+            note_cursor_gap(Some(t0), t0 + Duration::from_millis(40), 20, true, &mut st).is_none()
+        );
+        // редкие движения (человек помолчал и сдвинул мышь) — не пауза
         assert!(
             note_cursor_gap(
                 Some(t0),
-                t0 + Duration::from_millis(40),
-                active,
+                t0 + Duration::from_millis(1200),
+                20,
                 true,
                 &mut st
             )
             .is_none()
         );
-        // пауза при активном вводе — засчитывается
+        // непрерывное движение сквозь паузу — засчитывается
         let g = note_cursor_gap(
             Some(t0),
-            t0 + Duration::from_millis(420),
-            active,
+            t0 + Duration::from_millis(1000),
+            80,
             true,
             &mut st,
         );
         assert!(g.is_some());
         assert_eq!(st.cursor_gaps, 1);
-        assert!(st.cursor_gap_max_ms >= 400.0);
-        // без активного ввода — не считаем
-        let idle = t0.checked_sub(Duration::from_secs(10));
-        assert!(
-            note_cursor_gap(
-                Some(t0),
-                t0 + Duration::from_millis(500),
-                idle,
-                true,
-                &mut st
-            )
-            .is_none()
-        );
-        assert_eq!(st.cursor_gaps, 1);
+        assert!(st.cursor_gap_max_ms >= 900.0);
         // прогрев — не считаем
         assert!(
             note_cursor_gap(
                 Some(t0),
-                t0 + Duration::from_millis(600),
-                active,
+                t0 + Duration::from_millis(900),
+                90,
                 false,
                 &mut st
             )
@@ -434,7 +429,7 @@ mod tests {
         );
         assert_eq!(st.cursor_gaps, 1);
         // первый пакет — без паузы
-        assert!(note_cursor_gap(None, t0, active, true, &mut st).is_none());
+        assert!(note_cursor_gap(None, t0, 50, true, &mut st).is_none());
     }
 }
 
