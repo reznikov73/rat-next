@@ -388,6 +388,8 @@ pub fn spawn_agent(
         // Первый тик не считаем «паузой»: last_cursor_t намеренно в прошлом,
         // чтобы курсор ушёл сразу.
         let mut cursor_tick_seen = false;
+        // Первые секунды сессии не считаем (идёт стартовая раскрутка).
+        let cursor_t0 = Instant::now();
         let mut last_cursor: Option<(u16, u16, bool, u8)> = None;
         let mut last_cursor_img_key: (usize, u8) = (0, 0);
 
@@ -601,7 +603,10 @@ pub fn spawn_agent(
             let cur_wait = last_cursor_t.elapsed();
             if cur_wait >= Duration::from_millis(33) {
                 last_cursor_t = Instant::now();
-                if cursor_tick_seen && cur_wait >= Duration::from_millis(250) {
+                if cursor_tick_seen
+                    && cursor_t0.elapsed() > Duration::from_secs(3)
+                    && cur_wait >= Duration::from_millis(250)
+                {
                     // Поток B был заблокирован (например, буфер обмена или
                     // переключение стола) — маркер для разбора «залипаний».
                     crate::log::log_line(&format!(

@@ -1370,6 +1370,44 @@ mod ui {
     /// Имя семейства с настоящим жирным шрифтом для номера ID.
     const ID_BOLD: &str = "id-bold";
 
+    /// Диагностика памяти: пишем в журнал размер процесса (для разбора жалоб
+    /// «ест память» — видно базовый уровень и рост после сеансов).
+    fn mem_report(tag: &str) {
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct Pmc {
+            cb: u32,
+            PageFaultCount: u32,
+            PeakWorkingSetSize: usize,
+            WorkingSetSize: usize,
+            QuotaPeakPagedPoolUsage: usize,
+            QuotaPagedPoolUsage: usize,
+            QuotaPeakNonPagedPoolUsage: usize,
+            QuotaNonPagedPoolUsage: usize,
+            PagefileUsage: usize,
+            PeakPagefileUsage: usize,
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn K32GetProcessMemoryInfo(
+                process: *mut core::ffi::c_void,
+                p: *mut Pmc,
+                cb: u32,
+            ) -> i32;
+            fn GetCurrentProcess() -> *mut core::ffi::c_void;
+        }
+        let mut pmc: Pmc = unsafe { std::mem::zeroed() };
+        pmc.cb = std::mem::size_of::<Pmc>() as u32;
+        let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut pmc, pmc.cb) };
+        if ok != 0 {
+            crate::note(&format!(
+                "[mem] {tag}: рабочий набор {} МБ, приватно {} МБ",
+                pmc.WorkingSetSize / (1024 * 1024),
+                pmc.PagefileUsage / (1024 * 1024)
+            ));
+        }
+    }
+
     /// Подключает системный жирный шрифт для номера ID (`strong()` в egui
     /// меняет только цвет — реальной жирности в комплекте нет).
     fn install_ui_fonts(ctx: &egui::Context) {
@@ -1808,8 +1846,13 @@ mod ui {
                     }
                 }
             }
+            let live = self
+                .jobs
+                .iter()
+                .any(|j| matches!(j.status, JobStatusUi::Queued | JobStatusUi::Active));
             if self.failed.is_none() {
-                ctx.request_repaint_after(Duration::from_millis(80));
+                // Очередь активна — живее; в покое — реже (есть таймер уровня UI).
+                ctx.request_repaint_after(Duration::from_millis(if live { 80 } else { 250 }));
             }
         }
 
@@ -3220,8 +3263,23 @@ mod ui {
                 });
             }
             let port = args.port;
-            let (incoming_tx, incoming_rx) = channel();
-            let mut server = ServerHandle::new(incoming_tx.clone());
+            // Входящие запросы: пересылаем через мини-поток, который сразу
+            // будит UI (мгновенный диалог подтверждения) — не ждём страховочного
+            // таймера перерисовки.
+            let (incoming_tx_raw, incoming_rx_raw) = channel::<Request>();
+            let (incoming_tx, incoming_rx) = channel::<Request>();
+            {
+                let slot = repaint_slot.clone();
+                std::thread::spawn(move || {
+                    while let Ok(req) = incoming_rx_raw.recv() {
+                        let _ = incoming_tx.send(req);
+                        if let Some(c) = slot.lock().ok().and_then(|s| s.clone()) {
+                            c.request_repaint();
+                        }
+                    }
+                });
+            }
+            let mut server = ServerHandle::new(incoming_tx_raw.clone());
             let mut toast = None;
             if let Err(e) = server.start(port) {
                 crate::note(&format!("[ui] сервер не запустился: {e}"));
@@ -3307,11 +3365,12 @@ mod ui {
                     }
                 }
             };
-            let mut internet = InternetHandle::new(server.monitor.clone(), incoming_tx);
+            let mut internet = InternetHandle::new(server.monitor.clone(), incoming_tx_raw);
             if device.mode == ConnectionMode::Internet && is_valid_id(&device.id) {
                 let name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "rat-pc".into());
                 internet.start(device.relay.clone(), device.id.clone(), name);
             }
+            mem_report("старт окна");
             Self {
                 machines,
                 statuses,
@@ -4360,6 +4419,7 @@ mod ui {
                 f.save_prefs();
                 f.shutdown();
             }
+            mem_report("после файлового окна");
             self.screen = Screen::Home;
         }
 
@@ -5142,6 +5202,7 @@ mod ui {
             if let Some(mut s) = self.viewer.take() {
                 s.shutdown();
             }
+            mem_report("после сеанса");
             self.screen = Screen::Home;
         }
 
@@ -5360,11 +5421,39 @@ mod ui {
             }
             if self.finished {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            } else if self.hidden {
-                // Окно в трее: сессии продолжают работать, UI просыпается редко.
-                ctx.request_repaint_after(Duration::from_millis(250));
             } else {
-                ctx.request_repaint_after(Duration::from_millis(10));
+                // Перерисовка — по событиям (egui сам просыпается на ввод и
+                // сетевые команды); этот таймер — только страховочный, чтобы
+                // фоновые изменения (статусы, кадры сеанса, очередь файлов)
+                // доходили вовремя. В покое тикаем редко, а не 100 раз в сек.
+                let animating = self.viewer.as_ref().is_some_and(|v| {
+                    let tgt_top = if v.top_open { 1.0f32 } else { 0.0 };
+                    let tgt_bot = if v.bottom_open { 1.0f32 } else { 0.0 };
+                    (v.top_t - tgt_top).abs() > 0.01 || (v.bottom_t - tgt_bot).abs() > 0.01
+                });
+                let files_live = self.files.as_ref().is_some_and(|f| {
+                    f.jobs
+                        .iter()
+                        .any(|j| matches!(j.status, JobStatusUi::Queued | JobStatusUi::Active))
+                });
+                let ms = if animating {
+                    // Анимация панелей сеанса — плавно.
+                    10
+                } else if self.viewer.is_some() {
+                    // Сеанс: кадры идут ~30 Гц — чаще не нужно.
+                    33
+                } else if self.quit_at.is_some() || self.connect_rx.is_some() {
+                    100
+                } else if self.hidden {
+                    // Окно в трее: UI спит, сессии будят по событиям.
+                    500
+                } else if files_live {
+                    100
+                } else {
+                    // Покой (главный экран, настройки): редкий страховочный тик.
+                    500
+                };
+                ctx.request_repaint_after(Duration::from_millis(ms));
             }
         }
     }
