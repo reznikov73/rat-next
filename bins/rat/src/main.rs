@@ -1423,35 +1423,85 @@ mod ui {
         }
     }
 
-    /// Подключает системный жирный шрифт для номера ID (`strong()` в egui
-    /// меняет только цвет — реальной жирности в комплекте нет).
+    /// Шрифты «как на макете»: Segoe UI обычный — основной, полужирный — для
+    /// заголовков и номера ID (`strong()` в egui меняет только цвет, поэтому
+    /// настоящую жирность даём отдельным семейством). Если системных шрифтов
+    /// нет — остаёмся на встроенных.
     fn install_ui_fonts(ctx: &egui::Context) {
+        let mut fonts = egui::FontDefinitions::default();
+        let mut changed = false;
+        if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\segoeui.ttf") {
+            fonts
+                .font_data
+                .insert("sg".to_owned(), Arc::new(egui::FontData::from_owned(bytes)));
+            if let Some(list) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+                list.insert(0, "sg".to_owned());
+            }
+            changed = true;
+        }
         let candidates = [
             r"C:\Windows\Fonts\segoeuib.ttf",
             r"C:\Windows\Fonts\seguisb.ttf",
             r"C:\Windows\Fonts\arialbd.ttf",
         ];
-        let Some(bytes) = candidates.iter().find_map(|p| std::fs::read(p).ok()) else {
-            return;
-        };
-        let mut fonts = egui::FontDefinitions::default();
-        fonts.font_data.insert(
-            ID_BOLD.to_owned(),
-            Arc::new(egui::FontData::from_owned(bytes)),
-        );
-        let mut family = vec![ID_BOLD.to_owned()];
-        // Запасной вариант — шрифт по умолчанию.
-        if let Some(default_font) = fonts
-            .families
-            .get(&egui::FontFamily::Proportional)
-            .and_then(|f| f.first().cloned())
-        {
-            family.push(default_font);
+        if let Some(bytes) = candidates.iter().find_map(|p| std::fs::read(p).ok()) {
+            fonts.font_data.insert(
+                ID_BOLD.to_owned(),
+                Arc::new(egui::FontData::from_owned(bytes)),
+            );
+            let mut family = vec![ID_BOLD.to_owned()];
+            // Запасной вариант — шрифт по умолчанию.
+            if let Some(default_font) = fonts
+                .families
+                .get(&egui::FontFamily::Proportional)
+                .and_then(|f| f.first().cloned())
+            {
+                family.push(default_font);
+            }
+            fonts
+                .families
+                .insert(egui::FontFamily::Name(ID_BOLD.into()), family);
+            changed = true;
         }
-        fonts
-            .families
-            .insert(egui::FontFamily::Name(ID_BOLD.into()), family);
-        ctx.set_fonts(fonts);
+        if changed {
+            ctx.set_fonts(fonts);
+        }
+    }
+
+    /// Стиль под согласованный макет v3: светлая тема, тонкие обводки, радиусы
+    /// и отступы виджетов — «как на макете».
+    fn install_ui_style(ctx: &egui::Context) {
+        ctx.options_mut(|o| {
+            o.theme_preference = egui::ThemePreference::Light;
+        });
+        ctx.set_visuals(egui::Visuals::light());
+        ctx.all_styles_mut(|s| {
+            s.spacing.item_spacing = egui::vec2(7.0, 6.0);
+            s.spacing.button_padding = egui::vec2(10.0, 4.0);
+            let v = &mut s.visuals;
+            v.panel_fill = egui::Color32::from_rgb(243, 245, 248);
+            v.window_fill = egui::Color32::from_rgb(255, 255, 255);
+            v.window_corner_radius = egui::CornerRadius::same(8);
+            v.window_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(226, 229, 232));
+            v.hyperlink_color = egui::Color32::from_rgb(52, 83, 126);
+            v.selection.bg_fill = egui::Color32::from_rgb(207, 228, 250);
+            for w in [
+                &mut v.widgets.inactive,
+                &mut v.widgets.hovered,
+                &mut v.widgets.active,
+                &mut v.widgets.open,
+            ] {
+                w.corner_radius = egui::CornerRadius::same(6);
+            }
+            v.widgets.inactive.bg_fill = egui::Color32::from_rgb(251, 251, 252);
+            v.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(251, 251, 252);
+            v.widgets.inactive.bg_stroke =
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(201, 205, 210));
+            v.widgets.hovered.bg_fill = egui::Color32::from_rgb(240, 244, 248);
+            v.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(240, 244, 248);
+            v.widgets.hovered.bg_stroke =
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(160, 170, 182));
+        });
     }
 
     pub fn run(args: Args) -> Result<(), String> {
@@ -1491,6 +1541,7 @@ mod ui {
             options,
             Box::new(move |cc| {
                 install_ui_fonts(&cc.egui_ctx);
+                install_ui_style(&cc.egui_ctx);
                 Ok(Box::new(RatApp::new(
                     args,
                     show_request,
@@ -2201,7 +2252,11 @@ mod ui {
         fn queue_ui(&mut self, ui: &mut egui::Ui) {
             ui.add_space(3.0);
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Передачи").strong());
+                ui.label(
+                    egui::RichText::new("Передачи")
+                        .strong()
+                        .family(egui::FontFamily::Name(ID_BOLD.into())),
+                );
                 ui.label(
                     egui::RichText::new(format!("({})", self.jobs.len()))
                         .color(DIM2)
@@ -2303,7 +2358,7 @@ mod ui {
                 .fill(egui::Color32::from_rgb(252, 252, 253))
                 .stroke(egui::Stroke::new(
                     1.0,
-                    egui::Color32::from_rgb(226, 229, 232),
+                    egui::Color32::from_rgb(219, 223, 228),
                 ))
                 .corner_radius(8.0)
                 .inner_margin(egui::Margin::same(10))
@@ -2362,7 +2417,10 @@ mod ui {
                     Side::Local => "Этот компьютер".to_string(),
                     Side::Remote => self.name.clone(),
                 };
-                let t = egui::RichText::new(title).strong().size(14.5);
+                let t = egui::RichText::new(title)
+                    .strong()
+                    .size(14.5)
+                    .family(egui::FontFamily::Name(ID_BOLD.into()));
                 if is_active {
                     ui.label(t.color(egui::Color32::from_rgb(29, 79, 159)));
                 } else {
@@ -2410,6 +2468,7 @@ mod ui {
                         egui::RichText::new(&label)
                             .strong()
                             .color(egui::Color32::from_rgb(35, 38, 42))
+                            .family(egui::FontFamily::Name(ID_BOLD.into()))
                     } else {
                         egui::RichText::new(&label).color(egui::Color32::from_rgb(52, 83, 126))
                     };
@@ -2450,6 +2509,23 @@ mod ui {
                 }
             });
             ui.add_space(2.0);
+            // Шапка списка «Имя / Размер» (как на макете).
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("Имя").color(DIM2).size(11.5));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("Размер").color(DIM2).size(11.5));
+                });
+            });
+            let hdr_y = ui.cursor().top() + 1.0;
+            let hdr_x = ui.max_rect().x_range();
+            ui.painter().hline(
+                hdr_x,
+                hdr_y,
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(238, 240, 242)),
+            );
+            ui.add_space(3.0);
             // Список файлов: прокрутка независима, колесо — над своей панелью.
             let scroll_h = (ui.available_height() - 34.0).max(90.0);
             let mut dbl: Option<(bool, String, u64, String)> = None;
