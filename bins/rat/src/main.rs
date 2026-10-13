@@ -4786,10 +4786,21 @@ mod ui {
                     }
                     let (mx, my) = v.last_pointer.unwrap_or((32768, 32768));
                     let mut pb: Vec<(u8, bool, f32, f32)> = Vec::new();
-                    let mut wheel = (0f32, 0f32);
+                    // Колесо: считаем в «единицах колеса Windows» (120 = один
+                    // щелчок) — на удалённой машине прокрутка будет как
+                    // локальная (3 строки за щелчок), а не втрое медленнее.
+                    let mut wheel_units = (0f32, 0f32);
                     ui.ctx().input(|inp| {
-                        wheel = (inp.smooth_scroll_delta.x, inp.smooth_scroll_delta.y);
                         for ev in &inp.events {
+                            if let egui::Event::MouseWheel { unit, delta, .. } = ev {
+                                let factor = match unit {
+                                    egui::MouseWheelUnit::Line => 120.0,
+                                    egui::MouseWheelUnit::Page => 120.0,
+                                    egui::MouseWheelUnit::Point => 3.0,
+                                };
+                                wheel_units.0 += delta.x * factor;
+                                wheel_units.1 += delta.y * factor;
+                            }
                             if let egui::Event::PointerButton {
                                 pos,
                                 button,
@@ -4825,14 +4836,17 @@ mod ui {
                             });
                         }
                     }
-                    if resp.hovered() && !over_bars && (wheel.0.abs() > 0.5 || wheel.1.abs() > 0.5)
-                    {
-                        locked.push(InputEvent::Wheel {
-                            dx: wheel.0.clamp(-32768.0, 32767.0) as i16,
-                            dy: wheel.1.clamp(-32768.0, 32767.0) as i16,
-                            x: mx,
-                            y: my,
-                        });
+                    if resp.hovered() && !over_bars {
+                        let dxi = wheel_units.0.clamp(-32768.0, 32767.0) as i16;
+                        let dyi = wheel_units.1.clamp(-32768.0, 32767.0) as i16;
+                        if dxi != 0 || dyi != 0 {
+                            locked.push(InputEvent::Wheel {
+                                dx: dxi,
+                                dy: dyi,
+                                x: mx,
+                                y: my,
+                            });
+                        }
                     }
                 }
 
@@ -5365,6 +5379,11 @@ mod ui {
                 self.last_activity = Instant::now();
                 self.idle_trimmed = false;
             }
+            // Колесо: 3 строки списка (3 × 26 пт) за щелчок — как в Проводнике
+            // (по умолчанию egui давал ~1,5 строки — «мало крутит»).
+            ctx.options_mut(|o| {
+                o.input_options.line_scroll_speed = 78.0;
+            });
             // Первый кадр: запомнить контекст egui — поток слушателя
             // повторного запуска будит им перерисовку.
             if let Ok(mut slot) = self.repaint_slot.lock()
