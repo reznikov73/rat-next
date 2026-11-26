@@ -26,10 +26,18 @@ fn main() {
         return;
     }
 
-    let mut res = winresource::WindowsResource::new();
-    res.set_icon(ico.to_str().expect("путь к .ico не в UTF-8"));
-    if let Err(error) = res.compile() {
-        println!("cargo:warning=иконка не встроена в exe: {error}");
+    #[cfg(windows)]
+    {
+        let mut res = winresource::WindowsResource::new();
+        res.set_icon(ico.to_str().expect("путь к .ico не в UTF-8"));
+        if let Err(error) = res.compile() {
+            println!("cargo:warning=иконка не встроена в exe: {error}");
+        }
+    }
+    // На не-Windows платформах сюда не доходим: выше есть ранний return.
+    #[cfg(not(windows))]
+    {
+        let _ = &ico;
     }
 }
 

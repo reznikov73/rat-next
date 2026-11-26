@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Rat Next relay — управление
+Name[ru]=Rat Next relay — управление
+Comment=Запуск, остановка и журнал службы Rat Next relay
+Comment[ru]=Запуск, остановка и журнал службы Rat Next relay
+Exec=xfce4-terminal --title="Rat Next relay — управление" --command="linux/rat-relay-control.sh"
+Icon=network-server
+Terminal=false
+Categories=Network;
+Keywords=rat;relay;ratnext;service;ретранслятор;
+StartupNotify=false

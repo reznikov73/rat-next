@@ -25,6 +25,38 @@ pub fn is_installed() -> bool {
         .unwrap_or(false)
 }
 
+/// Включить автозапуск: создать задачу «при входе пользователя».
+///
+/// Задача запускает тот же exe с `--tray`, то есть relay стартует свёрнутым
+/// в трей, без окна поверх остальных приложений.
+pub fn install() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("путь к exe: {e}"))?;
+    let out = schtasks()
+        .args([
+            "/Create",
+            "/F",
+            "/SC",
+            "ONLOGON",
+            "/TN",
+            TASK,
+            "/TR",
+            &format!("\"{}\" --tray", exe.display()),
+        ])
+        .output()
+        .map_err(|e| format!("schtasks: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let err = if err.is_empty() {
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        } else {
+            err
+        };
+        Err(err)
+    }
+}
+
 /// Удалить задачу автозапуска.
 pub fn remove() -> Result<(), String> {
     let out = schtasks()

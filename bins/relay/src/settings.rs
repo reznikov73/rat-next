@@ -39,11 +39,55 @@ impl Default for Settings {
     }
 }
 
-/// Файл настроек рядом с исполняемым файлом.
+/// Файл настроек.
+///
+/// Windows: рядом с исполняемым файлом (поведение не меняем).
+/// Linux: сначала `/etc/rat-next/relay.json` (штатное место для сервиса,
+/// который работает не от того пользователя, который может писать рядом с
+/// exe), затем `$XDG_CONFIG_HOME/rat-next/relay.json` или
+/// `~/.config/rat-next/relay.json`, и только потом — рядом с exe.
+///
+/// Если файла нет или он нечитаем, [`load`] отдаёт значения по умолчанию.
 pub fn path() -> Option<PathBuf> {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("relay.json")))
+    #[cfg(windows)]
+    {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("relay.json")))
+    }
+
+    #[cfg(not(windows))]
+    {
+        // 1. Системный конфиг — основной для сервиса.
+        let system = PathBuf::from("/etc/rat-next/relay.json");
+        if system.exists() {
+            return Some(system);
+        }
+
+        // 2. Пользовательский конфиг.
+        let user = match std::env::var_os("XDG_CONFIG_HOME") {
+            Some(v) if !v.is_empty() => Some(PathBuf::from(v)),
+            _ => std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")),
+        }
+        .map(|base| base.join("rat-next").join("relay.json"));
+        if let Some(p) = &user
+            && p.exists()
+        {
+            return Some(p.clone());
+        }
+
+        // 3. Рядом с exe — как на Windows (переносимый запуск из папки).
+        if let Some(p) = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("relay.json")))
+            .filter(|p| p.exists())
+        {
+            return Some(p);
+        }
+
+        // Файла нигде нет — вернём предпочтительное место для записи.
+        user.or(Some(system))
+    }
 }
 
 /// Читает настройки; при отсутствии или ошибке возвращает значения по умолчанию.

@@ -21,3 +21,37 @@ jobs:
         run: cargo build --workspace
       - name: test
         run: cargo test --workspace
+
+  # Relay — единственный компонент, который штатно живёт на Linux (см.
+  # linux/PORTING.md). Отдельный job ловит регрессии платформенной
+  # обвязки: без него любой правок в общих крейтах может сломать Linux-путь,
+  # и это заметят только в момент установки на сервер.
+  linux-relay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      # headless-сборке relay системные библиотеки не нужны: GUI выключен,
+      # нативных C-зависимостей у крейтов нет (только libc).
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: build (headless)
+        run: cargo build -p rat-relay --no-default-features
+      - name: clippy (headless)
+        run: cargo clippy -p rat-relay --no-default-features -- -D warnings
+      - name: test (headless)
+        run: cargo test -p rat-relay -p rat-session --no-default-features
+      - name: smoke (protocol)
+        run: |
+          ./target/debug/rat-relay --listen 127.0.0.1:18899 &
+          RELAY_PID=$!
+          # ждём, пока порт начнёт принимать подключения
+          for i in $(seq 1 50); do
+            ss -ltn 2>/dev/null | grep -q 18899 && break
+            sleep 0.1
+          done
+          python3 linux/relay-smoke.py 127.0.0.1:18899
+          kill -TERM $RELAY_PID
+          wait $RELAY_PID || true

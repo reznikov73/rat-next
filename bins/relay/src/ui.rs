@@ -141,6 +141,11 @@ pub struct RelayApp {
 }
 
 pub fn run(initial_listen: Option<String>, start_hidden: bool, mode: UiMode) -> Result<(), String> {
+    // Windows: DX12 — единственный бэкенд, на котором окно стабильно работает
+    // с драйверами целевых машин (см. spikes/UI_KIT_DECISION.md).
+    // Linux/macOS: бэкенд выбирает wgpu сам (Vulkan/GL) — "dx12" там
+    // не существует и привёл бы к отказу инициализации окна.
+    #[cfg(windows)]
     if std::env::var_os("WGPU_BACKEND").is_none() {
         // SAFETY: до инициализации GUI, однопоточно.
         unsafe { std::env::set_var("WGPU_BACKEND", "dx12") };

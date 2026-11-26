@@ -22,7 +22,86 @@ pub fn try_acquire(tag: &str) -> bool {
     }
     #[cfg(not(windows))]
     {
-        let _ = tag;
+        unix_lock::try_acquire(tag)
+    }
+}
+
+/// Блокировка единственного экземпляра на Unix через `flock`.
+///
+/// На Windows роль играет именованный мьютекс; здесь — файл блокировки в
+/// `$XDG_RUNTIME_DIR` (или `/tmp`), имя которого привязано к тегу и пути exe:
+/// копии в разных папках не конфликтуют, а повторный запуск того же файла
+/// получает отказ.
+///
+/// Файл не удаляется: снятие `flock` происходит при закрытии дескриптора,
+/// то есть при завершении процесса (в том числе аварийном).
+#[cfg(not(windows))]
+mod unix_lock {
+    use std::fs::{File, OpenOptions};
+    use std::sync::Mutex;
+
+    /// Дескрипторы живут до конца процесса: закрытие снимает блокировку.
+    static LOCKS: Mutex<Vec<File>> = Mutex::new(Vec::new());
+
+    /// Каталог для файлов блокировки.
+    fn lock_dir() -> std::path::PathBuf {
+        match std::env::var_os("XDG_RUNTIME_DIR") {
+            Some(v) if !v.is_empty() => std::path::PathBuf::from(v),
+            _ => std::path::PathBuf::from("/tmp"),
+        }
+    }
+
+    /// Имя файла блокировки: тег + путь exe (чтобы копии не мешали друг другу).
+    fn lock_path(tag: &str) -> std::path::PathBuf {
+        let exe = std::env::current_exe()
+            .ok()
+            .and_then(|p| std::fs::canonicalize(p).ok())
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+
+        // Простая стабильная свёртка пути в hex — без внешних зависимостей.
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
+        for b in exe.as_bytes() {
+            hash ^= u64::from(*b);
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
+
+        lock_dir().join(format!("rat-next-{tag}-{hash:016x}.lock"))
+    }
+
+    unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+
+    pub fn try_acquire(tag: &str) -> bool {
+        let path = lock_path(tag);
+        let Ok(file) = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+        else {
+            // Не смогли создать файл — не мешаем запуску (как и в Windows-ветке).
+            return true;
+        };
+
+        use std::os::fd::AsRawFd;
+        let fd = file.as_raw_fd();
+
+        // SAFETY: fd валиден, флаги корректны; flock не блокирует при LOCK_NB.
+        let rc = unsafe { flock(fd, LOCK_EX | LOCK_NB) };
+        if rc != 0 {
+            // Блокировка занята — экземпляр уже работает.
+            return false;
+        }
+
+        if let Ok(mut locks) = LOCKS.lock() {
+            locks.push(file);
+        }
         true
     }
 }

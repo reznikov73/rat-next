@@ -1,0 +1,55 @@
+[Unit]
+# Вариант для системной установки: бинарник в /usr/bin, служба от
+# непривилегированного динамического пользователя.
+#
+# Если бинарник лежит в домашнем каталоге (обычный случай при сборке из
+# репозитория), этот unit не подойдёт: DynamicUser не пройдёт сквозь
+# /home/<user> с правами 750. Для такой раскладки есть `rat-relay
+# --install-service`: он подставляет User=<владелец файла> и экранирует
+# пробелы в пути (см. linux/PORTING.md).
+Description=Rat Next relay (pairing by ID + forward of opaque session bytes)
+Documentation=file:///usr/share/doc/rat-next/linux-port.md
+After=network-online.target
+Wants=network-online.target
+# Не пытаться бесконечно при явно битом конфиге.
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+# Адрес прослушивания. Relay порт непривилегированный, поэтому отдельный
+# пользователь — достаточная изоляция; root не нужен.
+ExecStart=/usr/bin/rat-relay --listen 0.0.0.0:8889
+
+# systemd перезапускает процесс при падении — это замена авторестарту
+# службы Windows (SC_ACTION_RESTART ×3 через 5 с).
+Restart=on-failure
+RestartSec=5
+# Ограничение на количество попыток задаётся в [Unit], а не в [Service].
+# Проверено `systemd-analyze verify`: в [Service] ключ игнорируется.
+
+# Отдельный системный пользователь без домашнего каталога и без shell.
+DynamicUser=yes
+StateDirectory=rat-relay
+# Конфиг при необходимости: /etc/rat-next/relay.json (см. settings.rs).
+# ProtectSystem=strict оставит /etc доступным только на чтение — этого хватает.
+
+# Базовая изоляция: relay не пишет на диск, не нужно ничего, кроме сети.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rat-relay
+
+[Install]
+WantedBy=multi-user.target
